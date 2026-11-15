@@ -1,0 +1,340 @@
+{
+  "settings": {
+    "unitName": "Đoàn Trường THPT Nguyễn Chí Thanh",
+    "unitCode": "ĐTN",
+    "numberMode": "separate",
+    "numberFormat": "{so}-{loai}/{don_vi}",
+    "customStartSequences": {
+      "2026_KH": 9
+    },
+    "msGraphConfig": {
+      "enabled": false,
+      "tenantId": "",
+      "clientId": "",
+      "clientSecret": "",
+      "driveId": "",
+      "filePath": "",
+      "tableName": "SoCapSoVanBan"
+    },
+    "googleSheetsConfig": {
+      "enabled": false,
+      "webhookUrl": "",
+      "lastSyncTime": ""
+    },
+    "googleDriveConfig": {
+      "enabled": false,
+      "authMode": "apps_script",
+      "folderUrl": "",
+      "folderId": "",
+      "folderName": "",
+      "folderByUnit": {},
+      "appsScriptUrl": "",
+      "serviceAccountJson": "",
+      "serviceAccountEmail": ""
+    }
+  },
+  "documentTypes": [
+    {
+      "id": "KH",
+      "code": "KH",
+      "name": "Kế hoạch",
+      "isActive": true,
+      "color": "blue"
+    },
+    {
+      "id": "BC",
+      "code": "BC",
+      "name": "Báo cáo",
+      "isActive": true,
+      "color": "emerald"
+    },
+    {
+      "id": "ĐN",
+      "code": "ĐN",
+      "name": "Đề nghị",
+      "isActive": true,
+      "color": "purple"
+    },
+    {
+      "id": "ND",
+      "code": "ND",
+      "name": "Nội dung",
+      "isActive": true,
+      "color": "teal"
+    },
+    {
+      "id": "TB",
+      "code": "TB",
+      "name": "Thông báo",
+      "isActive": true,
+      "color": "amber"
+    }
+  ],
+  "signers": [
+    {
+      "id": "sig-1",
+      "name": "Nguyễn Văn Minh",
+      "role": "Bí thư Đoàn trường"
+    },
+    {
+      "id": "sig-2",
+      "name": "Trần Thị Thu Thảo",
+      "role": "Phó Bí thư Đoàn trường"
+    },
+    {
+      "id": "sig-3",
+      "name": "Lê Hoàng Nam",
+      "role": "Ủy viên BTV Đoàn trường"
+    }
+  ],
+  "users": [
+    {
+      "id": "user-admin",
+      "username": "admin",
+      "fullName": "Quản trị viên Đoàn Trường",
+      "role": "admin",
+      "isActive": true,
+      "createdAt": "2026-10-12T14:18:16.889Z",
+      "passwordHash": "0644411de6c4e506ef7cda7dc9a061b5a17f0ca83bc0522091f217261e1c64a6"
+    }
+  ],
+  "documents": [
+    {
+      "id": "doc-1791814741272-bca6eaf5",
+      "stt": 4,
+      "year": 2026,
+      "issueDate": "12/10/2026",
+      "createdAt": "2026-10-12T14:19:01.272Z",
+      "typeCode": "TB",
+      "typeName": "Thông báo",
+      "sequenceNumber": 2,
+      "fullDocNumber": "02-TB/ĐTN",
+      "title": "Thông báo lịch sinh hoạt chi đoàn tháng 10 chính thức",
+      "signer": "Nguyễn Văn Minh",
+      "signerRole": "Bí thư Đoàn trường",
+      "issuedBy": "Bí thư Đoàn Trường (Quản trị viên)",
+      "issuedByUsername": "admin",
+      "issuedByUserId": "user-admin",
+      "status": "active",
+      "notes": "",
+      "auditLogs": [
+        {
+          "timestamp": "2026-10-12T14:19:01.272Z",
+          "userId": "user-admin",
+          "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+          "action": "create",
+          "changes": {
+            "fullDocNumber": {
+              "old": null,
+              "new": "02-TB/ĐTN"
+            },
+            "title": {
+              "old": null,
+              "new": "Thông báo lịch sinh hoạt chi đoàn tháng 10 chính thức"
+            },
+            "signer": {
+              "old": null,
+              "new": "Nguyễn Văn Minh"
+            }
+          }
+        }
+      ],
+      "syncStatus": "not_configured",
+      "idempotencyKey": "test-key-04",
+      "bookId": "book-doan-truong",
+      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+    },
+    {
+      "id": "doc-1791814727463-45e96723",
+      "stt": 3,
+      "year": 2026,
+      "issueDate": "12/10/2026",
+      "createdAt": "2026-10-12T14:18:47.464Z",
+      "typeCode": "TB",
+      "typeName": "Thông báo",
+      "sequenceNumber": 1,
+      "fullDocNumber": "01-TB/ĐTN",
+      "title": "Thông báo lịch sinh hoạt chi đoàn tháng 10",
+      "signer": "Nguyễn Văn Minh",
+      "signerRole": "Bí thư Đoàn trường",
+      "issuedBy": "Bí thư Đoàn Trường (Quản trị viên)",
+      "issuedByUsername": "admin",
+      "issuedByUserId": "user-admin",
+      "status": "cancelled",
+      "notes": "",
+      "auditLogs": [
+        {
+          "timestamp": "2026-10-12T14:18:47.464Z",
+          "userId": "user-admin",
+          "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+          "action": "create",
+          "changes": {
+            "fullDocNumber": {
+              "old": null,
+              "new": "01-TB/ĐTN"
+            },
+            "title": {
+              "old": null,
+              "new": "Thông báo lịch sinh hoạt chi đoàn tháng 10"
+            },
+            "signer": {
+              "old": null,
+              "new": "Nguyễn Văn Minh"
+            }
+          }
+        },
+        {
+          "timestamp": "2026-10-12T14:18:52.818Z",
+          "userId": "user-admin",
+          "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+          "action": "cancel",
+          "reason": "Soạn nhầm nội dung cuộc họp",
+          "changes": {
+            "status": {
+              "old": "active",
+              "new": "cancelled"
+            }
+          }
+        }
+      ],
+      "syncStatus": "not_configured",
+      "idempotencyKey": "test-key-03",
+      "cancelReason": "Soạn nhầm nội dung cuộc họp",
+      "cancelledAt": "2026-10-12T14:18:52.818Z",
+      "cancelledBy": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+      "bookId": "book-doan-truong",
+      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+    },
+    {
+      "id": "doc-1791814720699-de6aff02",
+      "stt": 2,
+      "year": 2026,
+      "issueDate": "12/10/2026",
+      "createdAt": "2026-10-12T14:18:40.700Z",
+      "typeCode": "KH",
+      "typeName": "Kế hoạch",
+      "sequenceNumber": 2,
+      "fullDocNumber": "02-KH/ĐTN",
+      "title": "Kế hoạch phát động phong trào Hoa điểm 10",
+      "signer": "Trần Thị Thu Thảo",
+      "signerRole": "Phó Bí thư Đoàn trường",
+      "issuedBy": "Bí thư Đoàn Trường (Quản trị viên)",
+      "issuedByUsername": "admin",
+      "issuedByUserId": "user-admin",
+      "status": "active",
+      "notes": "",
+      "auditLogs": [
+        {
+          "timestamp": "2026-10-12T14:18:40.699Z",
+          "userId": "user-admin",
+          "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+          "action": "create",
+          "changes": {
+            "fullDocNumber": {
+              "old": null,
+              "new": "02-KH/ĐTN"
+            },
+            "title": {
+              "old": null,
+              "new": "Kế hoạch phát động phong trào Hoa điểm 10"
+            },
+            "signer": {
+              "old": null,
+              "new": "Trần Thị Thu Thảo"
+            }
+          }
+        }
+      ],
+      "syncStatus": "not_configured",
+      "idempotencyKey": "test-key-02",
+      "bookId": "book-doan-truong",
+      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+    },
+    {
+      "id": "doc-1791814711946-38a9b459",
+      "stt": 1,
+      "year": 2026,
+      "issueDate": "12/10/2026",
+      "createdAt": "2026-10-12T14:18:31.946Z",
+      "typeCode": "KH",
+      "typeName": "Kế hoạch",
+      "sequenceNumber": 1,
+      "fullDocNumber": "01-KH/ĐTN",
+      "title": "Kế hoạch tổ chức Hội trại 26/3 truyền thống",
+      "signer": "Nguyễn Văn Minh",
+      "signerRole": "Bí thư Đoàn trường",
+      "issuedBy": "Bí thư Đoàn Trường (Quản trị viên)",
+      "issuedByUsername": "admin",
+      "issuedByUserId": "user-admin",
+      "status": "active",
+      "notes": "",
+      "auditLogs": [
+        {
+          "timestamp": "2026-10-12T14:18:31.946Z",
+          "userId": "user-admin",
+          "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+          "action": "create",
+          "changes": {
+            "fullDocNumber": {
+              "old": null,
+              "new": "01-KH/ĐTN"
+            },
+            "title": {
+              "old": null,
+              "new": "Kế hoạch tổ chức Hội trại 26/3 truyền thống"
+            },
+            "signer": {
+              "old": null,
+              "new": "Nguyễn Văn Minh"
+            }
+          }
+        }
+      ],
+      "syncStatus": "not_configured",
+      "idempotencyKey": "test-key-01",
+      "bookId": "book-doan-truong",
+      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+    }
+  ],
+  "books": [
+    {
+      "id": "book-doan-truong",
+      "name": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh",
+      "unitName": "Đoàn Trường THPT Nguyễn Chí Thanh",
+      "unitCode": "ĐTN",
+      "isShared": true,
+      "numberMode": "separate",
+      "numberFormat": "{so}-{loai}/{don_vi}",
+      "customStartSequences": {
+        "2026_KH": 9
+      },
+      "signers": [
+        {
+          "id": "sig-1",
+          "name": "Nguyễn Văn Minh",
+          "role": "Bí thư Đoàn trường"
+        },
+        {
+          "id": "sig-2",
+          "name": "Trần Thị Thu Thảo",
+          "role": "Phó Bí thư Đoàn trường"
+        },
+        {
+          "id": "sig-3",
+          "name": "Lê Hoàng Nam",
+          "role": "Ủy viên BTV Đoàn trường"
+        }
+      ],
+      "isActive": true,
+      "createdAt": "2026-11-14T14:47:03.620Z"
+    }
+  ],
+  "numberRequests": [],
+  "idempotencyKeys": {
+    "test-key-01": "doc-1791814711946-38a9b459",
+    "test-key-02": "doc-1791814720699-de6aff02",
+    "test-key-03": "doc-1791814727463-45e96723",
+    "test-key-04": "doc-1791814741272-bca6eaf5",
+    "req-1791814813367-t4zwii0": "doc-1791814869565-e55e7e57"
+  }
+}

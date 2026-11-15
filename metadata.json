@@ -1,0 +1,6 @@
+{
+  "name": "Sổ Cấp Số Văn Bản Đoàn Trường",
+  "description": "Hệ thống cấp số văn bản tự động và sổ theo dõi văn bản đi dành cho Đoàn Trường THPT Nguyễn Chí Thanh",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
