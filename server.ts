@@ -65,12 +65,64 @@ const __dirname = path.dirname(__filename);
 
 const app = express();
 const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
+const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
-app.use(cors());
-app.use(express.json());
+app.set('trust proxy', 1);
+
+const extraCorsOrigins = (process.env.CORS_ORIGINS || '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin) return callback(null, true);
+      if (extraCorsOrigins.includes(origin)) return callback(null, true);
+      try {
+        const url = new URL(origin);
+        const host = url.hostname.toLowerCase();
+        if (
+          host === 'localhost' ||
+          host === '127.0.0.1' ||
+          host.endsWith('.vercel.app') ||
+          host.endsWith('.run.app') ||
+          host.endsWith('.aistudio.google.com')
+        ) {
+          return callback(null, true);
+        }
+        if (process.env.APP_URL) {
+          const appHost = new URL(process.env.APP_URL).hostname.toLowerCase();
+          if (host === appHost) return callback(null, true);
+        }
+      } catch {
+        // ignore malformed origin
+      }
+      return callback(null, true);
+    },
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+);
+
+// Guard if serverless runtime already pre-parsed req.body before Express middleware runs
+app.use((req: any, _res, next) => {
+  if (req.body !== undefined && req.readableEnded) {
+    req._body = true;
+  }
+  next();
+});
+app.use(express.json({ limit: '15mb' }));
 
 // --- Database File Setup ---
-const DATA_DIR = path.resolve(__dirname, 'data');
+const BUNDLED_DATA_DIR = path.resolve(__dirname, 'data');
+const BUNDLED_DB_FILE = path.resolve(BUNDLED_DATA_DIR, 'db.json');
+const DATA_DIR = process.env.DATA_DIR
+  ? path.resolve(process.env.DATA_DIR)
+  : IS_SERVERLESS
+  ? '/tmp/nct-registry-data'
+  : BUNDLED_DATA_DIR;
 const DB_FILE = path.resolve(DATA_DIR, 'db.json');
 
 if (!fs.existsSync(DATA_DIR)) {
@@ -87,6 +139,7 @@ interface DatabaseSchema {
   numberRequests: NumberRequest[];
   idempotencyKeys: Record<string, string>; // key -> documentId
   systemAuditLogs: SystemAuditLog[];
+  revokedSessions?: Record<string, number>; // sid -> expiresAt ms
 }
 
 // Initial Seed Data
@@ -374,6 +427,15 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
   const numberRequests = Array.isArray(loaded.numberRequests) ? loaded.numberRequests : [];
   const idempotencyKeys = loaded.idempotencyKeys && typeof loaded.idempotencyKeys === 'object' ? loaded.idempotencyKeys : {};
   const systemAuditLogs = Array.isArray(loaded.systemAuditLogs) ? loaded.systemAuditLogs : [];
+  const nowMs = Date.now();
+  const revokedSessions: Record<string, number> = {};
+  if (loaded.revokedSessions && typeof loaded.revokedSessions === 'object') {
+    for (const [sid, exp] of Object.entries(loaded.revokedSessions)) {
+      if (typeof exp === 'number' && exp > nowMs) {
+        revokedSessions[sid] = exp;
+      }
+    }
+  }
 
   return {
     settings,
@@ -385,13 +447,20 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
     numberRequests,
     idempotencyKeys,
     systemAuditLogs,
+    revokedSessions,
   };
 }
 
 function loadDatabase(): DatabaseSchema {
-  if (fs.existsSync(DB_FILE)) {
+  const sourceFile = fs.existsSync(DB_FILE)
+    ? DB_FILE
+    : BUNDLED_DB_FILE !== DB_FILE && fs.existsSync(BUNDLED_DB_FILE)
+    ? BUNDLED_DB_FILE
+    : null;
+
+  if (sourceFile) {
     try {
-      const content = fs.readFileSync(DB_FILE, 'utf-8');
+      const content = fs.readFileSync(sourceFile, 'utf-8');
       const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
       const migrated = migrateDatabaseIdempotent(loaded);
       saveDatabaseSync(migrated);
@@ -411,13 +480,17 @@ function loadDatabase(): DatabaseSchema {
     numberRequests: [],
     idempotencyKeys: {},
     systemAuditLogs: [],
+    revokedSessions: {},
   });
   saveDatabaseSync(initialDb);
   return initialDb;
 }
 
 function saveDatabaseSync(data: DatabaseSchema) {
-  const tmpFile = `${DB_FILE}.tmp.${Date.now()}`;
+  if (!fs.existsSync(DATA_DIR)) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+  }
+  const tmpFile = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
   fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
   fs.renameSync(tmpFile, DB_FILE);
 }
@@ -696,12 +769,14 @@ interface StagedPdfEntry {
 }
 const stagedPdfs = new Map<string, StagedPdfEntry>();
 
-setInterval(() => {
-  const cutoff = Date.now() - 30 * 60 * 1000;
-  for (const [k, v] of stagedPdfs.entries()) {
-    if (v.createdAt < cutoff) stagedPdfs.delete(k);
-  }
-}, 5 * 60 * 1000);
+if (!IS_SERVERLESS) {
+  setInterval(() => {
+    const cutoff = Date.now() - 30 * 60 * 1000;
+    for (const [k, v] of stagedPdfs.entries()) {
+      if (v.createdAt < cutoff) stagedPdfs.delete(k);
+    }
+  }, 5 * 60 * 1000).unref();
+}
 
 function findConflictingDocumentByDriveFileName(
   targetFileName: string,
@@ -786,15 +861,17 @@ function broadcastSSE(event: string, payload: any) {
 }
 
 // Heartbeat for SSE to keep connections open (12s for mobile networks)
-setInterval(() => {
-  for (let i = sseClients.length - 1; i >= 0; i--) {
-    try {
-      sseClients[i].res.write(': heartbeat\n\n');
-    } catch {
-      sseClients.splice(i, 1);
+if (!IS_SERVERLESS) {
+  setInterval(() => {
+    for (let i = sseClients.length - 1; i >= 0; i--) {
+      try {
+        sseClients[i].res.write(': heartbeat\n\n');
+      } catch {
+        sseClients.splice(i, 1);
+      }
     }
-  }
-}, 12000);
+  }, 12000).unref();
+}
 
 // --- Timezone Asia/Ho_Chi_Minh Helpers ---
 function getVietnamTimeInfo(d = new Date()) {
@@ -812,47 +889,239 @@ function getVietnamTimeInfo(d = new Date()) {
   return { year, month, day, formattedDate };
 }
 
-// --- Token Store (Server-Side Session Store) ---
-const tokenStore = new Map<string, { user: User; expiresAt: number }>();
+// --- Signed Session & HttpOnly Cookie Store (tương thích cả Node lẫn Vercel Serverless) ---
+const SESSION_COOKIE_NAME = 'nct_session';
+const STANDARD_SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 ngày (thời hạn thông thường)
+const REMEMBER_SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000; // 30 ngày (Duy trì đăng nhập)
+const REMEMBER_COOKIE_MAX_AGE_SEC = 30 * 24 * 60 * 60;
 
-function generateToken(user: User): string {
-  const token = crypto.randomBytes(32).toString('hex');
-  // Token valid for 7 days
+const tokenStore = new Map<string, { user: User; expiresAt: number; sid?: string }>();
+const revokedSessionCache = new Map<string, number>();
+
+function getSessionSecret(): string {
+  const envSecret = (process.env.SESSION_SECRET || process.env.AUTH_SECRET || '').trim();
+  if (envSecret) return envSecret;
+  const seed = process.env.VERCEL_PROJECT_ID || process.env.APP_URL || 'nct-thpt-2026-session-key';
+  return crypto.createHash('sha256').update(`nct-hmac-v1:${seed}`).digest('hex');
+}
+
+function signPayloadB64(payloadB64: string): string {
+  return crypto.createHmac('sha256', getSessionSecret()).update(payloadB64).digest('base64url');
+}
+
+function isSessionRevoked(sid: string): boolean {
+  const now = Date.now();
+  const cachedExp = revokedSessionCache.get(sid);
+  if (cachedExp && cachedExp > now) return true;
+  const persistedExp = db.revokedSessions?.[sid];
+  if (persistedExp && persistedExp > now) {
+    revokedSessionCache.set(sid, persistedExp);
+    return true;
+  }
+  return false;
+}
+
+function revokeSessionById(sid: string, expiresAt: number) {
+  const exp = Math.max(expiresAt, Date.now() + 60_000);
+  revokedSessionCache.set(sid, exp);
+  if (!db.revokedSessions) db.revokedSessions = {};
+  db.revokedSessions[sid] = exp;
+  const now = Date.now();
+  for (const [k, v] of Object.entries(db.revokedSessions)) {
+    if (v <= now) delete db.revokedSessions[k];
+  }
+  for (const [k, v] of revokedSessionCache.entries()) {
+    if (v <= now) revokedSessionCache.delete(k);
+  }
+}
+
+interface SignedSessionPayload {
+  sid: string;
+  uid: string;
+  iat: number;
+  exp: number;
+  rem: boolean;
+}
+
+function generateToken(user: User, rememberMe = false): { token: string; expiresAt: number; sid: string } {
+  const sid = crypto.randomBytes(16).toString('hex');
+  const iat = Date.now();
+  const ttl = rememberMe ? REMEMBER_SESSION_TTL_MS : STANDARD_SESSION_TTL_MS;
+  const exp = iat + ttl;
+  const payload: SignedSessionPayload = {
+    sid,
+    uid: user.id,
+    iat,
+    exp,
+    rem: Boolean(rememberMe),
+  };
+  const payloadB64 = Buffer.from(JSON.stringify(payload), 'utf8').toString('base64url');
+  const sigB64 = signPayloadB64(payloadB64);
+  const token = `${payloadB64}.${sigB64}`;
+
   tokenStore.set(token, {
     user,
-    expiresAt: Date.now() + 7 * 24 * 60 * 60 * 1000,
+    expiresAt: exp,
+    sid,
   });
-  return token;
+  return { token, expiresAt: exp, sid };
+}
+
+function parseSignedToken(token: string): SignedSessionPayload | null {
+  const dotIdx = token.indexOf('.');
+  if (dotIdx <= 0) return null;
+  const payloadB64 = token.slice(0, dotIdx);
+  const sigB64 = token.slice(dotIdx + 1);
+  if (!payloadB64 || !sigB64) return null;
+
+  const expectedSig = signPayloadB64(payloadB64);
+  const bufA = Buffer.from(sigB64);
+  const bufB = Buffer.from(expectedSig);
+  if (bufA.length !== bufB.length || !crypto.timingSafeEqual(bufA, bufB)) {
+    return null;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, 'base64url').toString('utf8')) as SignedSessionPayload;
+    if (!parsed || !parsed.sid || !parsed.uid || typeof parsed.exp !== 'number') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function parseCookies(req: Request): Record<string, string> {
+  const header = req.headers.cookie;
+  const out: Record<string, string> = {};
+  if (!header) return out;
+  for (const part of header.split(';')) {
+    const eqIdx = part.indexOf('=');
+    if (eqIdx <= 0) continue;
+    const key = part.slice(0, eqIdx).trim();
+    const val = part.slice(eqIdx + 1).trim();
+    if (!key) continue;
+    try {
+      out[key] = decodeURIComponent(val);
+    } catch {
+      out[key] = val;
+    }
+  }
+  return out;
+}
+
+function extractTokenFromRequest(req: Request): string | undefined {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith('Bearer ')) {
+    const bearer = authHeader.slice(7).trim();
+    if (bearer) return bearer;
+  }
+  const cookies = parseCookies(req);
+  if (cookies[SESSION_COOKIE_NAME]) {
+    return cookies[SESSION_COOKIE_NAME];
+  }
+  if (req.query.token && typeof req.query.token === 'string' && req.query.token.trim()) {
+    return req.query.token.trim();
+  }
+  return undefined;
+}
+
+function buildSessionCookieHeader(
+  req: Request,
+  value: string,
+  opts: { maxAgeSeconds?: number; clear?: boolean } = {}
+): string {
+  const protoHeader = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+  const isHttps = req.secure || protoHeader === 'https' || Boolean(process.env.VERCEL);
+
+  const originHeader = String(req.headers.origin || '');
+  const reqHost = String(req.headers['x-forwarded-host'] || req.headers.host || '').split(',')[0].trim().toLowerCase();
+  let isCrossOrigin = false;
+  if (originHeader && reqHost) {
+    try {
+      const originHost = new URL(originHeader).host.toLowerCase();
+      if (originHost && originHost !== reqHost) {
+        isCrossOrigin = true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+  if (req.headers['sec-fetch-site'] === 'cross-site') {
+    isCrossOrigin = true;
+  }
+
+  const sameSite = isHttps && isCrossOrigin ? 'None' : 'Lax';
+  const parts = [
+    `${SESSION_COOKIE_NAME}=${opts.clear ? '' : encodeURIComponent(value)}`,
+    'Path=/',
+    'HttpOnly',
+    `SameSite=${sameSite}`,
+  ];
+  if (isHttps) {
+    parts.push('Secure');
+  }
+  if (opts.clear) {
+    parts.push('Max-Age=0');
+    parts.push('Expires=Thu, 01 Jan 1970 00:00:00 GMT');
+  } else if (typeof opts.maxAgeSeconds === 'number' && opts.maxAgeSeconds > 0) {
+    parts.push(`Max-Age=${opts.maxAgeSeconds}`);
+    parts.push(`Expires=${new Date(Date.now() + opts.maxAgeSeconds * 1000).toUTCString()}`);
+  }
+  return parts.join('; ');
+}
+
+function revokeTokenSession(token: string) {
+  const parsed = parseSignedToken(token);
+  if (parsed) {
+    revokeSessionById(parsed.sid, parsed.exp);
+  }
+  const cached = tokenStore.get(token);
+  if (cached?.sid) {
+    revokeSessionById(cached.sid, cached.expiresAt);
+  }
+  tokenStore.delete(token);
 }
 
 // Auth Middleware (luôn nạp quyền mới nhất từ db.users để áp dụng thu hồi/cấp quyền tức thì)
 function requireAuth(req: Request, res: Response, next: NextFunction) {
-  let token: string | undefined;
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
-  } else if (req.query.token && typeof req.query.token === 'string') {
-    token = req.query.token;
-  }
+  const token = extractTokenFromRequest(req);
 
   if (!token) {
     return res.status(401).json({ error: 'Yêu cầu đăng nhập để truy cập' });
   }
 
-  const session = tokenStore.get(token);
-  if (!session || session.expiresAt < Date.now()) {
-    return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại' });
+  let userId: string | null = null;
+  const parsed = parseSignedToken(token);
+  if (parsed) {
+    if (parsed.exp < Date.now()) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại' });
+    }
+    if (isSessionRevoked(parsed.sid)) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã kết thúc, vui lòng đăng nhập lại' });
+    }
+    userId = parsed.uid;
+  } else {
+    const session = tokenStore.get(token);
+    if (!session || session.expiresAt < Date.now()) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã hết hạn, vui lòng đăng nhập lại' });
+    }
+    if (session.sid && isSessionRevoked(session.sid)) {
+      return res.status(401).json({ error: 'Phiên đăng nhập đã kết thúc, vui lòng đăng nhập lại' });
+    }
+    userId = session.user.id;
   }
 
-  const freshUser = db.users.find((u) => u.id === session.user.id);
+  const freshUser = db.users.find((u) => u.id === userId);
   if (!freshUser || !freshUser.isActive) {
     tokenStore.delete(token);
     return res.status(401).json({ error: 'Tài khoản đã bị khóa hoặc không còn hiệu lực' });
   }
 
   const safeUser = toSafeUser(freshUser);
-  session.user = safeUser;
+  const cached = tokenStore.get(token);
+  if (cached) cached.user = safeUser;
   (req as any).user = safeUser;
+  (req as any).authToken = token;
   next();
 }
 
@@ -891,27 +1160,36 @@ app.get('/api/health', (req, res) => {
 
 // 2. Authentication
 app.post('/api/auth/login', (req, res) => {
-  const { username, password } = req.body;
+  const { username, password, rememberMe } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ error: 'Vui lòng nhập tên đăng nhập và mật khẩu' });
   }
 
-  const hash = hashPassword(password);
+  const hash = hashPassword(String(password));
   const foundUser = db.users.find(
-    (u) => u.username.toLowerCase() === username.trim().toLowerCase() && u.passwordHash === hash
+    (u) => u.username.toLowerCase() === String(username).trim().toLowerCase() && u.passwordHash === hash
   );
 
   if (!foundUser) {
-    return res.status(401).json({ error: 'Tên đăng nhập hoặc mật khẩu không chính xác' });
+    return res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu' });
   }
 
   if (!foundUser.isActive) {
     return res.status(403).json({ error: 'Tài khoản đã bị tạm khóa, vui lòng liên hệ Quản trị viên' });
   }
 
+  const remember = Boolean(rememberMe);
   const userSafe = toSafeUser(foundUser);
-  const token = generateToken(userSafe);
-  res.json({ user: userSafe, token });
+  const { token, expiresAt } = generateToken(userSafe, remember);
+
+  res.setHeader(
+    'Set-Cookie',
+    buildSessionCookieHeader(req, token, {
+      maxAgeSeconds: remember ? REMEMBER_COOKIE_MAX_AGE_SEC : undefined,
+    })
+  );
+
+  res.json({ user: userSafe, token, rememberMe: remember, expiresAt });
 });
 
 app.get('/api/auth/me', requireAuth, (req, res) => {
@@ -925,9 +1203,30 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ user: userSafe });
 });
 
-app.post('/api/auth/logout', requireAuth, (req, res) => {
-  const token = req.headers.authorization?.split(' ')[1];
-  if (token) tokenStore.delete(token);
+app.post('/api/auth/logout', (req, res) => {
+  const bearer = req.headers.authorization?.startsWith('Bearer ')
+    ? req.headers.authorization.slice(7).trim()
+    : undefined;
+  const cookieToken = parseCookies(req)[SESSION_COOKIE_NAME];
+
+  let changed = false;
+  if (bearer) {
+    revokeTokenSession(bearer);
+    changed = true;
+  }
+  if (cookieToken && cookieToken !== bearer) {
+    revokeTokenSession(cookieToken);
+    changed = true;
+  }
+  if (changed) {
+    try {
+      saveDatabaseSync(db);
+    } catch (err) {
+      console.error('Lỗi lưu trạng thái hủy phiên:', err);
+    }
+  }
+
+  res.setHeader('Set-Cookie', buildSessionCookieHeader(req, '', { clear: true }));
   res.json({ success: true });
 });
 
@@ -4147,6 +4446,13 @@ app.post('/api/drive/test', requireAuth, async (req, res) => {
   }
 });
 
+// Catch-all JSON 404 for unknown /api/* routes (never fall through to SPA index.html)
+app.all('/api/*', (req, res) => {
+  res.status(404).json({
+    error: `Không tìm thấy tuyến API (${req.method} ${req.originalUrl}).`,
+  });
+});
+
 // --- Vite Middleware in Dev or Static Serve in Prod ---
 async function startServer() {
   if (process.env.NODE_ENV === 'production') {
@@ -4169,6 +4475,11 @@ async function startServer() {
   });
 }
 
-startServer().catch((err) => {
-  console.error('Lỗi khởi động máy chủ:', err);
-});
+if (!IS_SERVERLESS) {
+  startServer().catch((err) => {
+    console.error('Lỗi khởi động máy chủ:', err);
+  });
+}
+
+export { app };
+export default app;

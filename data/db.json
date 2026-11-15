@@ -42,6 +42,13 @@
       "color": "blue"
     },
     {
+      "id": "QĐ",
+      "code": "QĐ",
+      "name": "Quyết định",
+      "color": "red",
+      "isActive": true
+    },
+    {
       "id": "BC",
       "code": "BC",
       "name": "Báo cáo",
@@ -142,7 +149,8 @@
       "syncStatus": "not_configured",
       "idempotencyKey": "test-key-04",
       "bookId": "book-doan-truong",
-      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+      "bookName": "Đoàn trường",
+      "bookCode": "DOAN_TRUONG"
     },
     {
       "id": "doc-1791814727463-45e96723",
@@ -203,7 +211,8 @@
       "cancelledAt": "2026-10-12T14:18:52.818Z",
       "cancelledBy": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
       "bookId": "book-doan-truong",
-      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+      "bookName": "Đoàn trường",
+      "bookCode": "DOAN_TRUONG"
     },
     {
       "id": "doc-1791814720699-de6aff02",
@@ -248,7 +257,8 @@
       "syncStatus": "not_configured",
       "idempotencyKey": "test-key-02",
       "bookId": "book-doan-truong",
-      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+      "bookName": "Đoàn trường",
+      "bookCode": "DOAN_TRUONG"
     },
     {
       "id": "doc-1791814711946-38a9b459",
@@ -293,13 +303,14 @@
       "syncStatus": "not_configured",
       "idempotencyKey": "test-key-01",
       "bookId": "book-doan-truong",
-      "bookName": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh"
+      "bookName": "Đoàn trường",
+      "bookCode": "DOAN_TRUONG"
     }
   ],
   "books": [
     {
       "id": "book-doan-truong",
-      "name": "Sổ văn bản Đoàn Trường THPT Nguyễn Chí Thanh",
+      "name": "Đoàn trường",
       "unitName": "Đoàn Trường THPT Nguyễn Chí Thanh",
       "unitCode": "ĐTN",
       "isShared": true,
@@ -326,7 +337,58 @@
         }
       ],
       "isActive": true,
-      "createdAt": "2026-11-14T14:47:03.620Z"
+      "createdAt": "2026-11-14T14:47:03.620Z",
+      "code": "DOAN_TRUONG"
+    },
+    {
+      "id": "book-chi-bo",
+      "code": "CHI_BO",
+      "name": "Chi bộ",
+      "unitName": "Chi bộ Trường THPT Nguyễn Chí Thanh",
+      "unitCode": "CB",
+      "isShared": false,
+      "numberMode": "separate",
+      "numberFormat": "{so}-{loai}/{don_vi}",
+      "customStartSequences": {},
+      "signers": [
+        {
+          "id": "sig-cb-1",
+          "name": "Bí thư Chi bộ",
+          "role": "Bí thư Chi bộ"
+        },
+        {
+          "id": "sig-cb-2",
+          "name": "Phó Bí thư Chi bộ",
+          "role": "Phó Bí thư Chi bộ"
+        }
+      ],
+      "isActive": true,
+      "createdAt": "2026-11-15T12:31:28.400Z"
+    },
+    {
+      "id": "book-nha-truong",
+      "code": "NHA_TRUONG",
+      "name": "Nhà trường",
+      "unitName": "Trường THPT Nguyễn Chí Thanh",
+      "unitCode": "THPTNCT",
+      "isShared": true,
+      "numberMode": "separate",
+      "numberFormat": "{so}-{loai}/{don_vi}",
+      "customStartSequences": {},
+      "signers": [
+        {
+          "id": "sig-nt-1",
+          "name": "Hiệu trưởng",
+          "role": "Hiệu trưởng"
+        },
+        {
+          "id": "sig-nt-2",
+          "name": "Phó Hiệu trưởng",
+          "role": "Phó Hiệu trưởng"
+        }
+      ],
+      "isActive": true,
+      "createdAt": "2026-11-15T12:31:28.400Z"
     }
   ],
   "numberRequests": [],
@@ -336,5 +398,7 @@
     "test-key-03": "doc-1791814727463-45e96723",
     "test-key-04": "doc-1791814741272-bca6eaf5",
     "req-1791814813367-t4zwii0": "doc-1791814869565-e55e7e57"
-  }
+  },
+  "systemAuditLogs": [],
+  "revokedSessions": {}
 }

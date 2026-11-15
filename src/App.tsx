@@ -6,7 +6,7 @@ import { DocumentRegistryView } from './components/DocumentRegistryView';
 import { StatisticsView } from './components/StatisticsView';
 import { SettingsView } from './components/SettingsView';
 import { LoginModal } from './components/LoginModal';
-import { api, getStoredUser, clearAuth } from './api';
+import { api, buildApiUrl, clearAuth } from './api';
 import type {
   DocumentRecord,
   DocumentTypeConfig,
@@ -28,7 +28,7 @@ import {
 import { Bell, BookOpen, FileText } from 'lucide-react';
 
 export default function App() {
-  const [currentUser, setCurrentUser] = useState<User | null>(getStoredUser);
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<AppTab>('issue');
   const [pendingOpenDocId, setPendingOpenDocId] = useState<string | null>(null);
@@ -150,7 +150,7 @@ export default function App() {
     let reconnectTimeout: ReturnType<typeof setTimeout>;
 
     const connectSSE = () => {
-      eventSource = new EventSource('/api/events');
+      eventSource = new EventSource(buildApiUrl('/api/events'), { withCredentials: true });
 
       eventSource.addEventListener('document_issued', (e: MessageEvent) => {
         try {
@@ -388,6 +388,10 @@ export default function App() {
   const handleLogout = async () => {
     await api.logout();
     setCurrentUser(null);
+    setBooks([]);
+    setDocuments([]);
+    setNumberRequests([]);
+    setActiveBookId(DEFAULT_BOOK_ID);
   };
 
   const handleDocumentIssued = (newDoc: DocumentRecord) => {

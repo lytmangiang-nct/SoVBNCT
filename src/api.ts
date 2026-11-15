@@ -17,15 +17,26 @@ import type {
 
 const TOKEN_KEY = 'nct_doc_token';
 const USER_KEY = 'nct_doc_user';
+const RAW_API_BASE = (import.meta.env.VITE_API_BASE_URL || '').trim().replace(/\/+$/, '');
+
+export function buildApiUrl(endpoint: string): string {
+  if (!RAW_API_BASE) return endpoint;
+  if (/^https?:\/\//i.test(endpoint)) return endpoint;
+  return `${RAW_API_BASE}${endpoint.startsWith('/') ? endpoint : `/${endpoint}`}`;
+}
 
 export function getStoredToken(): string | null {
-  return localStorage.getItem(TOKEN_KEY);
+  try {
+    return sessionStorage.getItem(TOKEN_KEY);
+  } catch {
+    return null;
+  }
 }
 
 export function getStoredUser(): User | null {
-  const data = localStorage.getItem(USER_KEY);
-  if (!data) return null;
   try {
+    const data = sessionStorage.getItem(USER_KEY);
+    if (!data) return null;
     return JSON.parse(data);
   } catch {
     return null;
@@ -33,13 +44,26 @@ export function getStoredUser(): User | null {
 }
 
 export function saveAuth(response: AuthResponse) {
-  localStorage.setItem(TOKEN_KEY, response.token);
-  localStorage.setItem(USER_KEY, JSON.stringify(response.user));
+  try {
+    // Không lưu thông tin xác thực dài hạn vào localStorage; phiên 30 ngày dùng cookie HttpOnly phía máy chủ
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+    sessionStorage.setItem(TOKEN_KEY, response.token);
+    sessionStorage.setItem(USER_KEY, JSON.stringify(response.user));
+  } catch {
+    // ignore storage errors
+  }
 }
 
 export function clearAuth() {
-  localStorage.removeItem(TOKEN_KEY);
-  localStorage.removeItem(USER_KEY);
+  try {
+    localStorage.removeItem(TOKEN_KEY);
+    localStorage.removeItem(USER_KEY);
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(USER_KEY);
+  } catch {
+    // ignore storage errors
+  }
 }
 
 async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
@@ -54,20 +78,58 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     headers.set('Authorization', `Bearer ${token}`);
   }
 
-  const res = await fetch(endpoint, {
-    ...options,
-    headers,
-  });
+  const targetUrl = buildApiUrl(endpoint);
+  let res: Response;
+  try {
+    res = await fetch(targetUrl, {
+      ...options,
+      headers,
+      credentials: 'include',
+    });
+  } catch {
+    const networkErr: any = new Error(
+      'Không kết nối được máy chủ. Vui lòng kiểm tra kết nối mạng hoặc trạng thái dịch vụ backend.'
+    );
+    networkErr.status = 0;
+    networkErr.code = 'NETWORK_ERROR';
+    throw networkErr;
+  }
+
+  const isLoginEndpoint = endpoint.startsWith('/api/auth/login');
 
   if (res.status === 401) {
+    if (isLoginEndpoint) {
+      const errorData = await res.json().catch(() => ({}));
+      const authErr: any = new Error(
+        errorData.error || errorData.message || 'Sai tên đăng nhập hoặc mật khẩu'
+      );
+      authErr.status = 401;
+      throw authErr;
+    }
     clearAuth();
     window.dispatchEvent(new CustomEvent('auth_expired'));
-    throw new Error('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+    const expiredErr: any = new Error('Phiên đăng nhập đã hết hạn. Vui lòng đăng nhập lại.');
+    expiredErr.status = 401;
+    throw expiredErr;
   }
 
   if (!res.ok) {
     const errorData = await res.json().catch(() => ({}));
-    const err: any = new Error(errorData.error || errorData.message || `Yêu cầu thất bại (Mã lỗi: ${res.status})`);
+    let fallbackMsg = `Yêu cầu thất bại (Mã lỗi: ${res.status})`;
+    if (res.status === 404) {
+      fallbackMsg = isLoginEndpoint
+        ? 'Không tìm thấy dịch vụ đăng nhập (404). Vui lòng kiểm tra cấu hình backend hoặc đường dẫn API.'
+        : 'Không tìm thấy dịch vụ API yêu cầu (404).';
+    } else if (res.status === 502 || res.status === 503 || res.status === 504) {
+      fallbackMsg = 'Không kết nối được máy chủ. Dịch vụ backend hiện tạm thời không phản hồi.';
+    }
+
+    const message =
+      res.status === 404 && isLoginEndpoint && !errorData.error
+        ? fallbackMsg
+        : errorData.error || errorData.message || fallbackMsg;
+
+    const err: any = new Error(message);
     err.status = res.status;
     if (errorData.code) err.code = errorData.code;
     if (errorData.document) err.document = errorData.document;
@@ -112,10 +174,10 @@ function buildExportQuery(params: ExportFilterParams, token: string | null): str
 
 export const api = {
   // Auth
-  login: async (username: string, password: string): Promise<AuthResponse> => {
+  login: async (username: string, password: string, rememberMe = false): Promise<AuthResponse> => {
     return request<AuthResponse>('/api/auth/login', {
       method: 'POST',
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify({ username, password, rememberMe }),
     });
   },
 
@@ -124,8 +186,19 @@ export const api = {
   },
 
   logout: async (): Promise<void> => {
+    const token = getStoredToken();
+    const headers = new Headers();
+    if (token) {
+      headers.set('Authorization', `Bearer ${token}`);
+    }
     try {
-      await request('/api/auth/logout', { method: 'POST' });
+      await fetch(buildApiUrl('/api/auth/logout'), {
+        method: 'POST',
+        headers,
+        credentials: 'include',
+      });
+    } catch {
+      // ignore network failure during logout
     } finally {
       clearAuth();
     }
@@ -446,7 +519,7 @@ export const api = {
   getStagedPdfUrl: (stageToken: string): string => {
     const token = getStoredToken();
     const q = token ? `?token=${encodeURIComponent(token)}` : '';
-    return `/api/pdf/staged/${encodeURIComponent(stageToken)}${q}`;
+    return buildApiUrl(`/api/pdf/staged/${encodeURIComponent(stageToken)}${q}`);
   },
 
   importPdfDocument: async (payload: {
@@ -588,19 +661,19 @@ export const api = {
   // Excel Export URL generator
   getExportUrl: (params: ExportFilterParams = {}): string => {
     const token = getStoredToken();
-    return `/api/export-excel?${buildExportQuery(params, token)}`;
+    return buildApiUrl(`/api/export-excel?${buildExportQuery(params, token)}`);
   },
 
   // Reliable Blob-based Excel Download
   downloadExcel: async (params: ExportFilterParams = {}): Promise<void> => {
     const token = getStoredToken();
-    const endpoint = `/api/export-excel?${buildExportQuery(params, token)}`;
+    const endpoint = buildApiUrl(`/api/export-excel?${buildExportQuery(params, token)}`);
     const headers = new Headers();
     if (token) {
       headers.set('Authorization', `Bearer ${token}`);
     }
 
-    const res = await fetch(endpoint, { headers });
+    const res = await fetch(endpoint, { headers, credentials: 'include' });
     if (!res.ok) {
       const err = await res.json().catch(() => ({}));
       throw new Error(err.error || `Tải file Excel thất bại (Mã phản hồi: ${res.status})`);

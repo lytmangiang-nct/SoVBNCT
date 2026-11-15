@@ -298,6 +298,8 @@ export interface User {
 export interface AuthResponse {
   user: User;
   token: string;
+  rememberMe?: boolean;
+  expiresAt?: number;
 }
 
 export interface StatisticsData {
