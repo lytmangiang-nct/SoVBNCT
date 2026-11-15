@@ -12,6 +12,7 @@ export const ALL_BOOK_PERMISSIONS: BookPermission[] = [
   'edit',
   'replace_file',
   'cancel',
+  'delete',
   'export',
   'manage_book',
 ];
@@ -54,6 +55,11 @@ export const BOOK_PERMISSION_META: Record<
     label: 'Hủy số văn bản',
     shortLabel: 'Hủy số',
     description: 'Hủy hiệu lực văn bản trong sổ (giữ lại số và lịch sử, không xóa vĩnh viễn).',
+  },
+  delete: {
+    label: 'Xóa văn bản (VB đã xóa)',
+    shortLabel: 'Xóa VB',
+    description: 'Xóa văn bản khỏi sổ hiệu lực (bắt buộc nhập lý do, chuyển sang VB đã xóa, giữ số và tệp Drive).',
   },
   export: {
     label: 'Xuất sổ Excel',

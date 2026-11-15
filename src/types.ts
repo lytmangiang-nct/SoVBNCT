@@ -1,8 +1,10 @@
 export type NumberMode = 'separate' | 'shared';
 
-export type DocumentStatus = 'active' | 'cancelled';
+export type DocumentStatus = 'active' | 'cancelled' | 'deleted';
 
 export type SyncStatus = 'not_configured' | 'pending' | 'synced' | 'error';
+
+export type ExcelDeleteSyncStatus = 'not_configured' | 'pending' | 'synced' | 'failed';
 
 export type BookPermission =
   | 'view'
@@ -12,6 +14,7 @@ export type BookPermission =
   | 'edit'
   | 'replace_file'
   | 'cancel'
+  | 'delete'
   | 'export'
   | 'manage_book';
 
@@ -114,23 +117,49 @@ export interface SystemSettings {
 
 export type DocumentCategory = 'outgoing' | 'incoming';
 
+export type DocumentAuditAction =
+  | 'create'
+  | 'update'
+  | 'cancel'
+  | 'delete'
+  | 'retry_excel_sync'
+  | 'upload_word'
+  | 'import_pdf'
+  | 'upload_pdf'
+  | 'request_number'
+  | 'replace_file';
+
 export interface AuditLog {
+  id?: string;
   timestamp: string;
+  timestampVietnam?: string;
+  dateKeyVietnam?: string;
   userId: string;
+  username?: string;
   userName: string;
   bookId?: string;
   bookCode?: string;
-  action:
-    | 'create'
-    | 'update'
-    | 'cancel'
-    | 'upload_word'
-    | 'import_pdf'
-    | 'upload_pdf'
-    | 'request_number'
-    | 'replace_file';
+  bookName?: string;
+  docId?: string;
+  fullDocNumber?: string;
+  docName?: string;
+  action: DocumentAuditAction;
   changes: Record<string, { old: string | null; new: string | null }>;
   reason?: string;
+  snapshot?: Record<string, any>;
+}
+
+export interface DocumentHistoryEntry extends AuditLog {
+  id: string;
+  timestampVietnam: string;
+  dateKeyVietnam: string;
+  username: string;
+  bookId: string;
+  bookCode: string;
+  bookName: string;
+  docId: string;
+  fullDocNumber: string;
+  docName: string;
 }
 
 export interface SystemAuditLog {
@@ -181,6 +210,27 @@ export interface DocumentRecord {
   cancelReason?: string;
   cancelledAt?: string;
   cancelledBy?: string;
+  deleteReason?: string;
+  deletedAt?: string;
+  deletedAtVietnam?: string;
+  deletedBy?: string;
+  deletedByUsername?: string;
+  deletedByUserId?: string;
+  deletedSnapshot?: Record<string, any>;
+  excelDeleteSyncStatus?: ExcelDeleteSyncStatus;
+  excelMovedToDeletedSheet?: boolean;
+  excelRemovedFromMainSheet?: boolean;
+  excelSyncError?: string;
+  excelSyncedAt?: string;
+  excelSyncTargets?: Record<
+    string,
+    {
+      movedToDeletedSheet: boolean;
+      removedFromMainSheet: boolean;
+      syncedAt?: string;
+      error?: string;
+    }
+  >;
   notes?: string;
   auditLogs: AuditLog[];
   syncStatus: SyncStatus;
@@ -336,4 +386,22 @@ export interface PreviewNumberResponse {
   mode: NumberMode;
   customStartSequence?: number | null;
   maxIssuedSequence?: number;
+}
+
+export interface StartSequenceSeriesConfig {
+  seriesKey: string;
+  storageKey: string;
+  bookId: string;
+  bookCode: string;
+  year: number;
+  typeCode: string;
+  isConfigured: boolean;
+  customStartSequence: number | null;
+  maxIssuedSequence: number;
+  minAllowedStartSequence: number;
+  nextExpectedSeq: number;
+  previewNumber: string;
+  configVersion: number;
+  serverYear?: number;
+  customStartSequences?: Record<string, number>;
 }

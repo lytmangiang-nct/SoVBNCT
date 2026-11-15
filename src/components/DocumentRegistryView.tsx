@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   Search,
   Copy,
@@ -21,9 +21,13 @@ import {
   FolderCheck,
   Upload,
   BookOpen,
+  RotateCw,
+  Clock,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
+  DocumentAuditAction,
+  DocumentHistoryEntry,
   DocumentRecord,
   DocumentTypeConfig,
   RegistryBook,
@@ -43,6 +47,7 @@ import { getDocBookId, hasBookPermission, isSystemAdmin } from '../utils/permiss
 
 interface DocumentRegistryViewProps {
   documents: DocumentRecord[];
+  deletedDocuments?: DocumentRecord[];
   documentTypes: DocumentTypeConfig[];
   books: RegistryBook[];
   activeBookId: string;
@@ -57,6 +62,12 @@ interface DocumentRegistryViewProps {
 }
 
 function getRecordStatusMeta(doc: DocumentRecord): { label: string; className: string } {
+  if (doc.status === 'deleted') {
+    return {
+      label: 'Đã xóa',
+      className: 'text-rose-900 bg-rose-100 border-rose-300',
+    };
+  }
   if (doc.status === 'cancelled') {
     return {
       label: 'Đã hủy',
@@ -88,8 +99,88 @@ function getDriveStatusLabel(doc: DocumentRecord): string {
   }
 }
 
+function getExcelDeleteSyncMeta(doc: DocumentRecord): {
+  label: string;
+  className: string;
+  needsRetry: boolean;
+} {
+  if (doc.excelDeleteSyncStatus === 'synced') {
+    return {
+      label: 'Đã chuyển sang sheet VB đã xóa',
+      className: 'text-emerald-800 bg-emerald-50 border-emerald-200',
+      needsRetry: false,
+    };
+  }
+  if (doc.excelDeleteSyncStatus === 'failed' || doc.excelDeleteSyncStatus === 'pending') {
+    return {
+      label: 'Đã xóa trên hệ thống · Chờ đồng bộ Excel',
+      className: 'text-amber-900 bg-amber-50 border-amber-300',
+      needsRetry: true,
+    };
+  }
+  return {
+    label: 'Đã chuyển VB đã xóa (Chưa bật Excel trực tuyến)',
+    className: 'text-slate-600 bg-slate-100 border-slate-200',
+    needsRetry: false,
+  };
+}
+
+function getAuditActionMeta(action: DocumentAuditAction): { label: string; className: string } {
+  switch (action) {
+    case 'create':
+      return { label: 'Cấp số', className: 'bg-emerald-50 text-emerald-800 border-emerald-200' };
+    case 'import_pdf':
+      return { label: 'Nhập PDF', className: 'bg-sky-50 text-sky-800 border-sky-200' };
+    case 'update':
+      return { label: 'Sửa văn bản', className: 'bg-amber-50 text-amber-800 border-amber-200' };
+    case 'upload_word':
+      return { label: 'Đính kèm Word', className: 'bg-sky-50 text-sky-800 border-sky-200' };
+    case 'upload_pdf':
+      return { label: 'Lưu PDF Drive', className: 'bg-sky-50 text-sky-800 border-sky-200' };
+    case 'replace_file':
+      return { label: 'Thay tệp Drive', className: 'bg-indigo-50 text-indigo-800 border-indigo-200' };
+    case 'cancel':
+      return { label: 'Hủy số', className: 'bg-rose-50 text-rose-800 border-rose-200' };
+    case 'delete':
+      return { label: 'Xóa văn bản', className: 'bg-rose-100 text-rose-900 border-rose-300' };
+    case 'retry_excel_sync':
+      return { label: 'Đồng bộ lại Excel', className: 'bg-amber-50 text-amber-900 border-amber-200' };
+    case 'request_number':
+      return { label: 'Xin số', className: 'bg-slate-100 text-slate-700 border-slate-200' };
+    default:
+      return { label: action, className: 'bg-slate-100 text-slate-700 border-slate-200' };
+  }
+}
+
+const AUDIT_FIELD_LABELS: Record<string, string> = {
+  docName: 'Tên văn bản',
+  title: 'Trích yếu / Nội dung',
+  signer: 'Người ký',
+  signerRole: 'Chức vụ',
+  notes: 'Ghi chú',
+  sequenceNumber: 'Số thứ tự',
+  fullDocNumber: 'Số / Ký hiệu',
+  issuingAgency: 'Cơ quan ban hành',
+  issueDate: 'Ngày ban hành',
+  signDate: 'Ngày ký',
+  driveFileName: 'Tên tệp Drive',
+  driveFileId: 'ID tệp Drive',
+  driveFileUrl: 'Liên kết Drive',
+  driveFilePreserved: 'Tệp Drive được giữ nguyên',
+  status: 'Trạng thái',
+  deleteReason: 'Lý do xóa',
+  excelDeleteSyncStatus: 'Trạng thái đồng bộ VB đã xóa',
+  syncStatus: 'Trạng thái đồng bộ Excel',
+  needsReview: 'Cờ cần kiểm tra',
+};
+
+function formatAuditFieldLabel(field: string): string {
+  return AUDIT_FIELD_LABELS[field] || field;
+}
+
 export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   documents,
+  deletedDocuments = [],
   documentTypes,
   books,
   activeBookId,
@@ -102,6 +193,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   initialOpenDocId,
   onClearInitialOpenDocId,
 }) => {
+  const [registrySection, setRegistrySection] = useState<'active' | 'deleted' | 'history'>('active');
   // Search & Filter State
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<'all' | 'outgoing' | 'incoming'>('all');
@@ -144,8 +236,31 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   const [cancelError, setCancelError] = useState<string | null>(null);
 
   // Delete form state
+  const [deleteReason, setDeleteReason] = useState('');
+  const [deleteConfirmed, setDeleteConfirmed] = useState(false);
   const [deleteSubmitting, setDeleteSubmitting] = useState(false);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+
+  // Deleted documents tab filters & retry Excel state
+  const [deletedSearch, setDeletedSearch] = useState('');
+  const [deletedByFilter, setDeletedByFilter] = useState('all');
+  const [deletedFromDate, setDeletedFromDate] = useState('');
+  const [deletedToDate, setDeletedToDate] = useState('');
+  const [deletedSyncFilter, setDeletedSyncFilter] = useState<'all' | 'synced' | 'pending_sync'>('all');
+  const [retryingSyncDocId, setRetryingSyncDocId] = useState<string | null>(null);
+  const [syncRetryNotice, setSyncRetryNotice] = useState<{ type: 'success' | 'error'; message: string } | null>(null);
+
+  // History tab state
+  const [historyLogs, setHistoryLogs] = useState<DocumentHistoryEntry[]>([]);
+  const [historyActors, setHistoryActors] = useState<Array<{ userId: string; username: string; userName: string }>>([]);
+  const [historyTotal, setHistoryTotal] = useState<number>(0);
+  const [historyLoading, setHistoryLoading] = useState<boolean>(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyActorFilter, setHistoryActorFilter] = useState<string>('all');
+  const [historyActionFilter, setHistoryActionFilter] = useState<string>('all');
+  const [historyFromDate, setHistoryFromDate] = useState<string>('');
+  const [historyToDate, setHistoryToDate] = useState<string>('');
+  const [historySearch, setHistorySearch] = useState<string>('');
 
   // Attachment Upload / Retry / Replace modal state
   const [uploadModalDoc, setUploadModalDoc] = useState<DocumentRecord | null>(null);
@@ -159,7 +274,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   const [exportError, setExportError] = useState<string | null>(null);
 
   const viewableBooks = useMemo(
-    () => books.filter((b) => hasBookPermission(currentUser, b.id, 'view')),
+    () => books.filter((b) => isSystemAdmin(currentUser) || hasBookPermission(currentUser, b.id, 'view')),
     [books, currentUser]
   );
 
@@ -176,7 +291,9 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   // Auto-open specific document when navigated from "Mở hồ sơ đã có"
   useEffect(() => {
     if (!initialOpenDocId) return;
-    const target = documents.find((d) => d.id === initialOpenDocId);
+    const target =
+      documents.find((d) => d.id === initialOpenDocId) ||
+      deletedDocuments.find((d) => d.id === initialOpenDocId);
     if (target) {
       setDetailModalDoc(target);
       onClearInitialOpenDocId?.();
@@ -193,10 +310,43 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
       .finally(() => {
         onClearInitialOpenDocId?.();
       });
-  }, [initialOpenDocId, documents, onClearInitialOpenDocId]);
+  }, [initialOpenDocId, documents, deletedDocuments, onClearInitialOpenDocId]);
+
+  const effectiveBookScope = useMemo(() => {
+    if (viewableBooks.length === 1) return viewableBooks[0].id;
+    return activeBookId || 'all';
+  }, [viewableBooks, activeBookId]);
+
+  const fetchDocumentHistory = useCallback(async () => {
+    setHistoryLoading(true);
+    setHistoryError(null);
+    try {
+      const res = await api.getDocumentHistory({
+        bookId: effectiveBookScope !== 'all' ? effectiveBookScope : undefined,
+        username: historyActorFilter !== 'all' ? historyActorFilter : undefined,
+        action: historyActionFilter !== 'all' ? historyActionFilter : undefined,
+        fromDate: historyFromDate || undefined,
+        toDate: historyToDate || undefined,
+        search: historySearch.trim() || undefined,
+      });
+      setHistoryLogs(res.logs);
+      setHistoryActors(res.actors);
+      setHistoryTotal(res.total);
+    } catch (err: any) {
+      setHistoryError(err.message || 'Không tải được lịch sử thao tác.');
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [effectiveBookScope, historyActorFilter, historyActionFilter, historyFromDate, historyToDate, historySearch]);
+
+  useEffect(() => {
+    if (registrySection === 'history') {
+      fetchDocumentHistory();
+    }
+  }, [registrySection, fetchDocumentHistory, documents.length, deletedDocuments.length]);
 
   const canRetryOrAttachDoc = (doc: DocumentRecord) => {
-    if (doc.status === 'cancelled') return false;
+    if (doc.status === 'cancelled' || doc.status === 'deleted') return false;
     const bId = getDocBookId(doc);
     return (
       isSystemAdmin(currentUser) ||
@@ -207,21 +357,37 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   };
 
   const canReplaceDocFile = (doc: DocumentRecord) => {
-    if (doc.status === 'cancelled') return false;
+    if (doc.status === 'cancelled' || doc.status === 'deleted') return false;
     const bId = getDocBookId(doc);
     return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'replace_file');
   };
 
   const canEditDoc = (doc: DocumentRecord) => {
-    if (doc.status === 'cancelled') return false;
+    if (doc.status === 'cancelled' || doc.status === 'deleted') return false;
     const bId = getDocBookId(doc);
     return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'edit');
   };
 
   const canCancelDoc = (doc: DocumentRecord) => {
-    if (doc.status === 'cancelled') return false;
+    if (doc.status === 'cancelled' || doc.status === 'deleted') return false;
     const bId = getDocBookId(doc);
     return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'cancel');
+  };
+
+  const canDeleteDoc = (doc: DocumentRecord) => {
+    if (doc.status === 'deleted') return false;
+    const bId = getDocBookId(doc);
+    return isSystemAdmin(currentUser) || hasBookPermission(currentUser, bId, 'delete');
+  };
+
+  const canRetryExcelSync = (doc: DocumentRecord) => {
+    const bId = getDocBookId(doc);
+    return (
+      isSystemAdmin(currentUser) ||
+      hasBookPermission(currentUser, bId, 'delete') ||
+      hasBookPermission(currentUser, bId, 'edit') ||
+      hasBookPermission(currentUser, bId, 'manage_book')
+    );
   };
 
   const canExportScope = useMemo(() => {
@@ -557,23 +723,152 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
     }
   };
 
-  const handleConfirmDelete = async () => {
-    if (!deleteModalDoc) return;
+  const openDeleteModal = (doc: DocumentRecord) => {
+    setDeleteModalDoc(doc);
+    setDeleteReason('');
+    setDeleteConfirmed(false);
+    setDeleteError(null);
+  };
+
+  const handleConfirmDelete = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    if (!deleteModalDoc || deleteSubmitting) return;
+    if (!deleteReason.trim()) {
+      setDeleteError('Vui lòng nhập lý do xóa văn bản.');
+      return;
+    }
+    if (!deleteConfirmed) {
+      setDeleteError('Vui lòng đánh dấu xác nhận trước khi xóa văn bản.');
+      return;
+    }
     setDeleteSubmitting(true);
     setDeleteError(null);
     try {
-      await api.deleteDocument(deleteModalDoc.id);
-      if (detailModalDoc && detailModalDoc.id === deleteModalDoc.id) {
-        setDetailModalDoc(null);
+      const res = await api.deleteDocument(deleteModalDoc.id, deleteReason.trim(), true);
+      if (res.document) {
+        onDocumentUpdated(res.document);
+        if (detailModalDoc && detailModalDoc.id === res.document.id) {
+          setDetailModalDoc(res.document);
+        }
       }
-      onRefresh();
       setDeleteModalDoc(null);
+      setDeleteReason('');
+      setDeleteConfirmed(false);
+      onRefresh();
     } catch (err: any) {
       setDeleteError(err.message || 'Lỗi khi xóa văn bản');
     } finally {
       setDeleteSubmitting(false);
     }
   };
+
+  const handleRetryExcelSync = async (doc: DocumentRecord) => {
+    if (retryingSyncDocId) return;
+    setRetryingSyncDocId(doc.id);
+    setSyncRetryNotice(null);
+    try {
+      const res = await api.retryDocumentExcelSync(doc.id);
+      if (res.document) {
+        onDocumentUpdated(res.document);
+        if (detailModalDoc && detailModalDoc.id === res.document.id) {
+          setDetailModalDoc(res.document);
+        }
+      }
+      setSyncRetryNotice({
+        type: 'success',
+        message: res.message || `Đã đồng bộ lại văn bản ${doc.fullDocNumber} sang sheet VB đã xóa.`,
+      });
+    } catch (err: any) {
+      if (err.document) {
+        onDocumentUpdated(err.document);
+        if (detailModalDoc && detailModalDoc.id === err.document.id) {
+          setDetailModalDoc(err.document);
+        }
+      }
+      setSyncRetryNotice({
+        type: 'error',
+        message: err.message || 'Đồng bộ lại Excel chưa thành công. Vui lòng thử lại sau.',
+      });
+    } finally {
+      setRetryingSyncDocId(null);
+    }
+  };
+
+  // Deleted documents derived lists
+  const pendingExcelSyncCount = useMemo(
+    () =>
+      deletedDocuments.filter(
+        (d) => d.excelDeleteSyncStatus === 'failed' || d.excelDeleteSyncStatus === 'pending'
+      ).length,
+    [deletedDocuments]
+  );
+
+  const availableDeletedActors = useMemo(() => {
+    const map = new Map<string, string>();
+    deletedDocuments.forEach((d) => {
+      const key = d.deletedByUsername || d.deletedByUserId || '';
+      if (key && !map.has(key)) {
+        map.set(key, d.deletedBy || key);
+      }
+    });
+    return Array.from(map.entries()).map(([username, label]) => ({ username, label }));
+  }, [deletedDocuments]);
+
+  const filteredDeletedDocuments = useMemo(() => {
+    let list = [...deletedDocuments];
+    if (effectiveBookScope && effectiveBookScope !== 'all') {
+      list = list.filter((d) => getDocBookId(d) === effectiveBookScope);
+    }
+    if (deletedByFilter !== 'all') {
+      list = list.filter(
+        (d) => (d.deletedByUsername || d.deletedByUserId || '') === deletedByFilter
+      );
+    }
+    if (deletedSyncFilter === 'synced') {
+      list = list.filter((d) => d.excelDeleteSyncStatus === 'synced');
+    } else if (deletedSyncFilter === 'pending_sync') {
+      list = list.filter(
+        (d) => d.excelDeleteSyncStatus === 'failed' || d.excelDeleteSyncStatus === 'pending'
+      );
+    }
+    if (deletedFromDate) {
+      list = list.filter((d) => {
+        const key = d.deletedAt
+          ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).format(new Date(d.deletedAt))
+          : '';
+        return key >= deletedFromDate;
+      });
+    }
+    if (deletedToDate) {
+      list = list.filter((d) => {
+        const key = d.deletedAt
+          ? new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh' }).format(new Date(d.deletedAt))
+          : '';
+        return key <= deletedToDate;
+      });
+    }
+    if (deletedSearch.trim()) {
+      const term = deletedSearch.trim().toLowerCase();
+      list = list.filter(
+        (d) =>
+          d.fullDocNumber.toLowerCase().includes(term) ||
+          (d.docName || d.title || '').toLowerCase().includes(term) ||
+          (d.deleteReason || '').toLowerCase().includes(term) ||
+          (d.deletedBy || '').toLowerCase().includes(term) ||
+          d.id.toLowerCase().includes(term)
+      );
+    }
+    list.sort((a, b) => new Date(b.deletedAt || b.createdAt).getTime() - new Date(a.deletedAt || a.createdAt).getTime());
+    return list;
+  }, [
+    deletedDocuments,
+    effectiveBookScope,
+    deletedByFilter,
+    deletedSyncFilter,
+    deletedFromDate,
+    deletedToDate,
+    deletedSearch,
+  ]);
 
   // Export Excel preserving ALL active filters + sort order + permissions
   const handleExportExcel = async () => {
@@ -686,6 +981,81 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         </div>
       )}
 
+      {/* Registry Sub-navigation: Danh sách hiệu lực / VB đã xóa / Lịch sử thao tác */}
+      <div className="flex items-center gap-2 overflow-x-auto pb-1">
+        <button
+          type="button"
+          onClick={() => setRegistrySection('active')}
+          className={`inline-flex items-center gap-2 px-3.5 py-2 min-h-[40px] rounded-lg text-xs font-bold border transition-colors shrink-0 ${
+            registrySection === 'active'
+              ? 'bg-sky-900 text-white border-sky-900 shadow-xs'
+              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+          }`}
+        >
+          <FileText className="w-3.5 h-3.5 shrink-0" />
+          <span>Sổ văn bản hiệu lực</span>
+          <span
+            className={`font-mono text-[11px] px-1.5 py-0.5 rounded ${
+              registrySection === 'active' ? 'bg-sky-800 text-sky-100' : 'bg-slate-100 text-slate-700'
+            }`}
+          >
+            {documents.length}
+          </span>
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setRegistrySection('deleted')}
+          className={`inline-flex items-center gap-2 px-3.5 py-2 min-h-[40px] rounded-lg text-xs font-bold border transition-colors shrink-0 ${
+            registrySection === 'deleted'
+              ? 'bg-rose-800 text-white border-rose-800 shadow-xs'
+              : 'bg-white text-slate-700 border-slate-200 hover:bg-rose-50/50'
+          }`}
+        >
+          <Trash2 className="w-3.5 h-3.5 shrink-0" />
+          <span>VB đã xóa</span>
+          <span
+            className={`font-mono text-[11px] px-1.5 py-0.5 rounded ${
+              registrySection === 'deleted' ? 'bg-rose-700 text-rose-100' : 'bg-slate-100 text-slate-700'
+            }`}
+          >
+            {deletedDocuments.length}
+          </span>
+          {pendingExcelSyncCount > 0 && (
+            <span
+              className="inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300"
+              title="Có văn bản chờ đồng bộ sang sheet VB đã xóa"
+            >
+              Chờ Excel: {pendingExcelSyncCount}
+            </span>
+          )}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => setRegistrySection('history')}
+          className={`inline-flex items-center gap-2 px-3.5 py-2 min-h-[40px] rounded-lg text-xs font-bold border transition-colors shrink-0 ${
+            registrySection === 'history'
+              ? 'bg-sky-900 text-white border-sky-900 shadow-xs'
+              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+          }`}
+        >
+          <History className="w-3.5 h-3.5 shrink-0" />
+          <span>Lịch sử thao tác</span>
+          {historyTotal > 0 && (
+            <span
+              className={`font-mono text-[11px] px-1.5 py-0.5 rounded ${
+                registrySection === 'history' ? 'bg-sky-800 text-sky-100' : 'bg-slate-100 text-slate-700'
+              }`}
+            >
+              {historyTotal}
+            </span>
+          )}
+        </button>
+      </div>
+
+      {registrySection === 'active' && (
+        <>
       {/* Filter & Search Bar */}
       <div className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 shadow-xs space-y-3">
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-12 gap-2.5">
@@ -1026,12 +1396,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                           <Ban className="w-4 h-4" />
                         </button>
                       )}
-                      {isSystemAdmin(currentUser) && (
+                      {canDeleteDoc(doc) && (
                         <button
                           type="button"
-                          onClick={() => setDeleteModalDoc(doc)}
+                          onClick={() => openDeleteModal(doc)}
                           className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-600 hover:text-rose-600 hover:bg-white rounded"
-                          title="Xóa văn bản"
+                          title="Xóa văn bản (chuyển sang VB đã xóa)"
                         >
                           <Trash2 className="w-4 h-4" />
                         </button>
@@ -1271,12 +1641,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                             </button>
                           )}
 
-                          {isSystemAdmin(currentUser) && (
+                          {canDeleteDoc(doc) && (
                             <button
                               type="button"
-                              onClick={() => setDeleteModalDoc(doc)}
+                              onClick={() => openDeleteModal(doc)}
                               className="p-1 text-slate-500 hover:text-rose-600 hover:bg-slate-100 rounded"
-                              title="Xóa văn bản (Quản trị viên)"
+                              title="Xóa văn bản (chuyển sang VB đã xóa)"
                             >
                               <Trash2 className="w-3.5 h-3.5" />
                             </button>
@@ -1291,6 +1661,411 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
           </table>
         </div>
       </div>
+        </>
+      )}
+
+      {/* SECTION 2: VB ĐÃ XÓA */}
+      {registrySection === 'deleted' && (
+        <div className="space-y-4">
+          {syncRetryNotice && (
+            <div
+              className={`p-3 rounded-lg border text-xs flex items-center justify-between gap-2 ${
+                syncRetryNotice.type === 'success'
+                  ? 'bg-emerald-50 border-emerald-200 text-emerald-900'
+                  : 'bg-rose-50 border-rose-200 text-rose-900'
+              }`}
+            >
+              <span className="break-words">{syncRetryNotice.message}</span>
+              <button
+                type="button"
+                onClick={() => setSyncRetryNotice(null)}
+                className="p-1 shrink-0"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+          )}
+
+          <div className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 shadow-xs space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
+              <div className="lg:col-span-2 relative min-w-0">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                <input
+                  type="text"
+                  value={deletedSearch}
+                  onChange={(e) => setDeletedSearch(e.target.value)}
+                  placeholder="Tìm số VB, tên VB, lý do xóa, người xóa..."
+                  className="w-full min-h-[42px] h-10 pl-9 pr-3 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-rose-600"
+                />
+              </div>
+
+              <select
+                aria-label="Lọc theo người xóa"
+                value={deletedByFilter}
+                onChange={(e) => setDeletedByFilter(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              >
+                <option value="all">Tất cả người xóa</option>
+                {availableDeletedActors.map((a) => (
+                  <option key={a.username} value={a.username}>
+                    {a.label}
+                  </option>
+                ))}
+              </select>
+
+              <select
+                aria-label="Lọc trạng thái đồng bộ Excel"
+                value={deletedSyncFilter}
+                onChange={(e) => setDeletedSyncFilter(e.target.value as any)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              >
+                <option value="all">Mọi trạng thái Excel</option>
+                <option value="pending_sync">Chờ đồng bộ Excel</option>
+                <option value="synced">Đã đồng bộ VB đã xóa</option>
+              </select>
+
+              <input
+                type="date"
+                aria-label="Từ ngày xóa"
+                value={deletedFromDate}
+                onChange={(e) => setDeletedFromDate(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              />
+
+              <input
+                type="date"
+                aria-label="Đến ngày xóa"
+                value={deletedToDate}
+                onChange={(e) => setDeletedToDate(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              />
+            </div>
+
+            <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+              <span>
+                Hiển thị <strong className="font-mono text-slate-800">{filteredDeletedDocuments.length}</strong> văn bản đã xóa (số văn bản trong dãy và tệp trên Google Drive vẫn được bảo toàn).
+              </span>
+              {(deletedSearch || deletedByFilter !== 'all' || deletedSyncFilter !== 'all' || deletedFromDate || deletedToDate) && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDeletedSearch('');
+                    setDeletedByFilter('all');
+                    setDeletedSyncFilter('all');
+                    setDeletedFromDate('');
+                    setDeletedToDate('');
+                  }}
+                  className="text-sky-700 hover:underline font-semibold"
+                >
+                  Đặt lại bộ lọc
+                </button>
+              )}
+            </div>
+          </div>
+
+          {filteredDeletedDocuments.length === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-slate-400">
+              <p className="font-semibold text-slate-600 text-sm">Không có văn bản đã xóa nào</p>
+              <span className="text-xs text-slate-400 mt-1 block">
+                Khi xóa văn bản khỏi danh sách hiệu lực, hồ sơ sẽ lưu tại đây và đồng bộ sang sheet &ldquo;VB đã xóa&rdquo;.
+              </span>
+            </div>
+          ) : (
+            <div className="space-y-3">
+              {filteredDeletedDocuments.map((doc) => {
+                const syncMeta = getExcelDeleteSyncMeta(doc);
+                const bookObj = bookMap.get(getDocBookId(doc));
+                return (
+                  <div
+                    key={doc.id}
+                    className="bg-white border border-rose-200 rounded-xl p-4 shadow-2xs space-y-3"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+                      <div className="space-y-1 min-w-0">
+                        <div className="flex items-center gap-2 flex-wrap">
+                          <span className="font-mono font-bold text-rose-900 bg-rose-50 border border-rose-200 px-2.5 py-0.5 rounded text-xs">
+                            {doc.fullDocNumber}
+                          </span>
+                          <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200">
+                            {bookObj?.name || doc.bookName || 'Đoàn trường'}
+                          </span>
+                          <span className="font-mono text-[10px] text-slate-400">
+                            Mã hồ sơ: {doc.id}
+                          </span>
+                        </div>
+                        <h3 className="text-sm font-bold text-slate-900 break-words">
+                          {doc.docName || doc.title}
+                        </h3>
+                      </div>
+
+                      <span className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-2.5 py-1 rounded border shrink-0 ${syncMeta.className}`}>
+                        <span>{syncMeta.label}</span>
+                      </span>
+                    </div>
+
+                    <div className="grid grid-cols-1 sm:grid-cols-3 gap-2.5 p-3 bg-rose-50/50 border border-rose-100 rounded-lg text-xs">
+                      <div>
+                        <span className="text-slate-500 block text-[11px]">Người xóa:</span>
+                        <span className="font-semibold text-slate-900">{doc.deletedBy || '—'}</span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[11px]">Thời điểm xóa (giờ VN):</span>
+                        <span className="font-mono font-semibold text-slate-900">
+                          {doc.deletedAtVietnam || (doc.deletedAt ? new Date(doc.deletedAt).toLocaleString('vi-VN') : '—')}
+                        </span>
+                      </div>
+                      <div>
+                        <span className="text-slate-500 block text-[11px]">Lý do xóa:</span>
+                        <span className="font-medium text-rose-900 break-words">{doc.deleteReason || '—'}</span>
+                      </div>
+                    </div>
+
+                    {doc.excelSyncError && syncMeta.needsRetry && (
+                      <div className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                        <strong>Chi tiết lỗi đồng bộ Excel:</strong> {doc.excelSyncError}
+                      </div>
+                    )}
+
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-2 border-t border-slate-100 text-xs">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {doc.driveStatus === 'saved' && doc.driveFileUrl ? (
+                          <button
+                            type="button"
+                            onClick={() => handleOpenDriveFile(doc)}
+                            disabled={openingFileId === doc.id}
+                            className="inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 font-semibold text-emerald-700 bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 rounded-lg"
+                          >
+                            <ExternalLink className="w-3.5 h-3.5" />
+                            <span>Mở tệp Drive ({doc.driveFileName || 'Tệp gốc'})</span>
+                          </button>
+                        ) : (
+                          <span className="text-[11px] text-slate-400">Không có tệp Drive đính kèm</span>
+                        )}
+                      </div>
+
+                      <div className="flex items-center gap-2 flex-wrap">
+                        {syncMeta.needsRetry && canRetryExcelSync(doc) && (
+                          <button
+                            type="button"
+                            onClick={() => handleRetryExcelSync(doc)}
+                            disabled={retryingSyncDocId === doc.id}
+                            className="inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white rounded-lg shadow-2xs"
+                          >
+                            <RotateCw className={`w-3.5 h-3.5 ${retryingSyncDocId === doc.id ? 'animate-spin' : ''}`} />
+                            <span>{retryingSyncDocId === doc.id ? 'Đang đồng bộ...' : 'Thử đồng bộ lại'}</span>
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          onClick={() => setDetailModalDoc(doc)}
+                          className="inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 rounded-lg"
+                        >
+                          <Eye className="w-3.5 h-3.5" />
+                          <span>Xem chi tiết</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* SECTION 3: LỊCH SỬ THAO TÁC (CHỈ ĐỌC, KHÔNG SỬA/XÓA) */}
+      {registrySection === 'history' && (
+        <div className="space-y-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 shadow-xs space-y-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-6 gap-2.5">
+              <div className="lg:col-span-2 relative min-w-0">
+                <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
+                <input
+                  type="text"
+                  value={historySearch}
+                  onChange={(e) => setHistorySearch(e.target.value)}
+                  placeholder="Tìm số VB, mã hồ sơ, tên VB, tài khoản, lý do..."
+                  className="w-full min-h-[42px] h-10 pl-9 pr-3 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                />
+              </div>
+
+              <select
+                aria-label="Lọc theo tài khoản"
+                value={historyActorFilter}
+                onChange={(e) => setHistoryActorFilter(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              >
+                <option value="all">Tất cả tài khoản</option>
+                {historyActors.map((actor) => (
+                  <option key={actor.username} value={actor.username}>
+                    {actor.userName} ({actor.username})
+                  </option>
+                ))}
+              </select>
+
+              <select
+                aria-label="Lọc theo loại thao tác"
+                value={historyActionFilter}
+                onChange={(e) => setHistoryActionFilter(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              >
+                <option value="all">Tất cả thao tác</option>
+                <option value="update">Sửa văn bản</option>
+                <option value="delete">Xóa văn bản</option>
+                <option value="replace_file">Thay tệp Drive</option>
+                <option value="upload_word">Đính kèm Word</option>
+                <option value="upload_pdf">Lưu PDF Drive</option>
+                <option value="cancel">Hủy số</option>
+                <option value="create">Cấp số mới</option>
+                <option value="import_pdf">Nhập PDF</option>
+                <option value="retry_excel_sync">Đồng bộ lại Excel</option>
+              </select>
+
+              <input
+                type="date"
+                aria-label="Từ ngày"
+                value={historyFromDate}
+                onChange={(e) => setHistoryFromDate(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              />
+
+              <input
+                type="date"
+                aria-label="Đến ngày"
+                value={historyToDate}
+                onChange={(e) => setHistoryToDate(e.target.value)}
+                className="min-h-[42px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden"
+              />
+            </div>
+
+            <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
+              <span>
+                Nhật ký bất biến trong phạm vi sổ được phân quyền · Tổng{' '}
+                <strong className="font-mono text-slate-800">{historyTotal}</strong> bản ghi.
+              </span>
+              <div className="flex items-center gap-3">
+                {(historySearch || historyActorFilter !== 'all' || historyActionFilter !== 'all' || historyFromDate || historyToDate) && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setHistorySearch('');
+                      setHistoryActorFilter('all');
+                      setHistoryActionFilter('all');
+                      setHistoryFromDate('');
+                      setHistoryToDate('');
+                    }}
+                    className="text-sky-700 hover:underline font-semibold"
+                  >
+                    Đặt lại bộ lọc
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={fetchDocumentHistory}
+                  disabled={historyLoading}
+                  className="inline-flex items-center gap-1 text-sky-700 hover:underline font-semibold"
+                >
+                  <RefreshCw className={`w-3.5 h-3.5 ${historyLoading ? 'animate-spin' : ''}`} />
+                  <span>Tải lại nhật ký</span>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {historyError && (
+            <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800">
+              {historyError}
+            </div>
+          )}
+
+          {historyLoading && historyLogs.length === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-slate-500 text-xs flex items-center justify-center gap-2">
+              <Loader2 className="w-4 h-4 animate-spin text-sky-700" />
+              <span>Đang tải lịch sử thao tác...</span>
+            </div>
+          ) : historyLogs.length === 0 ? (
+            <div className="bg-white border border-slate-200 rounded-xl p-10 text-center text-slate-400">
+              <p className="font-semibold text-slate-600 text-sm">Chưa có bản ghi lịch sử nào phù hợp</p>
+              <span className="text-xs text-slate-400 mt-1 block">
+                Mọi thao tác cấp số, sửa thông tin, thay tệp, hủy số và xóa văn bản đều được lưu vết tự động theo tài khoản.
+              </span>
+            </div>
+          ) : (
+            <div className="space-y-2.5">
+              {historyLogs.map((entry) => {
+                const actionMeta = getAuditActionMeta(entry.action);
+                const changeEntries = Object.entries(entry.changes || {});
+                return (
+                  <div
+                    key={entry.id}
+                    className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 shadow-2xs space-y-2 text-xs"
+                  >
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex items-center gap-2 flex-wrap min-w-0">
+                        <span className={`text-[11px] font-bold px-2 py-0.5 rounded border ${actionMeta.className}`}>
+                          {actionMeta.label}
+                        </span>
+                        <span className="font-mono font-bold text-slate-900">
+                          {entry.fullDocNumber || '—'}
+                        </span>
+                        <span className="text-[11px] font-semibold px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200">
+                          {entry.bookName}
+                        </span>
+                        <span className="font-mono text-[10px] text-slate-400">
+                          Mã hồ sơ: {entry.docId}
+                        </span>
+                      </div>
+
+                      <div className="flex items-center gap-2 text-[11px] text-slate-500 shrink-0">
+                        <Clock className="w-3.5 h-3.5 text-slate-400" />
+                        <span className="font-mono font-semibold text-slate-700">
+                          {entry.timestampVietnam || new Date(entry.timestamp).toLocaleString('vi-VN')}
+                        </span>
+                      </div>
+                    </div>
+
+                    <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-slate-700">
+                      <span>
+                        <strong>Tài khoản:</strong> {entry.userName}{' '}
+                        <span className="font-mono text-slate-500">({entry.username})</span>
+                      </span>
+                      {entry.docName && (
+                        <span className="truncate max-w-full">
+                          <strong>Văn bản:</strong> {entry.docName}
+                        </span>
+                      )}
+                    </div>
+
+                    {entry.reason && (
+                      <div className="p-2 rounded bg-slate-50 border border-slate-200 text-slate-800">
+                        <strong>Lý do / Ghi nhận:</strong> {entry.reason}
+                      </div>
+                    )}
+
+                    {changeEntries.length > 0 && (
+                      <div className="p-2.5 rounded-lg bg-slate-50/80 border border-slate-200 space-y-1">
+                        {changeEntries.map(([field, delta], fIdx) => (
+                          <div key={fIdx} className="text-[11px] text-slate-700 break-words">
+                            <span className="font-semibold text-slate-800">{formatAuditFieldLabel(field)}:</span>{' '}
+                            {delta.old !== null && delta.old !== undefined ? (
+                              <>
+                                <del className="text-rose-600">{delta.old || '(trống)'}</del> →{' '}
+                              </>
+                            ) : null}
+                            <ins className="text-emerald-700 no-underline font-semibold">
+                              {delta.new || '(trống)'}
+                            </ins>
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
+        </div>
+      )}
 
       {/* MODAL 1: CHI TIẾT HỒ SƠ & LỊCH SỬ THAO TÁC */}
       {detailModalDoc && (() => {
@@ -1310,6 +2085,9 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                   </span>
                   <span className={`text-[11px] font-bold px-2 py-0.5 rounded border ${recordStatus.className}`}>
                     {recordStatus.label}
+                  </span>
+                  <span className="font-mono text-[10px] text-slate-500 bg-slate-100 px-2 py-0.5 rounded border border-slate-200">
+                    Mã hồ sơ: {detailModalDoc.id}
                   </span>
                 </div>
                 <button
@@ -1548,6 +2326,46 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     </p>
                   </div>
                 )}
+
+                {detailModalDoc.status === 'deleted' && (() => {
+                  const delSyncMeta = getExcelDeleteSyncMeta(detailModalDoc);
+                  return (
+                    <div className="sm:col-span-2 p-3.5 bg-rose-50 border border-rose-200 rounded-xl text-rose-900 space-y-2">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <strong className="text-xs font-bold text-rose-950">Thông tin xóa văn bản (VB đã xóa):</strong>
+                        <span className={`text-[11px] font-semibold px-2 py-0.5 rounded border ${delSyncMeta.className}`}>
+                          {delSyncMeta.label}
+                        </span>
+                      </div>
+                      <p className="text-xs">
+                        <strong>Lý do xóa:</strong> {detailModalDoc.deleteReason || '—'}
+                      </p>
+                      <p className="text-[11px] text-rose-700">
+                        Thực hiện bởi: <strong>{detailModalDoc.deletedBy || '—'}</strong> vào lúc{' '}
+                        <span className="font-mono">
+                          {detailModalDoc.deletedAtVietnam ||
+                            (detailModalDoc.deletedAt ? new Date(detailModalDoc.deletedAt).toLocaleString('vi-VN') : '')}
+                        </span>
+                      </p>
+                      {detailModalDoc.excelSyncError && delSyncMeta.needsRetry && (
+                        <p className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded px-2.5 py-1.5">
+                          Lỗi đồng bộ Excel: {detailModalDoc.excelSyncError}
+                        </p>
+                      )}
+                      {delSyncMeta.needsRetry && canRetryExcelSync(detailModalDoc) && (
+                        <button
+                          type="button"
+                          onClick={() => handleRetryExcelSync(detailModalDoc)}
+                          disabled={retryingSyncDocId === detailModalDoc.id}
+                          className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold bg-amber-600 hover:bg-amber-700 disabled:opacity-60 text-white rounded-lg"
+                        >
+                          <RotateCw className={`w-3.5 h-3.5 ${retryingSyncDocId === detailModalDoc.id ? 'animate-spin' : ''}`} />
+                          <span>{retryingSyncDocId === detailModalDoc.id ? 'Đang đồng bộ lại...' : 'Thử đồng bộ lại Excel'}</span>
+                        </button>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               {/* Lịch sử thao tác */}
@@ -1555,67 +2373,55 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 <div className="flex items-center gap-2 mb-3">
                   <History className="w-4 h-4 text-sky-700" />
                   <h4 className="text-xs font-bold text-slate-800 uppercase tracking-wide">
-                    Lịch sử thao tác
+                    Lịch sử thao tác (Lưu vết bất biến)
                   </h4>
                 </div>
 
                 <div className="space-y-2 text-xs">
                   {detailModalDoc.auditLogs && detailModalDoc.auditLogs.length > 0 ? (
-                    detailModalDoc.auditLogs.map((log, idx) => (
-                      <div key={idx} className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg">
-                        <div className="flex items-center justify-between text-[11px] text-slate-500 mb-1">
-                          <span className="font-semibold text-slate-700">{log.userName}</span>
-                          <span className="font-mono">
-                            {new Date(log.timestamp).toLocaleString('vi-VN')}
-                          </span>
-                        </div>
-                        <div className="text-slate-700">
-                          {log.action === 'request_number' && (
-                            <span className="text-sky-700 font-medium">Gửi yêu cầu xin số ({log.reason})</span>
-                          )}
-                          {log.action === 'create' && (
-                            <span className="text-emerald-700 font-medium">
-                              {log.reason || 'Khởi tạo và cấp số văn bản'}
-                            </span>
-                          )}
-                          {log.action === 'import_pdf' && (
-                            <span className="text-sky-700 font-medium">Ghi sổ văn bản đến ({log.reason})</span>
-                          )}
-                          {log.action === 'cancel' && (
-                            <span className="text-rose-700 font-medium">Hủy số văn bản. Lý do: {log.reason}</span>
-                          )}
-                          {(log.action === 'upload_word' || log.action === 'upload_pdf' || log.action === 'replace_file') && (
-                            <div>
-                              <span className="text-sky-700 font-medium block">
-                                {log.action === 'replace_file'
-                                  ? 'Thay tệp trên Google Drive:'
-                                  : log.action === 'upload_pdf'
-                                  ? 'Lưu bản PDF gốc lên Google Drive:'
-                                  : 'Đính kèm & lưu tệp Word lên Google Drive:'}
+                    detailModalDoc.auditLogs.map((log, idx) => {
+                      const actionMeta = getAuditActionMeta(log.action);
+                      return (
+                        <div key={log.id || idx} className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg space-y-1">
+                          <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${actionMeta.className}`}>
+                                {actionMeta.label}
                               </span>
-                              {Object.entries(log.changes).map(([field, delta]: any, fIdx) => (
-                                <p key={fIdx} className="text-[11px] text-slate-600 pl-2">
-                                  • {field}:{' '}
-                                  {delta.old ? <><del className="text-rose-600">{delta.old}</del> → </> : null}
-                                  <span className="font-mono font-medium text-emerald-700">{delta.new || '(trống)'}</span>
-                                </p>
-                              ))}
+                              <span className="font-semibold text-slate-800">
+                                {log.userName}
+                                {log.username ? ` (${log.username})` : ''}
+                              </span>
                             </div>
+                            <span className="font-mono">
+                              {log.timestampVietnam || new Date(log.timestamp).toLocaleString('vi-VN')}
+                            </span>
+                          </div>
+                          {log.reason && (
+                            <p className="text-[11px] text-slate-700">
+                              <strong>Lý do / Ghi nhận:</strong> {log.reason}
+                            </p>
                           )}
-                          {log.action === 'update' && (
-                            <div>
-                              <span className="text-amber-700 font-medium block">Cập nhật thông tin:</span>
+                          {log.changes && Object.keys(log.changes).length > 0 && (
+                            <div className="space-y-0.5 pl-2">
                               {Object.entries(log.changes).map(([field, delta]: any, fIdx) => (
-                                <p key={fIdx} className="text-[11px] text-slate-600 pl-2">
-                                  • {field}: <del className="text-rose-600">{delta.old || '(trống)'}</del> →{' '}
-                                  <ins className="text-emerald-700 no-underline font-medium">{delta.new || '(trống)'}</ins>
+                                <p key={fIdx} className="text-[11px] text-slate-600">
+                                  • {formatAuditFieldLabel(field)}:{' '}
+                                  {delta.old !== null && delta.old !== undefined ? (
+                                    <>
+                                      <del className="text-rose-600">{delta.old || '(trống)'}</del> →{' '}
+                                    </>
+                                  ) : null}
+                                  <ins className="text-emerald-700 no-underline font-medium">
+                                    {delta.new || '(trống)'}
+                                  </ins>
                                 </p>
                               ))}
                             </div>
                           )}
                         </div>
-                      </div>
-                    ))
+                      );
+                    })
                   ) : (
                     <p className="text-slate-400 italic">Không có lịch sử thao tác.</p>
                   )}
@@ -1883,18 +2689,18 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         </div>
       )}
 
-      {/* MODAL 4: XÓA VĨNH VIỄN (ADMIN) */}
+      {/* MODAL 4: XÓA VĂN BẢN (CHUYỂN SANG VB ĐÃ XÓA + BẮT BUỘC NHẬP LÝ DO & XÁC NHẬN) */}
       {deleteModalDoc && (
         <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
           <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[92dvh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <h3 className="text-base font-bold text-rose-700 flex items-center gap-2">
                 <Trash2 className="w-5 h-5 text-rose-600 shrink-0" />
-                <span>Xác nhận xóa vĩnh viễn văn bản</span>
+                <span>Xác nhận xóa văn bản</span>
               </h3>
               <button
                 type="button"
-                onClick={() => setDeleteModalDoc(null)}
+                onClick={() => !deleteSubmitting && setDeleteModalDoc(null)}
                 className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center shrink-0"
               >
                 <X className="w-5 h-5" />
@@ -1903,33 +2709,74 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
             <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-900 text-xs leading-relaxed space-y-1.5">
               <p>
-                Bạn có chắc chắn muốn xóa văn bản số{' '}
-                <strong className="font-mono text-rose-950 font-bold break-all">{deleteModalDoc.fullDocNumber}</strong>?
+                Văn bản số{' '}
+                <strong className="font-mono text-rose-950 font-bold break-all">{deleteModalDoc.fullDocNumber}</strong>{' '}
+                sẽ được chuyển khỏi danh sách hiệu lực sang mục <strong>VB đã xóa</strong> (và sheet <strong>VB đã xóa</strong> trong Excel).
               </p>
               <p className="text-[11px] text-rose-800 break-words">
                 <strong>Tên văn bản:</strong> {deleteModalDoc.docName || deleteModalDoc.title}
               </p>
+              <p className="text-[11px] text-rose-800">
+                Số đã cấp được giữ nguyên trong dãy, tệp đính kèm trên Google Drive được bảo toàn và lịch sử xóa sẽ được ghi nhận bất biến theo tài khoản đang đăng nhập.
+              </p>
             </div>
 
-            {deleteError && <div className="p-2.5 bg-rose-50 text-rose-700 rounded-lg text-xs">{deleteError}</div>}
+            <form onSubmit={handleConfirmDelete} className="space-y-3.5 text-xs">
+              <div className="space-y-1">
+                <label className="font-bold text-slate-800 block">
+                  Lý do xóa văn bản <span className="text-rose-600">*</span>
+                </label>
+                <textarea
+                  value={deleteReason}
+                  onChange={(e) => setDeleteReason(e.target.value)}
+                  placeholder="Nhập lý do xóa (ví dụ: Nhập trùng hồ sơ, văn bản thu hồi không ban hành...)"
+                  rows={3}
+                  required
+                  disabled={deleteSubmitting}
+                  className="w-full p-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-rose-600"
+                />
+              </div>
 
-            <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
-              <button
-                type="button"
-                onClick={() => setDeleteModalDoc(null)}
-                className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
-              >
-                Hủy bỏ
-              </button>
-              <button
-                type="button"
-                onClick={handleConfirmDelete}
-                disabled={deleteSubmitting}
-                className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-rose-700 hover:bg-rose-800 text-white rounded-lg shadow-xs"
-              >
-                {deleteSubmitting ? 'Đang xóa...' : 'Xác nhận xóa vĩnh viễn'}
-              </button>
-            </div>
+              <label className="flex items-start gap-2.5 p-2.5 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer select-none">
+                <input
+                  type="checkbox"
+                  checked={deleteConfirmed}
+                  onChange={(e) => setDeleteConfirmed(e.target.checked)}
+                  disabled={deleteSubmitting}
+                  className="mt-0.5 w-4 h-4 text-rose-700 border-slate-300 rounded focus:ring-rose-600 shrink-0"
+                />
+                <span className="text-xs text-slate-700 leading-snug">
+                  Tôi xác nhận xóa văn bản này khỏi sổ hiệu lực và chuyển sang <strong>VB đã xóa</strong>.
+                </span>
+              </label>
+
+              {deleteError && <div className="p-2.5 bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs">{deleteError}</div>}
+
+              <div className="flex items-center justify-end gap-2 pt-3 border-t border-slate-100">
+                <button
+                  type="button"
+                  disabled={deleteSubmitting}
+                  onClick={() => setDeleteModalDoc(null)}
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                >
+                  Hủy bỏ
+                </button>
+                <button
+                  type="submit"
+                  disabled={deleteSubmitting || !deleteReason.trim() || !deleteConfirmed}
+                  className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white rounded-lg shadow-xs inline-flex items-center gap-1.5"
+                >
+                  {deleteSubmitting ? (
+                    <>
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                      <span>Đang xóa &amp; đồng bộ...</span>
+                    </>
+                  ) : (
+                    <span>Xác nhận xóa văn bản</span>
+                  )}
+                </button>
+              </div>
+            </form>
           </div>
         </div>
       )}

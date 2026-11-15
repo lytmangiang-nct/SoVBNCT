@@ -82,6 +82,7 @@ export default function App() {
   const [documentTypes, setDocumentTypes] = useState<DocumentTypeConfig[]>([]);
   const [signers, setSigners] = useState<SignerConfig[]>([]);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
+  const [deletedDocuments, setDeletedDocuments] = useState<DocumentRecord[]>([]);
   const [loadingData, setLoadingData] = useState<boolean>(false);
   const [settingsLoaded, setSettingsLoaded] = useState<boolean>(false);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
@@ -127,6 +128,7 @@ export default function App() {
       setSettingsLoaded(false);
       setBooks([]);
       setDocuments([]);
+      setDeletedDocuments([]);
       setNumberRequests([]);
     };
     window.addEventListener('auth_expired', handleExpired);
@@ -160,10 +162,11 @@ export default function App() {
     syncInFlightRef.current = true;
     setLoadingData(true);
     try {
-      const [meRes, settingsRes, docsRes, booksRes, reqsRes] = await Promise.all([
+      const [meRes, settingsRes, docsRes, deletedDocsRes, booksRes, reqsRes] = await Promise.all([
         api.getCurrentUser(),
         api.getSettings(),
         api.getDocuments({}),
+        api.getDocuments({ status: 'deleted' }).catch(() => ({ total: 0, documents: [] as DocumentRecord[] })),
         api.getBooks(),
         api.getNumberRequests().catch(() => ({ requests: [] as NumberRequest[] })),
       ]);
@@ -192,6 +195,7 @@ export default function App() {
       setDocumentTypes(settingsRes.documentTypes);
       setSigners(settingsRes.signers);
       setDocuments(docsRes.documents);
+      setDeletedDocuments(deletedDocsRes.documents);
       setBooks(booksRes.books);
       setNumberRequests(reqsRes.requests);
       applyServerTime(settingsRes.serverTimeVietnam || booksRes.serverTimeVietnam);
@@ -252,9 +256,19 @@ export default function App() {
         try {
           const data = JSON.parse(e.data);
           const updatedDoc: DocumentRecord = data.document;
-          setDocuments((prev) =>
-            prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
-          );
+          if (updatedDoc.status === 'deleted') {
+            setDocuments((prev) => prev.filter((d) => d.id !== updatedDoc.id));
+            setDeletedDocuments((prev) => {
+              const exists = prev.some((d) => d.id === updatedDoc.id);
+              return exists
+                ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+                : [updatedDoc, ...prev];
+            });
+          } else {
+            setDocuments((prev) =>
+              prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+            );
+          }
         } catch (err) {
           console.error(err);
         }
@@ -278,6 +292,16 @@ export default function App() {
           const data = JSON.parse(e.data);
           if (data.id) {
             setDocuments((prev) => prev.filter((d) => d.id !== data.id));
+          }
+          if (data.document) {
+            const deletedDoc: DocumentRecord = data.document;
+            setDeletedDocuments((prev) => {
+              const exists = prev.some((d) => d.id === deletedDoc.id);
+              return exists
+                ? prev.map((d) => (d.id === deletedDoc.id ? deletedDoc : d))
+                : [deletedDoc, ...prev];
+            });
+            showToast(`Văn bản ${deletedDoc.fullDocNumber} đã chuyển sang VB đã xóa`, 'info');
           }
         } catch (err) {
           console.error(err);
@@ -459,6 +483,7 @@ export default function App() {
     setSyncError(null);
     setBooks([]);
     setDocuments([]);
+    setDeletedDocuments([]);
     setNumberRequests([]);
     setActiveBookId(DEFAULT_BOOK_ID);
   };
@@ -472,9 +497,19 @@ export default function App() {
   };
 
   const handleDocumentUpdated = (updatedDoc: DocumentRecord) => {
-    setDocuments((prev) =>
-      prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
-    );
+    if (updatedDoc.status === 'deleted') {
+      setDocuments((prev) => prev.filter((d) => d.id !== updatedDoc.id));
+      setDeletedDocuments((prev) => {
+        const exists = prev.some((d) => d.id === updatedDoc.id);
+        return exists
+          ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+          : [updatedDoc, ...prev];
+      });
+    } else {
+      setDocuments((prev) =>
+        prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+      );
+    }
     setLastSyncAt(new Date());
   };
 
@@ -716,6 +751,7 @@ export default function App() {
             {activeTab === 'registry' && (
               <DocumentRegistryView
                 documents={documents}
+                deletedDocuments={deletedDocuments}
                 documentTypes={documentTypes}
                 books={books.length > 0 ? books : [activeBook]}
                 activeBookId={activeBook.id}

@@ -28,9 +28,9 @@ import type {
   BookPermission,
   DocumentTypeConfig,
   GoogleDriveAuthMode,
-  PreviewNumberResponse,
   RegistryBook,
   SignerConfig,
+  StartSequenceSeriesConfig,
   SystemAuditLog,
   SystemSettings,
   User,
@@ -64,86 +64,139 @@ interface SettingsViewProps {
   onRefreshData: () => void;
 }
 
-const GOOGLE_APPS_SCRIPT_TEMPLATE = `function doPost(e) {
+const GOOGLE_APPS_SCRIPT_TEMPLATE = `function getOrCreateSheetWithHeaders(ss, name, headers, headerBg) {
+  var sheet = ss.getSheetByName(name);
+  if (!sheet) {
+    sheet = ss.insertSheet(name);
+  }
+  if (sheet.getLastRow() === 0) {
+    sheet.appendRow(headers);
+    var headerRange = sheet.getRange(1, 1, 1, headers.length);
+    headerRange.setBackground(headerBg || "#005BAA");
+    headerRange.setFontColor("#FFFFFF");
+    headerRange.setFontWeight("bold");
+  }
+  return sheet;
+}
+
+function findRowBySystemId(sheet, docId, fallbackIdx) {
+  var rows = sheet.getDataRange().getValues();
+  if (!rows || rows.length <= 1) return -1;
+  var headerRow = rows[0] || [];
+  var idColIdx = headerRow.indexOf("Mã hệ thống");
+  if (idColIdx === -1) idColIdx = fallbackIdx;
+  for (var i = 1; i < rows.length; i++) {
+    if (String(rows[i][idColIdx]) === String(docId)) {
+      return i + 1;
+    }
+  }
+  return -1;
+}
+
+function doPost(e) {
   try {
     var data = JSON.parse(e.postData.contents);
     var ss = SpreadsheetApp.getActiveSpreadsheet();
     var sheetName = (data.bookCode || "DOAN_TRUONG").toString().trim();
-    var sheet = ss.getSheetByName(sheetName);
-    if (!sheet) {
-      sheet = ss.insertSheet(sheetName);
-    }
+    var deletedSheetName = (data.deletedSheetName || "VB đã xóa").toString().trim();
 
-    var HEADERS = [
+    var MAIN_HEADERS = [
       "STT", "Năm", "Ngày ban hành", "Ngày ký", "Nhóm VB", "Loại văn bản",
       "Số thứ tự", "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
       "Người ký", "Chức vụ", "Người thao tác", "Trạng thái hồ sơ",
       "Trạng thái tệp Drive", "Tên tệp Drive", "ID tệp Drive", "Liên kết Drive",
-      "Ghi chú", "Mã hệ thống", "Mã sổ", "Thời điểm cập nhật"
+      "Ghi chú", "Mã hệ thống", "Mã sổ", "Sổ", "Thời điểm cập nhật"
     ];
 
-    if (sheet.getLastRow() === 0) {
-      sheet.appendRow(HEADERS);
-      var headerRange = sheet.getRange(1, 1, 1, HEADERS.length);
-      headerRange.setBackground("#005BAA");
-      headerRange.setFontColor("#FFFFFF");
-      headerRange.setFontWeight("bold");
-    }
+    var DELETED_HEADERS = [
+      "STT", "Năm", "Ngày ban hành", "Ngày ký", "Nhóm VB", "Loại văn bản",
+      "Số thứ tự", "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
+      "Người ký", "Chức vụ", "Người thao tác", "Trạng thái hồ sơ",
+      "Trạng thái tệp Drive", "Tên tệp Drive", "ID tệp Drive", "Liên kết Drive",
+      "Ghi chú", "Mã hệ thống", "Mã sổ", "Sổ",
+      "Người xóa", "Thời điểm xóa", "Lý do xóa", "Thời điểm đồng bộ"
+    ];
 
     var docNameVal = data.docName || data.title || "";
     var titleVal = data.title || "";
-    var nowStr = new Date().toLocaleString("vi-VN");
+    var bookNameVal = data.bookName || sheetName;
+    var nowStr = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
+    var action = (data.action || "update").toString().trim();
+
+    // Bước 1 xóa: Tạo/lấy sheet "VB đã xóa" và ghi dòng theo Mã hệ thống (không trùng lặp), giữ liên kết Drive
+    if (action === "delete_append_to_deleted" || action === "delete") {
+      var delSheet = getOrCreateSheetWithHeaders(ss, deletedSheetName, DELETED_HEADERS, "#991B1B");
+      var delRowValues = [
+        data.stt, data.year, data.issueDate || "", data.signDate || "",
+        data.docCategory || "Văn bản đi", data.typeName || "", data.sequenceNumber,
+        data.fullDocNumber || "", docNameVal, titleVal,
+        data.signer || "", data.signerRole || "", data.issuedBy || "",
+        "Đã xóa", data.driveStatus || "Không đính kèm",
+        data.driveFileName || "", data.driveFileId || "", data.driveFileUrl || "",
+        data.notes || "", data.id, sheetName, bookNameVal,
+        data.deletedBy || "", data.deletedAtVietnam || nowStr, data.deleteReason || "", nowStr
+      ];
+      var existingDelRow = findRowBySystemId(delSheet, data.id, 19);
+      if (existingDelRow > 0) {
+        delSheet.getRange(existingDelRow, 1, 1, delRowValues.length).setValues([delRowValues]);
+      } else {
+        delSheet.appendRow(delRowValues);
+      }
+      var confirmedDelRow = findRowBySystemId(delSheet, data.id, 19);
+      if (confirmedDelRow <= 0) {
+        throw new Error("Không xác nhận được dòng đã ghi trong sheet " + deletedSheetName);
+      }
+      if (action === "delete_append_to_deleted") {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: "success", action: action, confirmed: true, deletedSheet: deletedSheetName
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+    }
+
+    // Bước 2 xóa: Chỉ xóa dòng khỏi sheet chính sau khi đã xác nhận có trong sheet "VB đã xóa"
+    if (action === "delete_remove_main" || action === "delete") {
+      var verifyDelSheet = ss.getSheetByName(deletedSheetName);
+      var verifiedRow = verifyDelSheet ? findRowBySystemId(verifyDelSheet, data.id, 19) : -1;
+      if (verifiedRow <= 0) {
+        return ContentService.createTextOutput(JSON.stringify({
+          result: "error", error: "Chưa tìm thấy hồ sơ trong " + deletedSheetName + ", không xóa khỏi sheet chính."
+        })).setMimeType(ContentService.MimeType.JSON);
+      }
+      var mainSheetForDelete = ss.getSheetByName(sheetName);
+      if (mainSheetForDelete) {
+        var rowToRemove = findRowBySystemId(mainSheetForDelete, data.id, 19);
+        if (rowToRemove > 0) {
+          mainSheetForDelete.deleteRow(rowToRemove);
+        }
+      }
+      return ContentService.createTextOutput(JSON.stringify({
+        result: "success", action: action, removedFromMain: true, tab: sheetName
+      })).setMimeType(ContentService.MimeType.JSON);
+    }
+
+    var sheet = getOrCreateSheetWithHeaders(ss, sheetName, MAIN_HEADERS, "#005BAA");
 
     // Thao tác kiểm tra kết nối theo đúng tab của sổ
-    if (data.action === "test") {
+    if (action === "test") {
       sheet.appendRow([
         0, data.year, data.issueDate, data.signDate || "", data.docCategory || "Văn bản đi",
         data.typeName, 0, data.fullDocNumber, docNameVal, titleVal,
         data.signer, data.signerRole, data.issuedBy, data.status,
         data.driveStatus || "Không đính kèm", data.driveFileName || "", data.driveFileId || "",
-        data.driveFileUrl || "", data.notes || "", data.id, sheetName, nowStr
+        data.driveFileUrl || "", data.notes || "", data.id, sheetName, bookNameVal, nowStr
       ]);
       return ContentService.createTextOutput(JSON.stringify({result: "success", action: "test", tab: sheetName}))
         .setMimeType(ContentService.MimeType.JSON);
     }
 
-    var docId = data.id;
-    var rows = sheet.getDataRange().getValues();
-    var headerRow = rows[0] || HEADERS;
-    var idColIdx = headerRow.indexOf("Mã hệ thống");
-    if (idColIdx === -1) idColIdx = 19;
-
-    var foundRowIndex = -1;
-    for (var i = 1; i < rows.length; i++) {
-      if (rows[i][idColIdx] === docId) {
-        foundRowIndex = i + 1;
-        break;
-      }
-    }
-
+    var foundRowIndex = findRowBySystemId(sheet, data.id, 19);
     var rowValues = [
-      data.stt,
-      data.year,
-      data.issueDate,
-      data.signDate || "",
-      data.docCategory || "Văn bản đi",
-      data.typeName,
-      data.sequenceNumber,
-      data.fullDocNumber,
-      docNameVal,
-      titleVal,
-      data.signer,
-      data.signerRole,
-      data.issuedBy,
-      data.status,
-      data.driveStatus || "Không đính kèm",
-      data.driveFileName || "",
-      data.driveFileId || "",
-      data.driveFileUrl || "",
-      data.notes || "",
-      data.id,
-      sheetName,
-      nowStr
+      data.stt, data.year, data.issueDate, data.signDate || "",
+      data.docCategory || "Văn bản đi", data.typeName, data.sequenceNumber,
+      data.fullDocNumber, docNameVal, titleVal, data.signer, data.signerRole,
+      data.issuedBy, data.status, data.driveStatus || "Không đính kèm",
+      data.driveFileName || "", data.driveFileId || "", data.driveFileUrl || "",
+      data.notes || "", data.id, sheetName, bookNameVal, nowStr
     ];
 
     if (foundRowIndex > 0) {
@@ -419,17 +472,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [modeError, setModeError] = useState<string | null>(null);
   const [modeSuccess, setModeSuccess] = useState(false);
 
-  // Custom Starting Sequence
+  // Custom Starting Sequence (keyed strictly by bookId + year + typeCode)
   const [seqYear, setSeqYear] = useState<number>(currentYear);
-  const [seqTypeCode, setSeqTypeCode] = useState<string>(
-    selectedBook.numberMode === 'shared' ? 'SHARED' : documentTypes[0]?.code || 'KH'
-  );
-  const [startSequenceVal, setStartSequenceVal] = useState<number>(1);
-  const [seqSaving, setSeqSaving] = useState(false);
-  const [seqError, setSeqError] = useState<string | null>(null);
-  const [seqSuccess, setSeqSuccess] = useState(false);
-  const [seqPreview, setSeqPreview] = useState<PreviewNumberResponse | null>(null);
-  const [seqPreviewLoading, setSeqPreviewLoading] = useState(false);
+  const [seqTypeCode, setSeqTypeCode] = useState<string>(() => {
+    if (selectedBook.numberMode === 'shared') return 'SHARED';
+    return getBookEnabledTypes(selectedBook, documentTypes)[0]?.code || 'KH';
+  });
+  const [savedSeriesMap, setSavedSeriesMap] = useState<Record<string, StartSequenceSeriesConfig>>({});
+  const [draftStartInputBySeries, setDraftStartInputBySeries] = useState<Record<string, string>>({});
+  const [seqConfigLoading, setSeqConfigLoading] = useState(false);
+  const [seqConfigLoadError, setSeqConfigLoadError] = useState<string | null>(null);
+  const [savingSeriesMap, setSavingSeriesMap] = useState<Record<string, boolean>>({});
+  const [seqSaveErrorBySeries, setSeqSaveErrorBySeries] = useState<Record<string, string | null>>({});
+  const [seqSaveSuccessNotice, setSeqSaveSuccessNotice] = useState<{
+    seriesId: string;
+    message: string;
+  } | null>(null);
 
   // Doc Type Modal / Form
   const [newTypeName, setNewTypeName] = useState('');
@@ -509,7 +567,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   }, [currentYear, seqYear]);
 
   const applySelectedBookToForms = useCallback(
-    (book: RegistryBook, forceResetMessages = true) => {
+    (book: RegistryBook, isBookSwitch = true) => {
       const enabledForBook = getBookEnabledTypes(book, documentTypes);
       setBookTitleInput(book.name);
       setUnitName(book.unitName);
@@ -517,15 +575,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setNumberFormat(book.numberFormat);
       setBookEnabledTypes(enabledForBook.map((t) => t.code));
       setTargetMode(book.numberMode);
-      setSeqTypeCode(book.numberMode === 'shared' ? 'SHARED' : enabledForBook[0]?.code || 'KH');
+      // Khi chỉ làm mới dữ liệu nền trên cùng một sổ, giữ nguyên loại văn bản người dùng đang chọn.
+      // Khi đổi sang sổ khác, giữ lại loại đang chọn nếu sổ mới cũng bật loại đó; nếu không thì chọn loại hợp lệ đầu tiên.
+      setSeqTypeCode((prevType) => {
+        if (book.numberMode === 'shared') return 'SHARED';
+        const matchInNewBook = enabledForBook.find(
+          (t) => t.code.trim().toUpperCase() === prevType.trim().toUpperCase()
+        );
+        if (!isBookSwitch && matchInNewBook) return matchInNewBook.code;
+        if (matchInNewBook) return matchInNewBook.code;
+        return enabledForBook[0]?.code || 'KH';
+      });
       setModeConfirmText('');
-      if (forceResetMessages) {
+      if (isBookSwitch) {
         setModeError(null);
         setModeSuccess(false);
         setGeneralSuccess(false);
         setGdSaveMessage(null);
         setGdTestResult(null);
         setBookGsMessage(null);
+        setSeqSaveSuccessNotice(null);
       }
 
       const cfg =
@@ -591,37 +660,121 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     targetMode,
   ]);
 
-  // Populate startSequenceVal from persisted customStartSequences for (book, year, type)
-  const effectiveSeqTypeCode = selectedBook.numberMode === 'shared' ? 'SHARED' : seqTypeCode;
-  const activeSeqKey = `${seqYear}_${effectiveSeqTypeCode}`;
-  const savedStartSequence = selectedBook.customStartSequences?.[activeSeqKey];
+  // Canonical series identity: bookId + year + typeCode
+  const enabledTypesForSelectedBook = useMemo(
+    () => getBookEnabledTypes(selectedBook, documentTypes),
+    [selectedBook, documentTypes]
+  );
 
-  useEffect(() => {
-    setStartSequenceVal(
-      typeof savedStartSequence === 'number' && savedStartSequence >= 1
-        ? savedStartSequence
-        : 1
+  const effectiveSeqTypeCode = useMemo(() => {
+    if (selectedBook.numberMode === 'shared') return 'SHARED';
+    const found = enabledTypesForSelectedBook.find(
+      (t) => t.code.trim().toUpperCase() === seqTypeCode.trim().toUpperCase()
     );
-  }, [selectedBook.id, activeSeqKey, savedStartSequence]);
+    return found ? found.code : enabledTypesForSelectedBook[0]?.code || 'KH';
+  }, [selectedBook.numberMode, enabledTypesForSelectedBook, seqTypeCode]);
 
-  const fetchSeqPreview = useCallback(async () => {
-    if (isConfigBlocked || !selectedBook.id) return;
-    setSeqPreviewLoading(true);
-    try {
-      const res = await api.previewNumber(effectiveSeqTypeCode, selectedBook.id, seqYear);
-      setSeqPreview(res);
-    } catch {
-      setSeqPreview(null);
-    } finally {
-      setSeqPreviewLoading(false);
-    }
-  }, [isConfigBlocked, selectedBook.id, effectiveSeqTypeCode, seqYear]);
+  const activeSeriesId = `${selectedBook.id}::${seqYear}::${effectiveSeqTypeCode}`;
+  const activeSeriesKeyDisplay = `${selectedBook.code}:${seqYear}:${effectiveSeqTypeCode}`;
+
+  const activeSeriesIdRef = useRef<string>(activeSeriesId);
+  activeSeriesIdRef.current = activeSeriesId;
+  const activeBookIdRef = useRef<string>(selectedBook.id);
+  activeBookIdRef.current = selectedBook.id;
+  const draftStartInputBySeriesRef = useRef<Record<string, string>>(draftStartInputBySeries);
+  draftStartInputBySeriesRef.current = draftStartInputBySeries;
+
+  const readRequestSeqRef = useRef<number>(0);
+  const latestCompletedReadReqBySeriesRef = useRef<Record<string, number>>({});
+  const readAbortControllerRef = useRef<AbortController | null>(null);
+
+  const loadStartSequenceSeries = useCallback(
+    async (bookId: string, year: number, typeCode: string) => {
+      if (isConfigBlocked || !bookId || !typeCode) return;
+
+      if (readAbortControllerRef.current) {
+        readAbortControllerRef.current.abort();
+      }
+      const controller = new AbortController();
+      readAbortControllerRef.current = controller;
+
+      const reqId = ++readRequestSeqRef.current;
+      const targetSeriesId = `${bookId}::${year}::${typeCode}`;
+
+      if (activeSeriesIdRef.current === targetSeriesId) {
+        setSeqConfigLoading(true);
+        setSeqConfigLoadError(null);
+      }
+
+      try {
+        const res = await api.getStartSequenceConfig(bookId, year, typeCode, controller.signal);
+        const prevCompleted = latestCompletedReadReqBySeriesRef.current[targetSeriesId] || 0;
+        if (reqId >= prevCompleted) {
+          latestCompletedReadReqBySeriesRef.current[targetSeriesId] = reqId;
+          setSavedSeriesMap((prev) => ({
+            ...prev,
+            [targetSeriesId]: res,
+          }));
+        }
+
+        if (reqId === readRequestSeqRef.current && activeSeriesIdRef.current === targetSeriesId) {
+          setSeqConfigLoading(false);
+          setSeqConfigLoadError(null);
+        }
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+        if (reqId === readRequestSeqRef.current && activeSeriesIdRef.current === targetSeriesId) {
+          setSeqConfigLoading(false);
+          setSeqConfigLoadError(err?.message || 'Không thể tải cấu hình dãy số từ máy chủ.');
+        }
+      }
+    },
+    [isConfigBlocked]
+  );
 
   useEffect(() => {
-    if (activeSubTab === 'numbering') {
-      fetchSeqPreview();
+    if (activeSubTab === 'numbering' && !isConfigBlocked) {
+      loadStartSequenceSeries(selectedBook.id, seqYear, effectiveSeqTypeCode);
     }
-  }, [activeSubTab, fetchSeqPreview, selectedBook.configVersion, savedStartSequence]);
+    return () => {
+      if (readAbortControllerRef.current) {
+        readAbortControllerRef.current.abort();
+      }
+    };
+  }, [
+    activeSubTab,
+    isConfigBlocked,
+    selectedBook.id,
+    selectedBook.configVersion,
+    selectedBook.numberMode,
+    selectedBook.numberFormat,
+    selectedBook.unitCode,
+    seqYear,
+    effectiveSeqTypeCode,
+    loadStartSequenceSeries,
+  ]);
+
+  const activeSavedConfig = savedSeriesMap[activeSeriesId] || null;
+  const savedInputString =
+    activeSavedConfig?.isConfigured && activeSavedConfig.customStartSequence != null
+      ? String(activeSavedConfig.customStartSequence)
+      : '';
+  const hasSeriesDraft = Object.prototype.hasOwnProperty.call(
+    draftStartInputBySeries,
+    activeSeriesId
+  );
+  const currentStartInputValue = hasSeriesDraft
+    ? draftStartInputBySeries[activeSeriesId]
+    : savedInputString;
+  const isSeriesDirty =
+    hasSeriesDraft && draftStartInputBySeries[activeSeriesId].trim() !== savedInputString;
+  const isActiveSeriesSaving = Boolean(savingSeriesMap[activeSeriesId]);
+  const activeSeriesSaveError = seqSaveErrorBySeries[activeSeriesId] || null;
+  const parsedStartInputNum = Number(currentStartInputValue.trim());
+  const isStartInputValid =
+    currentStartInputValue.trim() !== '' &&
+    Number.isInteger(parsedStartInputNum) &&
+    parsedStartInputNum >= 1;
 
   // Microsoft Graph
   const [msEnabled, setMsEnabled] = useState(settings.msGraphConfig.enabled);
@@ -855,7 +1008,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       onRefreshData();
       setModeSuccess(true);
       setModeConfirmText('');
-      fetchSeqPreview();
+      loadStartSequenceSeries(
+        selectedBook.id,
+        seqYear,
+        targetMode === 'shared' ? 'SHARED' : effectiveSeqTypeCode
+      );
       setTimeout(() => setModeSuccess(false), 3000);
     } catch (err: any) {
       if (!handleConflictError(err, () => saveModeRequest(true))) {
@@ -871,43 +1028,111 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     await saveModeRequest(false);
   };
 
-  // 3. Set Start Sequence for selected book
-  const saveStartSequenceRequest = async (forceOverwrite = false) => {
-    if (!canManageSelectedBook || isConfigBlocked) return;
-    setSeqSaving(true);
-    setSeqError(null);
-    setSeqSuccess(false);
-    try {
-      const res = await api.setStartSequence(
-        seqYear,
-        effectiveSeqTypeCode,
-        startSequenceVal,
-        selectedBook.id,
-        loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
-        forceOverwrite
-      );
-      loadedBookSnapshotRef.current = {
-        bookId: selectedBook.id,
-        version: res.book?.configVersion || (selectedBook.configVersion || 1) + 1,
-      };
-      setSettingsConflict(null);
-      setSeqSuccess(true);
-      onBooksUpdated?.();
-      onRefreshData();
-      await fetchSeqPreview();
-      setTimeout(() => setSeqSuccess(false), 3000);
-    } catch (err: any) {
-      if (!handleConflictError(err, () => saveStartSequenceRequest(true))) {
-        setSeqError(err.message || 'Lỗi khi đặt số bắt đầu');
-      }
-    } finally {
-      setSeqSaving(false);
-    }
-  };
-
+  // 3. Set Start Sequence for selected (book, year, typeCode) with out-of-order save isolation
   const handleSetStartSequence = async (e: React.FormEvent) => {
     e.preventDefault();
-    await saveStartSequenceRequest(false);
+    if (
+      !canManageSelectedBook ||
+      isConfigBlocked ||
+      seqConfigLoading ||
+      Boolean(seqConfigLoadError)
+    ) {
+      return;
+    }
+
+    const targetBookId = selectedBook.id;
+    const targetBookName = selectedBook.name;
+    const targetYear = seqYear;
+    const targetTypeCode = effectiveSeqTypeCode;
+    const targetSeriesId = `${targetBookId}::${targetYear}::${targetTypeCode}`;
+    const rawDraft = currentStartInputValue;
+    const trimmed = rawDraft.trim();
+    const nextNum = Number(trimmed);
+
+    if (!trimmed || !Number.isInteger(nextNum) || nextNum < 1) {
+      setSeqSaveErrorBySeries((prev) => ({
+        ...prev,
+        [targetSeriesId]: 'Vui lòng nhập số bắt đầu là số nguyên dương từ 1 trở lên.',
+      }));
+      return;
+    }
+
+    if (activeSavedConfig && nextNum < activeSavedConfig.minAllowedStartSequence) {
+      setSeqSaveErrorBySeries((prev) => ({
+        ...prev,
+        [targetSeriesId]: `Số bắt đầu (${nextNum}) phải lớn hơn số lớn nhất đã cấp/hủy trong dãy (${activeSavedConfig.maxIssuedSequence}). Mức tối thiểu là ${activeSavedConfig.minAllowedStartSequence}.`,
+      }));
+      return;
+    }
+
+    setSavingSeriesMap((prev) => ({ ...prev, [targetSeriesId]: true }));
+    setSeqSaveErrorBySeries((prev) => ({ ...prev, [targetSeriesId]: null }));
+    setSeqSaveSuccessNotice((prev) => (prev?.seriesId === targetSeriesId ? null : prev));
+
+    try {
+      const res = await api.setStartSequence(targetYear, targetTypeCode, nextNum, targetBookId);
+
+      // Cập nhật riêng cấu hình đã lưu của đúng dãy vừa lưu, không ảnh hưởng dãy đang xem nếu người dùng đã chuyển loại
+      const updatedConfig: StartSequenceSeriesConfig = {
+        seriesKey: res.seriesKey,
+        storageKey: res.storageKey,
+        bookId: res.bookId,
+        bookCode: res.bookCode,
+        year: res.year,
+        typeCode: res.typeCode,
+        isConfigured: res.isConfigured,
+        customStartSequence: res.customStartSequence,
+        maxIssuedSequence: res.maxIssuedSequence,
+        minAllowedStartSequence: res.minAllowedStartSequence,
+        nextExpectedSeq: res.nextExpectedSeq,
+        previewNumber: res.previewNumber,
+        configVersion: res.configVersion,
+        customStartSequences: res.customStartSequences,
+      };
+      latestCompletedReadReqBySeriesRef.current[targetSeriesId] = ++readRequestSeqRef.current;
+      setSavedSeriesMap((prev) => ({
+        ...prev,
+        [targetSeriesId]: updatedConfig,
+      }));
+
+      // Chỉ xóa bản nháp của dãy vừa lưu nếu người dùng chưa nhập giá trị khác trong lúc chờ phản hồi
+      if (draftStartInputBySeriesRef.current[targetSeriesId] === rawDraft) {
+        setDraftStartInputBySeries((prev) => {
+          const next = { ...prev };
+          delete next[targetSeriesId];
+          return next;
+        });
+      }
+
+      if (activeBookIdRef.current === targetBookId && res.book?.configVersion) {
+        loadedBookSnapshotRef.current = {
+          bookId: targetBookId,
+          version: res.book.configVersion,
+        };
+      }
+
+      const isStillViewingSameSeries = activeSeriesIdRef.current === targetSeriesId;
+      setSeqSaveSuccessNotice({
+        seriesId: targetSeriesId,
+        message: isStillViewingSameSeries
+          ? `Đã lưu Số bắt đầu đã cài (${String(nextNum).padStart(2, '0')}) cho ${targetBookName} · Năm ${targetYear} · ${targetTypeCode}!`
+          : `Đã lưu xong mốc ${targetBookName} · Năm ${targetYear} · ${targetTypeCode} = ${String(nextNum).padStart(2, '0')} (dãy đang chọn vẫn được giữ nguyên).`,
+      });
+
+      onBooksUpdated?.();
+      onRefreshData();
+    } catch (err: any) {
+      setSeqSaveErrorBySeries((prev) => ({
+        ...prev,
+        [targetSeriesId]: err.message || 'Lỗi khi lưu số bắt đầu',
+      }));
+    } finally {
+      setSavingSeriesMap((prev) => {
+        const next = { ...prev };
+        delete next[targetSeriesId];
+        return next;
+      });
+    }
   };
 
   // 4. Create Document Type (Admin)
@@ -2201,18 +2426,72 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
-            <h2 className="text-base font-bold text-slate-900">
-              Thiết Lập Số Bắt Đầu Tiếp Theo — {selectedBook.name}
-            </h2>
-            <p className="text-xs text-slate-600">
-              Nếu đơn vị đã cấp một số văn bản trên sổ giấy trước khi dùng phần mềm, có thể đặt số bắt đầu để hệ thống tiếp nối chính xác. Giá trị <strong>Số bắt đầu đã cài</strong> luôn được lưu giữ theo Sổ + Năm + Loại văn bản, tách biệt với <strong>Số tiếp theo dự kiến</strong> khi sổ phát sinh thêm văn bản.
-            </p>
+            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h2 className="text-base font-bold text-slate-900">
+                  Thiết Lập Số Bắt Đầu — {selectedBook.name}
+                </h2>
+                <p className="text-xs text-slate-600 mt-1">
+                  Mỗi loại văn bản có mốc bắt đầu và dãy số riêng theo từng sổ, từng năm. Khóa dãy đang chọn:{' '}
+                  <code className="font-mono font-bold text-sky-800 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200">
+                    {activeSeriesKeyDisplay}
+                  </code>
+                </p>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-1.5 shrink-0">
+                {seqConfigLoading ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-50 text-sky-800 border border-sky-200">
+                    <RotateCw className="w-3 h-3 animate-spin" />
+                    <span>Đang tải cấu hình...</span>
+                  </span>
+                ) : seqConfigLoadError ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-rose-50 text-rose-800 border border-rose-200">
+                    <AlertTriangle className="w-3 h-3" />
+                    <span>Lỗi tải cấu hình</span>
+                  </span>
+                ) : isSeriesDirty ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                    <span>Chưa lưu</span>
+                  </span>
+                ) : activeSavedConfig?.isConfigured ? (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                    <CheckCircle2 className="w-3 h-3" />
+                    <span>Đã thiết lập mốc riêng</span>
+                  </span>
+                ) : (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-slate-100 text-slate-700 border border-slate-200">
+                    <span>Chưa thiết lập · Mặc định 01</span>
+                  </span>
+                )}
+              </div>
+            </div>
+
+            {seqConfigLoadError && (
+              <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-900 flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-start gap-2 min-w-0">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <span className="break-words">
+                    Không tải được cấu hình cho dãy <strong>{activeSeriesKeyDisplay}</strong>: {seqConfigLoadError}. Nút lưu tạm khóa để tránh ghi đè sai.
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => loadStartSequenceSeries(selectedBook.id, seqYear, effectiveSeqTypeCode)}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-md shrink-0"
+                >
+                  <RefreshCw className="w-3.5 h-3.5" />
+                  <span>Thử tải lại</span>
+                </button>
+              </div>
+            )}
 
             <form onSubmit={handleSetStartSequence} className="space-y-4 text-xs">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                 <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Năm áp dụng</label>
                   <select
+                    aria-label="Năm áp dụng số bắt đầu"
                     value={seqYear}
                     onChange={(e) => setSeqYear(parseInt(e.target.value, 10))}
                     disabled={!canManageSelectedBook || isConfigBlocked}
@@ -2240,6 +2519,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Loại văn bản</label>
                   <select
+                    aria-label="Loại văn bản thiết lập số bắt đầu"
                     value={effectiveSeqTypeCode}
                     onChange={(e) => setSeqTypeCode(e.target.value)}
                     disabled={!canManageSelectedBook || isConfigBlocked}
@@ -2248,7 +2528,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     {selectedBook.numberMode === 'shared' ? (
                       <option value="SHARED">Dãy số chung (SHARED)</option>
                     ) : (
-                      getBookEnabledTypes(selectedBook, documentTypes).map((t) => (
+                      enabledTypesForSelectedBook.map((t) => (
                         <option key={t.code} value={t.code}>
                           {t.name} ({t.code})
                         </option>
@@ -2258,84 +2538,172 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
 
                 <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Số bắt đầu đã cài</label>
+                  <div className="flex items-center justify-between gap-2">
+                    <label htmlFor="start-sequence-input" className="font-bold text-slate-700">
+                      Số bắt đầu đã cài
+                    </label>
+                    <div className="flex items-center gap-1.5">
+                      {isSeriesDirty && (
+                        <>
+                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-bold">
+                            Chưa lưu
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setDraftStartInputBySeries((prev) => {
+                                const next = { ...prev };
+                                delete next[activeSeriesId];
+                                return next;
+                              });
+                              setSeqSaveErrorBySeries((prev) => ({
+                                ...prev,
+                                [activeSeriesId]: null,
+                              }));
+                            }}
+                            className="text-[11px] font-semibold text-slate-500 hover:text-slate-800 underline"
+                          >
+                            Hoàn tác
+                          </button>
+                        </>
+                      )}
+                    </div>
+                  </div>
                   <input
+                    id="start-sequence-input"
                     type="number"
                     min={1}
-                    value={startSequenceVal}
-                    onChange={(e) => setStartSequenceVal(parseInt(e.target.value, 10) || 1)}
-                    disabled={!canManageSelectedBook || isConfigBlocked}
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-base sm:text-xs"
+                    step={1}
+                    value={currentStartInputValue}
+                    placeholder="Chưa thiết lập · Mặc định 01"
+                    onChange={(e) => {
+                      const raw = e.target.value;
+                      setSeqSaveErrorBySeries((prev) => ({ ...prev, [activeSeriesId]: null }));
+                      setDraftStartInputBySeries((prev) => {
+                        if (raw.trim() === savedInputString) {
+                          const next = { ...prev };
+                          delete next[activeSeriesId];
+                          return next;
+                        }
+                        return { ...prev, [activeSeriesId]: raw };
+                      });
+                    }}
+                    disabled={
+                      !canManageSelectedBook ||
+                      isConfigBlocked ||
+                      seqConfigLoading ||
+                      Boolean(seqConfigLoadError)
+                    }
+                    className={`w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border rounded-lg font-mono font-bold text-base sm:text-xs ${
+                      isSeriesDirty ? 'border-amber-400 ring-1 ring-amber-300' : 'border-slate-300'
+                    }`}
                   />
                 </div>
               </div>
 
-              {/* Explicit side-by-side summary: Saved Start Sequence vs Expected Next Number */}
+              {/* Explicit side-by-side summary: Số bắt đầu đã cài vs Số tiếp theo dự kiến */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="p-3 bg-sky-50 border border-sky-200 rounded-lg space-y-1 min-w-0">
                   <span className="text-[11px] font-semibold text-sky-800 block">
-                    Số bắt đầu đã cài ({activeSeqKey})
+                    Số bắt đầu đã cài ({activeSeriesKeyDisplay})
                   </span>
                   <div className="font-mono text-base font-bold text-sky-950 break-words">
-                    {typeof savedStartSequence === 'number'
-                      ? `${String(savedStartSequence).padStart(2, '0')} (Mốc đã lưu)`
-                      : '01 (Mặc định chưa cài riêng)'}
+                    {seqConfigLoading
+                      ? 'Đang tải...'
+                      : seqConfigLoadError
+                      ? 'Lỗi tải cấu hình'
+                      : activeSavedConfig?.isConfigured && activeSavedConfig.customStartSequence != null
+                      ? `${String(activeSavedConfig.customStartSequence).padStart(2, '0')} (${activeSavedConfig.customStartSequence})`
+                      : 'Chưa thiết lập · Mặc định 01'}
                   </div>
                   <span className="text-[11px] text-sky-700 block">
-                    Mốc bắt đầu được giữ cố định, không bị thay đổi khi cấp số mới.
+                    {isSeriesDirty
+                      ? `Bản nháp đang nhập: "${currentStartInputValue.trim() || 'trống'}" (Chưa lưu — bấm Lưu số bắt đầu để áp dụng).`
+                      : 'Mốc đã lưu giữ cố định theo sổ, năm và loại văn bản; không tự thay đổi khi cấp số mới.'}
                   </span>
                 </div>
 
                 <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg space-y-1 min-w-0">
                   <span className="text-[11px] font-semibold text-emerald-800 block">
-                    Số tiếp theo dự kiến (Năm {seqYear})
+                    Số tiếp theo dự kiến ({selectedBook.name} · Năm {seqYear} · {effectiveSeqTypeCode})
                   </span>
                   <div className="font-mono text-base font-bold text-emerald-950 break-words">
-                    {seqPreviewLoading
+                    {seqConfigLoading
                       ? 'Đang tính...'
-                      : seqPreview
-                      ? `${String(seqPreview.sequenceNumber).padStart(2, '0')} → ${seqPreview.previewNumber}`
+                      : seqConfigLoadError
+                      ? 'Chưa có dữ liệu dự kiến'
+                      : activeSavedConfig
+                      ? `${String(activeSavedConfig.nextExpectedSeq).padStart(2, '0')} → ${activeSavedConfig.previewNumber}`
                       : 'Chưa có dữ liệu dự kiến'}
                   </div>
                   <span className="text-[11px] text-emerald-800 block">
-                    Tính từ max(Số bắt đầu đã cài, Số lớn nhất đã cấp/hủy: {seqPreview?.maxIssuedSequence ?? 0} + 1).
+                    {activeSavedConfig
+                      ? `= max(Mốc đã cài, Số lớn nhất đã cấp/hủy: ${activeSavedConfig.maxIssuedSequence} + 1). Mức đặt tối thiểu: ${activeSavedConfig.minAllowedStartSequence}.`
+                      : 'Tính từ max(Mốc đã cài, Số lớn nhất đã cấp/hủy trong cùng dãy + 1).'}
                   </span>
                 </div>
               </div>
 
               {Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
                 <div className="p-3 bg-sky-50/70 border border-sky-200 rounded-lg text-[11px] text-sky-900">
-                  <strong className="block mb-1">Các mốc Số bắt đầu đã cài trên sổ:</strong>
+                  <strong className="block mb-1">
+                    Các mốc Số bắt đầu đã cài trên sổ "{selectedBook.name}":
+                  </strong>
                   <div className="flex flex-wrap gap-2">
-                    {Object.entries(selectedBook.customStartSequences).map(([k, val]) => (
-                      <span key={k} className="px-2 py-0.5 bg-white border border-sky-200 rounded font-mono">
-                        {k}: bắt đầu từ <strong>{val}</strong>
-                      </span>
-                    ))}
+                    {Object.entries(selectedBook.customStartSequences)
+                      .sort(([a], [b]) => a.localeCompare(b))
+                      .map(([k, val]) => {
+                        const [yr, ...rest] = k.split('_');
+                        const tCode = rest.join('_');
+                        const isActiveRow =
+                          String(seqYear) === yr && tCode === effectiveSeqTypeCode;
+                        return (
+                          <span
+                            key={k}
+                            className={`px-2 py-0.5 rounded font-mono border ${
+                              isActiveRow
+                                ? 'bg-sky-700 text-white border-sky-700'
+                                : 'bg-white border-sky-200 text-sky-900'
+                            }`}
+                          >
+                            {selectedBook.code}:{yr}:{tCode} = <strong>{val}</strong>
+                          </span>
+                        );
+                      })}
                   </div>
                 </div>
               )}
 
               <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600">
-                <strong>Quy tắc bảo vệ:</strong> Số bắt đầu không được nhỏ hơn hoặc bằng số lớn nhất đã cấp trong sổ cho loại văn bản và năm đó.
+                <strong>Quy tắc bảo vệ:</strong> Số bắt đầu của từng dãy không được nhỏ hơn hoặc bằng số lớn nhất từng cấp (bao gồm số đã hủy) trong chính sổ, năm và loại văn bản đó.
               </div>
 
-              {seqError && <div className="p-3 bg-rose-50 text-rose-700 rounded-lg text-xs">{seqError}</div>}
+              {activeSeriesSaveError && (
+                <div className="p-3 bg-rose-50 border border-rose-200 text-rose-700 rounded-lg text-xs">
+                  {activeSeriesSaveError}
+                </div>
+              )}
 
-              {seqSuccess && (
-                <div className="p-3 bg-emerald-50 text-emerald-800 rounded-lg text-xs flex items-center gap-2">
+              {seqSaveSuccessNotice && (
+                <div className="p-3 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded-lg text-xs flex items-center gap-2">
                   <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                  <span>Đã lưu Số bắt đầu đã cài thành công!</span>
+                  <span>{seqSaveSuccessNotice.message}</span>
                 </div>
               )}
 
               {canManageSelectedBook && (
                 <button
                   type="submit"
-                  disabled={seqSaving || isConfigBlocked}
+                  disabled={
+                    isActiveSeriesSaving ||
+                    isConfigBlocked ||
+                    seqConfigLoading ||
+                    Boolean(seqConfigLoadError) ||
+                    !isStartInputValid
+                  }
                   className="w-full sm:w-auto min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
-                  {seqSaving ? 'Đang lưu...' : 'Lưu số bắt đầu'}
+                  {isActiveSeriesSaving ? 'Đang lưu...' : 'Lưu số bắt đầu'}
                 </button>
               )}
             </form>

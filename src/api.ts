@@ -1,6 +1,7 @@
 import type {
   AuthResponse,
   BookPermission,
+  DocumentHistoryEntry,
   DocumentRecord,
   DocumentTypeConfig,
   GoogleDriveConfig,
@@ -9,6 +10,7 @@ import type {
   PreviewNumberResponse,
   RegistryBook,
   SignerConfig,
+  StartSequenceSeriesConfig,
   StatisticsData,
   SystemAuditLog,
   SystemSettings,
@@ -391,6 +393,22 @@ export const api = {
     });
   },
 
+  getStartSequenceConfig: async (
+    bookId: string,
+    year: number,
+    typeCode: string,
+    signal?: AbortSignal
+  ): Promise<StartSequenceSeriesConfig> => {
+    const q = new URLSearchParams({
+      bookId,
+      year: String(year),
+      typeCode,
+    });
+    return request<StartSequenceSeriesConfig>(`/api/settings/start-sequence?${q.toString()}`, {
+      signal,
+    });
+  },
+
   setStartSequence: async (
     year: number,
     typeCode: string,
@@ -398,20 +416,18 @@ export const api = {
     bookId?: string,
     expectedVersion?: number,
     forceOverwrite?: boolean
-  ): Promise<{
-    success: boolean;
-    customStartSequences?: Record<string, number>;
-    customStartSequence?: number;
-    nextExpectedSeq?: number;
-    book?: RegistryBook;
-  }> => {
-    return request<{
+  ): Promise<
+    StartSequenceSeriesConfig & {
       success: boolean;
-      customStartSequences?: Record<string, number>;
-      customStartSequence?: number;
-      nextExpectedSeq?: number;
       book?: RegistryBook;
-    }>('/api/settings/start-sequence', {
+    }
+  > => {
+    return request<
+      StartSequenceSeriesConfig & {
+        success: boolean;
+        book?: RegistryBook;
+      }
+    >('/api/settings/start-sequence', {
       method: 'POST',
       body: JSON.stringify({ year, typeCode, startSequence, bookId, expectedVersion, forceOverwrite }),
     });
@@ -645,6 +661,9 @@ export const api = {
     signer?: string;
     status?: string;
     driveStatus?: string;
+    deletedBy?: string;
+    fromDate?: string;
+    toDate?: string;
     search?: string;
     sort?: string;
   } = {}): Promise<{ total: number; documents: DocumentRecord[] }> => {
@@ -655,6 +674,34 @@ export const api = {
       }
     });
     return request<{ total: number; documents: DocumentRecord[] }>(`/api/documents?${searchParams.toString()}`);
+  },
+
+  getDocumentHistory: async (params: {
+    bookId?: string;
+    username?: string;
+    userId?: string;
+    fromDate?: string;
+    toDate?: string;
+    docId?: string;
+    action?: string;
+    search?: string;
+  } = {}): Promise<{
+    total: number;
+    logs: DocumentHistoryEntry[];
+    actors: Array<{ userId: string; username: string; userName: string }>;
+  }> => {
+    const searchParams = new URLSearchParams();
+    Object.entries(params).forEach(([k, v]) => {
+      if (v !== undefined && v !== null && v !== '' && v !== 'all') {
+        searchParams.append(k, String(v));
+      }
+    });
+    const qs = searchParams.toString();
+    return request<{
+      total: number;
+      logs: DocumentHistoryEntry[];
+      actors: Array<{ userId: string; username: string; userName: string }>;
+    }>(`/api/document-history${qs ? `?${qs}` : ''}`);
   },
 
   getDocument: async (id: string): Promise<{ document: DocumentRecord }> => {
@@ -689,10 +736,26 @@ export const api = {
     });
   },
 
-  deleteDocument: async (id: string): Promise<{ success: boolean; message: string }> => {
-    return request<{ success: boolean; message: string }>(`/api/documents/${id}`, {
+  deleteDocument: async (
+    id: string,
+    reason: string,
+    confirmed = true
+  ): Promise<{ success: boolean; document: DocumentRecord; message: string }> => {
+    return request<{ success: boolean; document: DocumentRecord; message: string }>(`/api/documents/${encodeURIComponent(id)}`, {
       method: 'DELETE',
+      body: JSON.stringify({ reason, confirmed }),
     });
+  },
+
+  retryDocumentExcelSync: async (
+    id: string
+  ): Promise<{ success: boolean; document: DocumentRecord; message?: string }> => {
+    return request<{ success: boolean; document: DocumentRecord; message?: string }>(
+      `/api/documents/${encodeURIComponent(id)}/retry-excel-sync`,
+      {
+        method: 'POST',
+      }
+    );
   },
 
   cancelDocument: async (id: string, reason: string): Promise<{ document: DocumentRecord }> => {

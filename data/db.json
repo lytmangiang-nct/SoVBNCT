@@ -145,7 +145,15 @@
               "old": null,
               "new": "Nguyễn Văn Minh"
             }
-          }
+          },
+          "timestampVietnam": "12/10/2026 21:19:01",
+          "dateKeyVietnam": "2026-10-12",
+          "docId": "doc-1791814741272-bca6eaf5",
+          "fullDocNumber": "02-TB/ĐTN",
+          "docName": "Thông báo lịch sinh hoạt chi đoàn tháng 10 chính thức",
+          "bookId": "book-doan-truong",
+          "bookCode": "DOAN_TRUONG",
+          "bookName": "Đoàn trường"
         }
       ],
       "syncStatus": "not_configured",
@@ -191,7 +199,15 @@
               "old": null,
               "new": "Nguyễn Văn Minh"
             }
-          }
+          },
+          "timestampVietnam": "12/10/2026 21:18:47",
+          "dateKeyVietnam": "2026-10-12",
+          "docId": "doc-1791814727463-45e96723",
+          "fullDocNumber": "01-TB/ĐTN",
+          "docName": "Thông báo lịch sinh hoạt chi đoàn tháng 10",
+          "bookId": "book-doan-truong",
+          "bookCode": "DOAN_TRUONG",
+          "bookName": "Đoàn trường"
         },
         {
           "timestamp": "2026-10-12T14:18:52.818Z",
@@ -204,7 +220,15 @@
               "old": "active",
               "new": "cancelled"
             }
-          }
+          },
+          "timestampVietnam": "12/10/2026 21:18:52",
+          "dateKeyVietnam": "2026-10-12",
+          "docId": "doc-1791814727463-45e96723",
+          "fullDocNumber": "01-TB/ĐTN",
+          "docName": "Thông báo lịch sinh hoạt chi đoàn tháng 10",
+          "bookId": "book-doan-truong",
+          "bookCode": "DOAN_TRUONG",
+          "bookName": "Đoàn trường"
         }
       ],
       "syncStatus": "not_configured",
@@ -253,7 +277,15 @@
               "old": null,
               "new": "Trần Thị Thu Thảo"
             }
-          }
+          },
+          "timestampVietnam": "12/10/2026 21:18:40",
+          "dateKeyVietnam": "2026-10-12",
+          "docId": "doc-1791814720699-de6aff02",
+          "fullDocNumber": "02-KH/ĐTN",
+          "docName": "Kế hoạch phát động phong trào Hoa điểm 10",
+          "bookId": "book-doan-truong",
+          "bookCode": "DOAN_TRUONG",
+          "bookName": "Đoàn trường"
         }
       ],
       "syncStatus": "not_configured",
@@ -299,7 +331,15 @@
               "old": null,
               "new": "Nguyễn Văn Minh"
             }
-          }
+          },
+          "timestampVietnam": "12/10/2026 21:18:31",
+          "dateKeyVietnam": "2026-10-12",
+          "docId": "doc-1791814711946-38a9b459",
+          "fullDocNumber": "01-KH/ĐTN",
+          "docName": "Kế hoạch tổ chức Hội trại 26/3 truyền thống",
+          "bookId": "book-doan-truong",
+          "bookCode": "DOAN_TRUONG",
+          "bookName": "Đoàn trường"
         }
       ],
       "syncStatus": "not_configured",
@@ -408,5 +448,150 @@
     "req-1791814813367-t4zwii0": "doc-1791814869565-e55e7e57"
   },
   "systemAuditLogs": [],
+  "documentHistoryLogs": [
+    {
+      "timestamp": "2026-10-12T14:19:01.272Z",
+      "userId": "user-admin",
+      "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+      "action": "create",
+      "changes": {
+        "fullDocNumber": {
+          "old": null,
+          "new": "02-TB/ĐTN"
+        },
+        "title": {
+          "old": null,
+          "new": "Thông báo lịch sinh hoạt chi đoàn tháng 10 chính thức"
+        },
+        "signer": {
+          "old": null,
+          "new": "Nguyễn Văn Minh"
+        }
+      },
+      "timestampVietnam": "12/10/2026 21:19:01",
+      "dateKeyVietnam": "2026-10-12",
+      "docId": "doc-1791814741272-bca6eaf5",
+      "fullDocNumber": "02-TB/ĐTN",
+      "docName": "Thông báo lịch sinh hoạt chi đoàn tháng 10 chính thức",
+      "bookId": "book-doan-truong",
+      "bookCode": "DOAN_TRUONG",
+      "bookName": "Đoàn trường",
+      "id": "hist-b2739815013e",
+      "username": "admin"
+    },
+    {
+      "timestamp": "2026-10-12T14:18:52.818Z",
+      "userId": "user-admin",
+      "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+      "action": "cancel",
+      "reason": "Soạn nhầm nội dung cuộc họp",
+      "changes": {
+        "status": {
+          "old": "active",
+          "new": "cancelled"
+        }
+      },
+      "timestampVietnam": "12/10/2026 21:18:52",
+      "dateKeyVietnam": "2026-10-12",
+      "docId": "doc-1791814727463-45e96723",
+      "fullDocNumber": "01-TB/ĐTN",
+      "docName": "Thông báo lịch sinh hoạt chi đoàn tháng 10",
+      "bookId": "book-doan-truong",
+      "bookCode": "DOAN_TRUONG",
+      "bookName": "Đoàn trường",
+      "id": "hist-9776ac701458",
+      "username": "admin"
+    },
+    {
+      "timestamp": "2026-10-12T14:18:47.464Z",
+      "userId": "user-admin",
+      "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+      "action": "create",
+      "changes": {
+        "fullDocNumber": {
+          "old": null,
+          "new": "01-TB/ĐTN"
+        },
+        "title": {
+          "old": null,
+          "new": "Thông báo lịch sinh hoạt chi đoàn tháng 10"
+        },
+        "signer": {
+          "old": null,
+          "new": "Nguyễn Văn Minh"
+        }
+      },
+      "timestampVietnam": "12/10/2026 21:18:47",
+      "dateKeyVietnam": "2026-10-12",
+      "docId": "doc-1791814727463-45e96723",
+      "fullDocNumber": "01-TB/ĐTN",
+      "docName": "Thông báo lịch sinh hoạt chi đoàn tháng 10",
+      "bookId": "book-doan-truong",
+      "bookCode": "DOAN_TRUONG",
+      "bookName": "Đoàn trường",
+      "id": "hist-79088ed4ff0b",
+      "username": "admin"
+    },
+    {
+      "timestamp": "2026-10-12T14:18:40.699Z",
+      "userId": "user-admin",
+      "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+      "action": "create",
+      "changes": {
+        "fullDocNumber": {
+          "old": null,
+          "new": "02-KH/ĐTN"
+        },
+        "title": {
+          "old": null,
+          "new": "Kế hoạch phát động phong trào Hoa điểm 10"
+        },
+        "signer": {
+          "old": null,
+          "new": "Trần Thị Thu Thảo"
+        }
+      },
+      "timestampVietnam": "12/10/2026 21:18:40",
+      "dateKeyVietnam": "2026-10-12",
+      "docId": "doc-1791814720699-de6aff02",
+      "fullDocNumber": "02-KH/ĐTN",
+      "docName": "Kế hoạch phát động phong trào Hoa điểm 10",
+      "bookId": "book-doan-truong",
+      "bookCode": "DOAN_TRUONG",
+      "bookName": "Đoàn trường",
+      "id": "hist-711b1d72f550",
+      "username": "admin"
+    },
+    {
+      "timestamp": "2026-10-12T14:18:31.946Z",
+      "userId": "user-admin",
+      "userName": "Bí thư Đoàn Trường (Quản trị viên) (admin)",
+      "action": "create",
+      "changes": {
+        "fullDocNumber": {
+          "old": null,
+          "new": "01-KH/ĐTN"
+        },
+        "title": {
+          "old": null,
+          "new": "Kế hoạch tổ chức Hội trại 26/3 truyền thống"
+        },
+        "signer": {
+          "old": null,
+          "new": "Nguyễn Văn Minh"
+        }
+      },
+      "timestampVietnam": "12/10/2026 21:18:31",
+      "dateKeyVietnam": "2026-10-12",
+      "docId": "doc-1791814711946-38a9b459",
+      "fullDocNumber": "01-KH/ĐTN",
+      "docName": "Kế hoạch tổ chức Hội trại 26/3 truyền thống",
+      "bookId": "book-doan-truong",
+      "bookCode": "DOAN_TRUONG",
+      "bookName": "Đoàn trường",
+      "id": "hist-85bd63d0af78",
+      "username": "admin"
+    }
+  ],
   "revokedSessions": {}
 }
