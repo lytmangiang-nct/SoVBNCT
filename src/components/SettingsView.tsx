@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   Users,
   Shield,
@@ -10,6 +10,7 @@ import {
   Save,
   CheckCircle2,
   RotateCw,
+  RefreshCw,
   Copy,
   Clock,
   UserCheck,
@@ -27,6 +28,7 @@ import type {
   BookPermission,
   DocumentTypeConfig,
   GoogleDriveAuthMode,
+  PreviewNumberResponse,
   RegistryBook,
   SignerConfig,
   SystemAuditLog,
@@ -54,6 +56,9 @@ interface SettingsViewProps {
   settings: SystemSettings;
   documentTypes: DocumentTypeConfig[];
   signers: SignerConfig[];
+  serverYear?: number;
+  configLoaded?: boolean;
+  syncError?: string | null;
   onSettingsUpdated: (newSettings: SystemSettings) => void;
   onBooksUpdated?: () => void;
   onRefreshData: () => void;
@@ -318,12 +323,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   settings,
   documentTypes,
   signers,
+  serverYear,
+  configLoaded = true,
+  syncError = null,
   onSettingsUpdated,
   onBooksUpdated,
   onRefreshData,
 }) => {
   const isAdmin = isSystemAdmin(currentUser);
-  const currentYear = new Date().getFullYear();
+  const currentYear =
+    serverYear ||
+    Number(
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone: 'Asia/Ho_Chi_Minh',
+        year: 'numeric',
+      }).format(new Date())
+    );
+  const isConfigBlocked = !configLoaded || Boolean(syncError);
 
   const managedBooks = useMemo(() => {
     return books.filter((b) => isAdmin || hasBookPermission(currentUser, b.id, 'manage_book'));
@@ -412,6 +428,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [seqSaving, setSeqSaving] = useState(false);
   const [seqError, setSeqError] = useState<string | null>(null);
   const [seqSuccess, setSeqSuccess] = useState(false);
+  const [seqPreview, setSeqPreview] = useState<PreviewNumberResponse | null>(null);
+  const [seqPreviewLoading, setSeqPreviewLoading] = useState(false);
 
   // Doc Type Modal / Form
   const [newTypeName, setNewTypeName] = useState('');
@@ -468,38 +486,142 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [bookGsSaving, setBookGsSaving] = useState(false);
   const [bookGsMessage, setBookGsMessage] = useState<string | null>(null);
 
-  // Sync form states when switching selectedBook
+  // Dirty-state & optimistic concurrency tracking
+  const [generalDirty, setGeneralDirty] = useState(false);
+  const [driveDirty, setDriveDirty] = useState(false);
+  const [bookGsDirty, setBookGsDirty] = useState(false);
+  const [settingsConflict, setSettingsConflict] = useState<{
+    message: string;
+    serverVersion?: number;
+    serverBook?: RegistryBook;
+    retryAction?: () => Promise<void>;
+  } | null>(null);
+  const loadedBookSnapshotRef = useRef<{ bookId: string; version: number } | null>(null);
+  const prevServerYearRef = useRef<number>(currentYear);
+
   useEffect(() => {
-    const enabledForBook = getBookEnabledTypes(selectedBook, documentTypes);
-    setBookTitleInput(selectedBook.name);
-    setUnitName(selectedBook.unitName);
-    setUnitCode(selectedBook.unitCode);
-    setNumberFormat(selectedBook.numberFormat);
-    setBookEnabledTypes(enabledForBook.map((t) => t.code));
-    setTargetMode(selectedBook.numberMode);
-    setSeqTypeCode(selectedBook.numberMode === 'shared' ? 'SHARED' : enabledForBook[0]?.code || 'KH');
-    setModeConfirmText('');
-    setModeError(null);
-    setModeSuccess(false);
-    setGeneralSuccess(false);
+    if (prevServerYearRef.current !== currentYear) {
+      if (seqYear === prevServerYearRef.current) {
+        setSeqYear(currentYear);
+      }
+      prevServerYearRef.current = currentYear;
+    }
+  }, [currentYear, seqYear]);
 
-    const cfg =
-      selectedBook.id !== DEFAULT_BOOK_ID
-        ? selectedBook.googleDriveConfig
-        : selectedBook.googleDriveConfig || settings.googleDriveConfig;
-    setGdEnabled(Boolean(cfg?.enabled));
-    setGdAuthMode(cfg?.authMode || 'apps_script');
-    setGdFolderUrl(cfg?.folderUrl || cfg?.folderId || '');
-    setGdAppsScriptUrl('');
-    setGdServiceAccountJson('');
-    setGdSaveMessage(null);
-    setGdTestResult(null);
+  const applySelectedBookToForms = useCallback(
+    (book: RegistryBook, forceResetMessages = true) => {
+      const enabledForBook = getBookEnabledTypes(book, documentTypes);
+      setBookTitleInput(book.name);
+      setUnitName(book.unitName);
+      setUnitCode(book.unitCode);
+      setNumberFormat(book.numberFormat);
+      setBookEnabledTypes(enabledForBook.map((t) => t.code));
+      setTargetMode(book.numberMode);
+      setSeqTypeCode(book.numberMode === 'shared' ? 'SHARED' : enabledForBook[0]?.code || 'KH');
+      setModeConfirmText('');
+      if (forceResetMessages) {
+        setModeError(null);
+        setModeSuccess(false);
+        setGeneralSuccess(false);
+        setGdSaveMessage(null);
+        setGdTestResult(null);
+        setBookGsMessage(null);
+      }
 
-    setBookGsEnabled(Boolean(selectedBook.googleSheetsConfig?.enabled));
-    setBookGsWebhookUrl(selectedBook.googleSheetsConfig?.webhookUrl || '');
-    setBookGsMessage(null);
-    setGsTestBookId(selectedBook.id);
-  }, [selectedBook, settings.googleDriveConfig, documentTypes]);
+      const cfg =
+        book.id !== DEFAULT_BOOK_ID
+          ? book.googleDriveConfig
+          : book.googleDriveConfig || settings.googleDriveConfig;
+      setGdEnabled(Boolean(cfg?.enabled));
+      setGdAuthMode(cfg?.authMode || 'apps_script');
+      setGdFolderUrl(cfg?.folderUrl || cfg?.folderId || '');
+      setGdAppsScriptUrl('');
+      setGdServiceAccountJson('');
+
+      setBookGsEnabled(Boolean(book.googleSheetsConfig?.enabled));
+      setBookGsWebhookUrl(book.googleSheetsConfig?.webhookUrl || '');
+      setGsTestBookId(book.id);
+
+      setGeneralDirty(false);
+      setDriveDirty(false);
+      setBookGsDirty(false);
+      setSettingsConflict(null);
+      loadedBookSnapshotRef.current = {
+        bookId: book.id,
+        version: book.configVersion || 1,
+      };
+    },
+    [documentTypes, settings.googleDriveConfig]
+  );
+
+  // Sync form states cleanly when switching selectedBook or when remote config changes while form is clean
+  useEffect(() => {
+    const incomingVersion = selectedBook.configVersion || 1;
+    const prev = loadedBookSnapshotRef.current;
+
+    if (!prev || prev.bookId !== selectedBook.id) {
+      applySelectedBookToForms(selectedBook, true);
+      return;
+    }
+
+    if (incomingVersion !== prev.version) {
+      const hasUnsavedChanges =
+        generalDirty ||
+        driveDirty ||
+        bookGsDirty ||
+        targetMode !== selectedBook.numberMode;
+      if (hasUnsavedChanges) {
+        setSettingsConflict((existing) => ({
+          message:
+            'Cài đặt đã thay đổi trên thiết bị khác. Hãy tải lại cấu hình mới nhất từ máy chủ hoặc xác nhận ghi đè bằng nội dung bạn đang sửa.',
+          serverVersion: incomingVersion,
+          serverBook: selectedBook,
+          retryAction: existing?.retryAction,
+        }));
+      } else {
+        applySelectedBookToForms(selectedBook, false);
+      }
+    }
+  }, [
+    selectedBook,
+    applySelectedBookToForms,
+    generalDirty,
+    driveDirty,
+    bookGsDirty,
+    targetMode,
+  ]);
+
+  // Populate startSequenceVal from persisted customStartSequences for (book, year, type)
+  const effectiveSeqTypeCode = selectedBook.numberMode === 'shared' ? 'SHARED' : seqTypeCode;
+  const activeSeqKey = `${seqYear}_${effectiveSeqTypeCode}`;
+  const savedStartSequence = selectedBook.customStartSequences?.[activeSeqKey];
+
+  useEffect(() => {
+    setStartSequenceVal(
+      typeof savedStartSequence === 'number' && savedStartSequence >= 1
+        ? savedStartSequence
+        : 1
+    );
+  }, [selectedBook.id, activeSeqKey, savedStartSequence]);
+
+  const fetchSeqPreview = useCallback(async () => {
+    if (isConfigBlocked || !selectedBook.id) return;
+    setSeqPreviewLoading(true);
+    try {
+      const res = await api.previewNumber(effectiveSeqTypeCode, selectedBook.id, seqYear);
+      setSeqPreview(res);
+    } catch {
+      setSeqPreview(null);
+    } finally {
+      setSeqPreviewLoading(false);
+    }
+  }, [isConfigBlocked, selectedBook.id, effectiveSeqTypeCode, seqYear]);
+
+  useEffect(() => {
+    if (activeSubTab === 'numbering') {
+      fetchSeqPreview();
+    }
+  }, [activeSubTab, fetchSeqPreview, selectedBook.configVersion, savedStartSequence]);
 
   // Microsoft Graph
   const [msEnabled, setMsEnabled] = useState(settings.msGraphConfig.enabled);
@@ -575,14 +697,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  const handleConflictError = (err: any, retryAction: () => Promise<void>): boolean => {
+    if (err?.status === 409 && err?.code === 'SETTINGS_CONFLICT') {
+      setSettingsConflict({
+        message:
+          err.message ||
+          'Cài đặt đã thay đổi trên thiết bị khác. Vui lòng tải lại cấu hình mới hoặc xác nhận ghi đè.',
+        serverVersion: err.serverVersion,
+        serverBook: err.serverBook,
+        retryAction,
+      });
+      return true;
+    }
+    return false;
+  };
+
   // Create new Registry Book (Admin only)
   const handleCreateBook = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isAdmin) return;
+    if (!isAdmin || isConfigBlocked) return;
     if (newBookEnabledTypes.length === 0) {
       setBookMessage({
         success: false,
-        text: 'Vui lòng chọn ít nhất 1 loại văn bản được phép sử dụng trong sổ mới.',
+        text: 'Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ mới.',
       });
       return;
     }
@@ -628,91 +765,155 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleToggleBookActive = async (book: RegistryBook) => {
-    if (!isAdmin || book.id === DEFAULT_BOOK_ID) return;
+    if (!isAdmin || isConfigBlocked || book.id === DEFAULT_BOOK_ID) return;
     try {
-      await api.updateBook(book.id, { isActive: !book.isActive });
+      await api.updateBook(book.id, {
+        isActive: !book.isActive,
+        expectedVersion: book.configVersion,
+      });
       onBooksUpdated?.();
       onRefreshData();
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi cập nhật trạng thái sổ');
+      if (!handleConflictError(err, async () => {
+        await api.updateBook(book.id, { isActive: !book.isActive, forceOverwrite: true });
+        onBooksUpdated?.();
+        onRefreshData();
+      })) {
+        setBookMessage({ success: false, text: err.message || 'Lỗi khi cập nhật trạng thái sổ' });
+      }
     }
   };
 
   // 1. Save General Settings for selected book
-  const handleSaveGeneral = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!canManageSelectedBook) return;
+  const saveGeneralRequest = async (forceOverwrite = false) => {
+    if (!canManageSelectedBook || isConfigBlocked) return;
     if (bookEnabledTypes.length === 0) {
-      alert('Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ này.');
+      setSettingsConflict(null);
+      setBookMessage({
+        success: false,
+        text: 'Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ này.',
+      });
       return;
     }
     setGeneralSaving(true);
     setGeneralSuccess(false);
     try {
-      await api.updateBook(selectedBook.id, {
+      const res = await api.updateBook(selectedBook.id, {
         name: bookTitleInput.trim() || selectedBook.name,
         unitName: unitName.trim(),
         unitCode: unitCode.trim().toUpperCase(),
         numberFormat: numberFormat.trim(),
         enabledTypeCodes: bookEnabledTypes,
+        expectedVersion: loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
+        forceOverwrite,
       });
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: res.book.configVersion || (selectedBook.configVersion || 1) + 1,
+      };
+      setGeneralDirty(false);
+      setSettingsConflict(null);
       onBooksUpdated?.();
       onRefreshData();
       setGeneralSuccess(true);
       setTimeout(() => setGeneralSuccess(false), 3000);
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi lưu cài đặt sổ');
+      if (!handleConflictError(err, () => saveGeneralRequest(true))) {
+        setModeError(err.message || 'Lỗi khi lưu cài đặt sổ');
+      }
     } finally {
       setGeneralSaving(false);
     }
   };
 
-  // 2. Change Number Mode for selected book
-  const handleChangeMode = async (e: React.FormEvent) => {
+  const handleSaveGeneral = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!canManageSelectedBook) return;
+    await saveGeneralRequest(false);
+  };
+
+  // 2. Change Number Mode for selected book
+  const saveModeRequest = async (forceOverwrite = false) => {
+    if (!canManageSelectedBook || isConfigBlocked) return;
     setModeSaving(true);
     setModeError(null);
     setModeSuccess(false);
     try {
-      const res = await api.updateNumberMode(targetMode, modeConfirmText.trim(), selectedBook.id);
+      const res = await api.updateNumberMode(
+        targetMode,
+        modeConfirmText.trim(),
+        selectedBook.id,
+        loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
+        forceOverwrite
+      );
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: (selectedBook.configVersion || 1) + 1,
+      };
+      setSettingsConflict(null);
       onSettingsUpdated(res.settings);
       onBooksUpdated?.();
       onRefreshData();
       setModeSuccess(true);
       setModeConfirmText('');
+      fetchSeqPreview();
       setTimeout(() => setModeSuccess(false), 3000);
     } catch (err: any) {
-      setModeError(err.message || 'Lỗi khi đổi chế độ dãy số');
+      if (!handleConflictError(err, () => saveModeRequest(true))) {
+        setModeError(err.message || 'Lỗi khi đổi chế độ dãy số');
+      }
     } finally {
       setModeSaving(false);
     }
   };
 
-  // 3. Set Start Sequence for selected book
-  const handleSetStartSequence = async (e: React.FormEvent) => {
+  const handleChangeMode = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!canManageSelectedBook) return;
+    await saveModeRequest(false);
+  };
+
+  // 3. Set Start Sequence for selected book
+  const saveStartSequenceRequest = async (forceOverwrite = false) => {
+    if (!canManageSelectedBook || isConfigBlocked) return;
     setSeqSaving(true);
     setSeqError(null);
     setSeqSuccess(false);
     try {
-      await api.setStartSequence(seqYear, seqTypeCode, startSequenceVal, selectedBook.id);
+      const res = await api.setStartSequence(
+        seqYear,
+        effectiveSeqTypeCode,
+        startSequenceVal,
+        selectedBook.id,
+        loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
+        forceOverwrite
+      );
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: res.book?.configVersion || (selectedBook.configVersion || 1) + 1,
+      };
+      setSettingsConflict(null);
       setSeqSuccess(true);
       onBooksUpdated?.();
       onRefreshData();
+      await fetchSeqPreview();
       setTimeout(() => setSeqSuccess(false), 3000);
     } catch (err: any) {
-      setSeqError(err.message || 'Lỗi khi đặt số bắt đầu');
+      if (!handleConflictError(err, () => saveStartSequenceRequest(true))) {
+        setSeqError(err.message || 'Lỗi khi đặt số bắt đầu');
+      }
     } finally {
       setSeqSaving(false);
     }
   };
 
+  const handleSetStartSequence = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveStartSequenceRequest(false);
+  };
+
   // 4. Create Document Type (Admin)
   const handleCreateDocType = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isAdmin) return;
+    if (!isAdmin || isConfigBlocked) return;
     setTypeSaving(true);
     setTypeError(null);
     try {
@@ -733,22 +934,22 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleUpdateDocTypeColor = async (id: string, color: string) => {
-    if (!isAdmin) return;
+    if (!isAdmin || isConfigBlocked) return;
     try {
       await api.updateDocumentType(id, { color });
       onRefreshData();
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi cập nhật màu sắc loại văn bản');
+      setTypeError(err.message || 'Lỗi khi cập nhật màu sắc loại văn bản');
     }
   };
 
   const handleDeleteDocType = async (id: string, code: string) => {
-    if (!isAdmin || !confirm(`Xác nhận xóa loại văn bản "${code}"?`)) return;
+    if (!isAdmin || isConfigBlocked || !confirm(`Xác nhận xóa loại văn bản "${code}"?`)) return;
     try {
       await api.deleteDocumentType(id);
       onRefreshData();
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi xóa loại văn bản');
+      setTypeError(err.message || 'Lỗi khi xóa loại văn bản');
     }
   };
 
@@ -760,52 +961,64 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     return signers;
   }, [selectedBook.signers, signers]);
 
-  const handleCreateBookSigner = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!canManageSelectedBook) return;
+  const saveBookSignerRequest = async (updatedList: SignerConfig[], forceOverwrite = false, resetInput = false) => {
+    if (!canManageSelectedBook || isConfigBlocked) return;
     setSignerSaving(true);
     setSignerError(null);
     try {
-      const nextSigner: SignerConfig = {
-        id: `sig-${Date.now()}`,
-        name: newSignerName.trim(),
-        role: newSignerRole.trim(),
+      const res = await api.updateBook(selectedBook.id, {
+        signers: updatedList,
+        expectedVersion: loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
+        forceOverwrite,
+      });
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: res.book.configVersion || (selectedBook.configVersion || 1) + 1,
       };
-      const updatedList = [...displayedBookSigners, nextSigner];
-      await api.updateBook(selectedBook.id, { signers: updatedList });
-      if (isAdmin && selectedBook.id === DEFAULT_BOOK_ID) {
-        await api.createSigner({ name: nextSigner.name, role: nextSigner.role }).catch(() => {});
+      setSettingsConflict(null);
+      if (resetInput) {
+        setNewSignerName('');
+        setNewSignerRole('');
       }
-      setNewSignerName('');
-      setNewSignerRole('');
       onBooksUpdated?.();
       onRefreshData();
     } catch (err: any) {
-      setSignerError(err.message || 'Lỗi khi thêm người ký');
+      if (!handleConflictError(err, () => saveBookSignerRequest(updatedList, true, resetInput))) {
+        setSignerError(err.message || 'Lỗi khi cập nhật người ký');
+      }
     } finally {
       setSignerSaving(false);
     }
   };
 
+  const handleCreateBookSigner = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!canManageSelectedBook || isConfigBlocked) return;
+    const nextSigner: SignerConfig = {
+      id: `sig-${Date.now()}`,
+      name: newSignerName.trim(),
+      role: newSignerRole.trim(),
+    };
+    const updatedList = [...displayedBookSigners, nextSigner];
+    await saveBookSignerRequest(updatedList, false, true);
+    if (isAdmin && selectedBook.id === DEFAULT_BOOK_ID) {
+      await api.createSigner({ name: nextSigner.name, role: nextSigner.role }).catch(() => {});
+    }
+  };
+
   const handleDeleteBookSigner = async (signerId: string) => {
-    if (!canManageSelectedBook || !confirm('Xác nhận xóa người ký này khỏi sổ?')) return;
-    try {
-      const updatedList = displayedBookSigners.filter((s) => s.id !== signerId);
-      await api.updateBook(selectedBook.id, { signers: updatedList });
-      if (isAdmin && selectedBook.id === DEFAULT_BOOK_ID) {
-        await api.deleteSigner(signerId).catch(() => {});
-      }
-      onBooksUpdated?.();
-      onRefreshData();
-    } catch (err: any) {
-      alert(err.message || 'Lỗi khi xóa người ký');
+    if (!canManageSelectedBook || isConfigBlocked || !confirm('Xác nhận xóa người ký này khỏi sổ?')) return;
+    const updatedList = displayedBookSigners.filter((s) => s.id !== signerId);
+    await saveBookSignerRequest(updatedList, false, false);
+    if (isAdmin && selectedBook.id === DEFAULT_BOOK_ID) {
+      await api.deleteSigner(signerId).catch(() => {});
     }
   };
 
   // 6. Google Sheets Config & Sync Handlers
   const handleSaveGoogleSheets = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isAdmin) return;
+    if (!isAdmin || isConfigBlocked) return;
     setGsSaving(true);
     try {
       const res = await api.saveGoogleSheetsConfig({
@@ -813,9 +1026,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         webhookUrl: gsWebhookUrl.trim(),
       });
       onSettingsUpdated({ ...settings, googleSheetsConfig: res.googleSheetsConfig });
-      alert('Đã lưu cấu hình Google Trang tính thành công!');
+      setGsSyncResult('Đã lưu cấu hình Google Trang tính thành công!');
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi lưu cấu hình Google Trang tính');
+      setGsSyncResult(`Lỗi: ${err.message || 'Lỗi khi lưu cấu hình Google Trang tính'}`);
     } finally {
       setGsSaving(false);
     }
@@ -848,30 +1061,43 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const handleSaveBookGoogleSheets = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isAdmin) return;
+  const saveBookGoogleSheetsRequest = async (forceOverwrite = false) => {
+    if (!isAdmin || isConfigBlocked) return;
     setBookGsSaving(true);
     setBookGsMessage(null);
     try {
-      await api.saveBookGoogleSheetsConfig(selectedBook.id, {
+      const res = await api.saveBookGoogleSheetsConfig(selectedBook.id, {
         enabled: bookGsEnabled,
         webhookUrl: bookGsWebhookUrl.trim(),
+        expectedVersion: loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
+        forceOverwrite,
       });
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: res.book?.configVersion || (selectedBook.configVersion || 1) + 1,
+      };
+      setBookGsDirty(false);
+      setSettingsConflict(null);
       onBooksUpdated?.();
       onRefreshData();
       setBookGsMessage(`Đã lưu webhook Google Sheets riêng cho sổ "${selectedBook.name}".`);
     } catch (err: any) {
-      setBookGsMessage(`Lỗi: ${err.message || 'Không thể lưu cấu hình Google Sheets của sổ.'}`);
+      if (!handleConflictError(err, () => saveBookGoogleSheetsRequest(true))) {
+        setBookGsMessage(`Lỗi: ${err.message || 'Không thể lưu cấu hình Google Sheets của sổ.'}`);
+      }
     } finally {
       setBookGsSaving(false);
     }
   };
 
-  // 6b. Google Drive Storage Handlers (per selected book)
-  const handleSaveGoogleDrive = async (e: React.FormEvent) => {
+  const handleSaveBookGoogleSheets = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!canManageSelectedBook) return;
+    await saveBookGoogleSheetsRequest(false);
+  };
+
+  // 6b. Google Drive Storage Handlers (per selected book)
+  const saveGoogleDriveRequest = async (forceOverwrite = false) => {
+    if (!canManageSelectedBook || isConfigBlocked) return;
     setGdSaving(true);
     setGdSaveMessage(null);
     try {
@@ -883,7 +1109,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         appsScriptUrl: gdAppsScriptUrl.trim() || undefined,
         serviceAccountJson: gdServiceAccountJson.trim() || undefined,
         scopeUnitCode: selectedBook.unitCode,
+        expectedVersion: loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
+        forceOverwrite,
       });
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: (selectedBook.configVersion || 1) + 1,
+      };
+      setDriveDirty(false);
+      setSettingsConflict(null);
       if (selectedBook.id === DEFAULT_BOOK_ID) {
         onSettingsUpdated({ ...settings, googleDriveConfig: res.googleDriveConfig });
       }
@@ -896,17 +1130,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         message: `Đã lưu cấu hình thư mục Google Drive cho "${selectedBook.name}". Hãy bấm "Kiểm tra kết nối" để xác nhận quyền tải tệp.`,
       });
     } catch (err: any) {
-      setGdSaveMessage({
-        success: false,
-        message: err.message || 'Lỗi khi lưu cấu hình Google Drive',
-      });
+      if (!handleConflictError(err, () => saveGoogleDriveRequest(true))) {
+        setGdSaveMessage({
+          success: false,
+          message: err.message || 'Lỗi khi lưu cấu hình Google Drive',
+        });
+      }
     } finally {
       setGdSaving(false);
     }
   };
 
+  const handleSaveGoogleDrive = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await saveGoogleDriveRequest(false);
+  };
+
   const handleClearDriveCredential = async (type: 'apps_script' | 'service_account') => {
-    if (!canManageSelectedBook) return;
+    if (!canManageSelectedBook || isConfigBlocked) return;
     setGdSaving(true);
     setGdSaveMessage(null);
     try {
@@ -918,6 +1159,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         clearAppsScriptUrl: type === 'apps_script',
         clearServiceAccountJson: type === 'service_account',
         scopeUnitCode: selectedBook.unitCode,
+        expectedVersion: loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion,
       });
       if (selectedBook.id === DEFAULT_BOOK_ID) {
         onSettingsUpdated({ ...settings, googleDriveConfig: res.googleDriveConfig });
@@ -976,6 +1218,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     try {
       const text = await file.text();
       setGdServiceAccountJson(text);
+      setDriveDirty(true);
       setGdSaveMessage(null);
     } catch {
       setGdSaveMessage({
@@ -1157,7 +1400,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </span>
                 </div>
 
-                <div className="flex flex-wrap items-center gap-1">
+                <div className="flex flex-wrap items-center gap-1.5">
                   {PERMISSION_PRESETS.map((preset) => (
                     <button
                       key={preset.label}
@@ -1168,7 +1411,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           [book.id]: normalizeBookPermissionList([...preset.perms]),
                         })
                       }
-                      className="px-2 py-0.5 text-[10px] font-semibold bg-white hover:bg-sky-50 text-slate-700 hover:text-sky-800 border border-slate-200 rounded transition-colors"
+                      className="px-2.5 py-1 min-h-[32px] text-[10px] font-semibold bg-white hover:bg-sky-50 text-slate-700 hover:text-sky-800 border border-slate-200 rounded transition-colors"
                     >
                       {preset.label}
                     </button>
@@ -1176,7 +1419,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </div>
 
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
                 {ALL_BOOK_PERMISSIONS.map((perm) => {
                   const meta = BOOK_PERMISSION_META[perm];
                   const checked = currentPerms.includes(perm);
@@ -1189,7 +1432,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           ? 'Quyền Lấy số tự động bao gồm quyền Chỉ xem trên sổ này'
                           : meta.description
                       }
-                      className={`flex items-start gap-2 p-2 rounded-md border text-[11px] transition-colors ${
+                      className={`flex items-start gap-2.5 p-2.5 min-h-[42px] rounded-md border text-[11px] transition-colors ${
                         lockedViewByIssue ? 'cursor-default' : 'cursor-pointer'
                       } ${
                         checked
@@ -1229,29 +1472,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   return (
-    <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-6">
+    <div className="max-w-7xl mx-auto py-5 sm:py-8 px-3 sm:px-6 lg:px-8 space-y-5 sm:space-y-6">
       {/* Header + Book Scope Selector */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
-            Cài Đặt Hệ Thống & Quản Trị Sổ
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
+            Cài Đặt Hệ Thống &amp; Quản Trị Sổ
           </h1>
-          <p className="text-sm text-slate-600 mt-1">
+          <p className="text-xs sm:text-sm text-slate-600 mt-1">
             Quản lý nhiều sổ văn bản, quy tắc cấp số, người ký, phân quyền theo từng sổ và kết nối Google Drive.
           </p>
         </div>
 
         {managedBooks.length > 0 && (
-          <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-3 py-2 shadow-2xs text-xs">
+          <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-3 py-1.5 min-h-[44px] shadow-2xs text-xs w-full sm:w-auto min-w-0">
             <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />
-            <span className="font-semibold text-slate-700 whitespace-nowrap">Sổ đang cấu hình:</span>
+            <span className="font-semibold text-slate-700 whitespace-nowrap shrink-0">Sổ đang cấu hình:</span>
             <select
               value={selectedBook.id}
               onChange={(e) => {
                 setSelectedBookId(e.target.value);
                 onSelectBookId(e.target.value);
               }}
-              className="font-bold text-sky-900 bg-transparent border-0 focus:outline-hidden cursor-pointer max-w-[240px]"
+              className="font-bold text-sky-900 bg-transparent border-0 focus:outline-hidden cursor-pointer flex-1 sm:flex-initial min-w-0 sm:max-w-[240px] text-base sm:text-xs"
             >
               {managedBooks.map((b) => (
                 <option key={b.id} value={b.id}>
@@ -1263,6 +1506,76 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         )}
       </div>
 
+      {isConfigBlocked && (
+        <div className="p-4 bg-rose-50 border border-rose-300 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs text-rose-950">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+            <div>
+              <strong className="block font-bold">
+                Chưa cập nhật được dữ liệu cấu hình từ máy chủ
+              </strong>
+              <span>
+                {syncError || 'Đang tải cấu hình mới nhất. Các nút lưu cài đặt tạm khóa để tránh ghi đè nhầm cấu hình cũ.'}
+              </span>
+            </div>
+          </div>
+          <button
+            type="button"
+            onClick={onRefreshData}
+            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-lg transition-colors"
+          >
+            <RefreshCw className="w-3.5 h-3.5" />
+            <span>Thử lại</span>
+          </button>
+        </div>
+      )}
+
+      {settingsConflict && (
+        <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl space-y-2.5 text-xs text-amber-950">
+          <div className="flex items-start gap-2.5">
+            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+            <div className="space-y-1">
+              <strong className="block font-bold">
+                Cài đặt đã thay đổi trên thiết bị khác
+              </strong>
+              <span>{settingsConflict.message}</span>
+            </div>
+          </div>
+          <div className="flex flex-wrap items-center gap-2 pl-7">
+            <button
+              type="button"
+              onClick={() => {
+                const targetBook = settingsConflict.serverBook || selectedBook;
+                applySelectedBookToForms(targetBook, true);
+                onRefreshData();
+              }}
+              className="px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg transition-colors"
+            >
+              Tải lại cài đặt mới từ máy chủ
+            </button>
+            <button
+              type="button"
+              onClick={async () => {
+                if (settingsConflict.retryAction) {
+                  await settingsConflict.retryAction();
+                } else {
+                  if (settingsConflict.serverVersion) {
+                    loadedBookSnapshotRef.current = {
+                      bookId: selectedBook.id,
+                      version: settingsConflict.serverVersion,
+                    };
+                  }
+                  setSettingsConflict(null);
+                }
+              }}
+              className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 font-semibold rounded-lg transition-colors"
+            >
+              Giữ nội dung đang sửa & ghi đè lên máy chủ
+            </button>
+          </div>
+        </div>
+      )}
+
       {!isAdmin && (
         <div className="p-3 bg-sky-50 border border-sky-200 rounded-lg text-xs text-sky-900 flex items-center gap-2">
           <Sliders className="w-4 h-4 text-sky-700 shrink-0" />
@@ -1273,10 +1586,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       )}
 
       {/* Sub Tabs */}
-      <div className="flex border-b border-slate-200 overflow-x-auto gap-2">
+      <div className="flex border-b border-slate-200 max-w-full overflow-x-auto gap-1 sm:gap-2">
         <button
           onClick={() => setActiveSubTab('books')}
-          className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
             activeSubTab === 'books'
               ? 'border-sky-700 text-sky-800'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1287,7 +1600,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <button
           onClick={() => setActiveSubTab('general')}
-          className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
             activeSubTab === 'general'
               ? 'border-sky-700 text-sky-800'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1298,7 +1611,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <button
           onClick={() => setActiveSubTab('numbering')}
-          className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
             activeSubTab === 'numbering'
               ? 'border-sky-700 text-sky-800'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1309,7 +1622,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <button
           onClick={() => setActiveSubTab('signers')}
-          className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
             activeSubTab === 'signers'
               ? 'border-sky-700 text-sky-800'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1320,7 +1633,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <button
           onClick={() => setActiveSubTab('googledrive')}
-          className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
             activeSubTab === 'googledrive'
               ? 'border-sky-700 text-sky-800'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1331,7 +1644,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <button
           onClick={() => setActiveSubTab('docTypes')}
-          className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
             activeSubTab === 'docTypes'
               ? 'border-sky-700 text-sky-800'
               : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1344,7 +1657,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <>
             <button
               onClick={() => setActiveSubTab('googlesheets')}
-              className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+              className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
                 activeSubTab === 'googlesheets'
                   ? 'border-emerald-700 text-emerald-800'
                   : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1355,7 +1668,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <button
               onClick={() => setActiveSubTab('msgraph')}
-              className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+              className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
                 activeSubTab === 'msgraph'
                   ? 'border-sky-700 text-sky-800'
                   : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1366,7 +1679,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <button
               onClick={handleOpenUsersTab}
-              className={`pb-3 px-3 text-xs font-bold border-b-2 whitespace-nowrap transition-colors ${
+              className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
                 activeSubTab === 'users'
                   ? 'border-sky-700 text-sky-800'
                   : 'border-transparent text-slate-500 hover:text-slate-800'
@@ -1441,7 +1754,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-2 shrink-0">
+                    <div className="flex flex-wrap items-center gap-2 shrink-0">
                       {(isAdmin || hasBookPermission(currentUser, book.id, 'manage_book')) && (
                         <button
                           type="button"
@@ -1450,7 +1763,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             onSelectBookId(book.id);
                             setActiveSubTab('general');
                           }}
-                          className="px-2.5 py-1.5 bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 rounded-md font-semibold transition-colors"
+                          className="px-3 py-2 min-h-[38px] bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 rounded-md font-semibold transition-colors"
                         >
                           Cấu hình sổ này
                         </button>
@@ -1458,8 +1771,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       {isAdmin && book.id !== DEFAULT_BOOK_ID && (
                         <button
                           type="button"
+                          disabled={isConfigBlocked}
                           onClick={() => handleToggleBookActive(book)}
-                          className={`px-2.5 py-1.5 rounded-md font-semibold border transition-colors ${
+                          className={`px-3 py-2 min-h-[38px] rounded-md font-semibold border transition-colors disabled:opacity-50 ${
                             book.isActive
                               ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
                               : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
@@ -1476,14 +1790,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {isAdmin && (
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-4">
+            <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
               <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <Plus className="w-4 h-4 text-sky-700" />
+                <Plus className="w-4 h-4 text-sky-700 shrink-0" />
                 <span>Tạo Sổ Văn Bản Mới (Phòng ban / Tổ chuyên môn / Sổ dùng chung)</span>
               </h3>
 
               <form onSubmit={handleCreateBook} className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Tên sổ văn bản *</label>
                   <input
                     type="text"
@@ -1497,11 +1811,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     }}
                     placeholder="Ví dụ: Tổ Ngữ văn / Công đoàn / Văn thư"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">
                     Mã sổ nội bộ cố định (Tên tab Google Sheets) *
                   </label>
@@ -1514,12 +1828,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     }}
                     placeholder="Ví dụ: TO_NGU_VAN"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono uppercase text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono uppercase text-base sm:text-sm"
                   />
                   <span className="text-[11px] text-slate-500">Không thể đổi sau khi tạo, dùng để định tuyến tab Sheets.</span>
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Tên đơn vị / bộ phận *</label>
                   <input
                     type="text"
@@ -1527,11 +1841,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewBookUnitName(e.target.value)}
                     placeholder="Ví dụ: Tổ Ngữ văn - Trường THPT Nguyễn Chí Thanh"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Ký hiệu đơn vị chính thức *</label>
                   <input
                     type="text"
@@ -1539,27 +1853,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewBookUnitCode(e.target.value)}
                     placeholder="Ví dụ: TNV, CB, THPTNCT..."
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono uppercase text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono uppercase text-base sm:text-sm"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Mẫu định dạng số</label>
                   <input
                     type="text"
                     value={newBookFormat}
                     onChange={(e) => setNewBookFormat(e.target.value)}
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Phạm vi & Chế độ dãy số</label>
-                  <div className="grid grid-cols-2 gap-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
                     <select
                       value={newBookIsShared ? 'shared' : 'unit'}
                       onChange={(e) => setNewBookIsShared(e.target.value === 'shared')}
-                      className="w-full h-10 px-2.5 bg-white border border-slate-300 rounded-lg"
+                      className="w-full min-h-[44px] h-11 sm:h-10 px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                     >
                       <option value="unit">Sổ riêng đơn vị</option>
                       <option value="shared">Dùng chung trường</option>
@@ -1567,7 +1881,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     <select
                       value={newBookMode}
                       onChange={(e) => setNewBookMode(e.target.value === 'shared' ? 'shared' : 'separate')}
-                      className="w-full h-10 px-2.5 bg-white border border-slate-300 rounded-lg"
+                      className="w-full min-h-[44px] h-11 sm:h-10 px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                     >
                       <option value="separate">Dãy riêng theo loại</option>
                       <option value="shared">Dãy chung liên tục</option>
@@ -1579,13 +1893,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <label className="font-bold text-slate-700 block">
                     Loại văn bản được sử dụng trong sổ mới *
                   </label>
-                  <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
                     {documentTypes.filter((t) => t.isActive).map((t) => {
                       const checked = newBookEnabledTypes.includes(t.code);
                       return (
                         <label
                           key={t.code}
-                          className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer ${
+                          className={`flex items-center gap-2.5 p-2.5 min-h-[42px] rounded-lg border cursor-pointer ${
                             checked ? 'bg-sky-50 border-sky-300 text-sky-950 font-semibold' : 'bg-white border-slate-200 text-slate-600'
                           }`}
                         >
@@ -1626,8 +1940,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div className="sm:col-span-2 flex justify-end">
                   <button
                     type="submit"
-                    disabled={bookSaving}
-                    className="px-5 py-2.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2"
+                    disabled={bookSaving || isConfigBlocked}
+                    className="w-full sm:w-auto min-h-[44px] px-5 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-2"
                   >
                     <Plus className="w-4 h-4" />
                     <span>{bookSaving ? 'Đang tạo sổ...' : 'Tạo sổ văn bản mới'}</span>
@@ -1641,9 +1955,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
       {/* SUB-TAB 1: THÔNG TIN SỔ & MẪU SỐ */}
       {activeSubTab === 'general' && (
-        <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs max-w-2xl">
+        <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs max-w-2xl">
           <div className="mb-4 pb-3 border-b border-slate-100 flex items-center justify-between">
-            <div>
+            <div className="min-w-0">
               <h2 className="text-base font-bold text-slate-900">
                 Thông tin đơn vị & Mẫu số: {selectedBook.name}
               </h2>
@@ -1654,14 +1968,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          <form onSubmit={handleSaveGeneral} className="space-y-5 text-xs">
+          <form onSubmit={handleSaveGeneral} className="space-y-4 sm:space-y-5 text-xs">
             <div className="space-y-1">
               <label className="font-bold text-slate-700">Mã sổ nội bộ cố định (Tab Google Sheets)</label>
               <input
                 type="text"
                 value={selectedBook.code}
                 disabled
-                className="w-full h-9 px-3 bg-slate-100 border border-slate-200 rounded-lg font-mono text-xs text-slate-600 cursor-not-allowed"
+                className="w-full min-h-[42px] h-10 sm:h-9 px-3 bg-slate-100 border border-slate-200 rounded-lg font-mono text-base sm:text-xs text-slate-600 cursor-not-allowed"
               />
             </div>
 
@@ -1670,9 +1984,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <input
                 type="text"
                 value={bookTitleInput}
-                onChange={(e) => setBookTitleInput(e.target.value)}
-                disabled={!canManageSelectedBook || generalSaving}
-                className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
+                onChange={(e) => {
+                  setBookTitleInput(e.target.value);
+                  setGeneralDirty(true);
+                }}
+                disabled={!canManageSelectedBook || generalSaving || isConfigBlocked}
+                className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
               />
             </div>
 
@@ -1681,9 +1998,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <input
                 type="text"
                 value={unitName}
-                onChange={(e) => setUnitName(e.target.value)}
-                disabled={!canManageSelectedBook || generalSaving}
-                className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
+                onChange={(e) => {
+                  setUnitName(e.target.value);
+                  setGeneralDirty(true);
+                }}
+                disabled={!canManageSelectedBook || generalSaving || isConfigBlocked}
+                className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
               />
             </div>
 
@@ -1692,11 +2012,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <input
                 type="text"
                 value={unitCode}
-                onChange={(e) => setUnitCode(e.target.value)}
-                disabled={!canManageSelectedBook || generalSaving}
-                className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 font-mono focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
+                onChange={(e) => {
+                  setUnitCode(e.target.value);
+                  setGeneralDirty(true);
+                }}
+                disabled={!canManageSelectedBook || generalSaving || isConfigBlocked}
+                className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 font-mono focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
               />
-              <span className="text-[11px] text-slate-500">
+              <span className="text-[11px] text-slate-500 block">
                 Ví dụ: ĐTN (Đoàn trường), CB (Chi bộ), THPTNCT (Nhà trường) — quản trị viên có thể đổi theo đúng ký hiệu đơn vị đang dùng.
               </span>
             </div>
@@ -1706,11 +2029,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <input
                 type="text"
                 value={numberFormat}
-                onChange={(e) => setNumberFormat(e.target.value)}
-                disabled={!canManageSelectedBook || generalSaving}
-                className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 font-mono focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
+                onChange={(e) => {
+                  setNumberFormat(e.target.value);
+                  setGeneralDirty(true);
+                }}
+                disabled={!canManageSelectedBook || generalSaving || isConfigBlocked}
+                className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 font-mono focus:outline-hidden focus:ring-2 focus:ring-sky-600 disabled:bg-slate-50"
               />
-              <span className="text-[11px] text-slate-500">
+              <span className="text-[11px] text-slate-500 block">
                 Các biến thay thế: <code className="bg-slate-100 px-1 py-0.5 rounded">{'{so}'}</code> (số thứ tự),{' '}
                 <code className="bg-slate-100 px-1 py-0.5 rounded">{'{loai}'}</code> (loại văn bản),{' '}
                 <code className="bg-slate-100 px-1 py-0.5 rounded">{'{don_vi}'}</code> (ký hiệu đơn vị). Ví dụ:{' '}
@@ -1722,25 +2048,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <label className="font-bold text-slate-700 block">
                 Loại văn bản được sử dụng trong sổ "{selectedBook.name}"
               </label>
-              <div className="grid grid-cols-2 sm:grid-cols-3 gap-2">
+              <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
                 {documentTypes.filter((t) => t.isActive).map((t) => {
                   const checked = bookEnabledTypes.includes(t.code);
                   return (
                     <label
                       key={t.code}
-                      className={`flex items-center gap-2 p-2 rounded-lg border cursor-pointer ${
+                      className={`flex items-center gap-2.5 p-2.5 min-h-[42px] rounded-lg border cursor-pointer ${
                         checked ? 'bg-sky-50 border-sky-300 text-sky-950 font-semibold' : 'bg-white border-slate-200 text-slate-600'
                       }`}
                     >
                       <input
                         type="checkbox"
                         checked={checked}
-                        disabled={!canManageSelectedBook || generalSaving}
-                        onChange={() =>
+                        disabled={!canManageSelectedBook || generalSaving || isConfigBlocked}
+                        onChange={() => {
                           setBookEnabledTypes((prev) =>
                             prev.includes(t.code) ? prev.filter((c) => c !== t.code) : [...prev, t.code]
-                          )
-                        }
+                          );
+                          setGeneralDirty(true);
+                        }}
                         className="rounded text-sky-700"
                       />
                       <span>{t.name} ({t.code})</span>
@@ -1752,7 +2079,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             {generalSuccess && (
               <div className="p-3 bg-emerald-50 text-emerald-800 rounded-lg flex items-center gap-2">
-                <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                 <span>Đã lưu thành công cấu hình sổ "{bookTitleInput}"!</span>
               </div>
             )}
@@ -1761,8 +2088,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="pt-2">
                 <button
                   type="submit"
-                  disabled={generalSaving}
-                  className="px-5 py-2.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2"
+                  disabled={generalSaving || isConfigBlocked}
+                  className="w-full sm:w-auto min-h-[44px] px-5 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-2"
                 >
                   <Save className="w-4 h-4" />
                   <span>{generalSaving ? 'Đang lưu...' : 'Lưu cài đặt sổ'}</span>
@@ -1776,7 +2103,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       {/* SUB-TAB 2: QUY TẮC DÃY SỐ & SỐ BẮT ĐẦU */}
       {activeSubTab === 'numbering' && (
         <div className="space-y-6 max-w-3xl">
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
             <h2 className="text-base font-bold text-slate-900">
               Chế Độ Dãy Số Trong Năm — {selectedBook.name}
             </h2>
@@ -1786,7 +2113,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <form onSubmit={handleChangeMode} className="space-y-4 text-xs">
               <div className="space-y-3">
-                <label className="flex items-start gap-3 p-3.5 border rounded-lg cursor-pointer transition-colors hover:bg-slate-50 border-slate-300">
+                <label className="flex items-start gap-3 p-3.5 min-h-[48px] border rounded-lg cursor-pointer transition-colors hover:bg-slate-50 border-slate-300">
                   <input
                     type="radio"
                     name="numberMode"
@@ -1806,7 +2133,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </div>
                 </label>
 
-                <label className="flex items-start gap-3 p-3.5 border rounded-lg cursor-pointer transition-colors hover:bg-slate-50 border-slate-300">
+                <label className="flex items-start gap-3 p-3.5 min-h-[48px] border rounded-lg cursor-pointer transition-colors hover:bg-slate-50 border-slate-300">
                   <input
                     type="radio"
                     name="numberMode"
@@ -1845,7 +2172,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     value={modeConfirmText}
                     onChange={(e) => setModeConfirmText(e.target.value)}
                     placeholder="Nhập: XÁC NHẬN CHUYỂN ĐỔI"
-                    className="w-full h-9 px-3 bg-white border border-rose-300 rounded-lg text-xs font-bold text-rose-900"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-rose-300 rounded-lg text-base sm:text-xs font-bold text-rose-900"
                   />
                 </div>
               )}
@@ -1856,7 +2183,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               {modeSuccess && (
                 <div className="p-3 bg-emerald-50 text-emerald-800 rounded-lg text-xs flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
                   <span>Đã cập nhật chế độ cấp số thành công!</span>
                 </div>
               )}
@@ -1864,8 +2191,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               {canManageSelectedBook && targetMode !== selectedBook.numberMode && (
                 <button
                   type="submit"
-                  disabled={modeSaving}
-                  className="px-4 py-2 bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  disabled={modeSaving || isConfigBlocked}
+                  className="w-full sm:w-auto min-h-[44px] px-4 py-2.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
                   {modeSaving ? 'Đang cập nhật...' : 'Xác nhận áp dụng chế độ mới'}
                 </button>
@@ -1873,39 +2200,50 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </form>
           </div>
 
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
             <h2 className="text-base font-bold text-slate-900">
               Thiết Lập Số Bắt Đầu Tiếp Theo — {selectedBook.name}
             </h2>
             <p className="text-xs text-slate-600">
-              Nếu đơn vị đã cấp một số văn bản trên sổ giấy trước khi dùng phần mềm, có thể đặt số bắt đầu tiếp theo để hệ thống tiếp nối chính xác.
+              Nếu đơn vị đã cấp một số văn bản trên sổ giấy trước khi dùng phần mềm, có thể đặt số bắt đầu để hệ thống tiếp nối chính xác. Giá trị <strong>Số bắt đầu đã cài</strong> luôn được lưu giữ theo Sổ + Năm + Loại văn bản, tách biệt với <strong>Số tiếp theo dự kiến</strong> khi sổ phát sinh thêm văn bản.
             </p>
 
             <form onSubmit={handleSetStartSequence} className="space-y-4 text-xs">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Năm áp dụng</label>
                   <select
                     value={seqYear}
                     onChange={(e) => setSeqYear(parseInt(e.target.value, 10))}
-                    disabled={!canManageSelectedBook}
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg"
+                    disabled={!canManageSelectedBook || isConfigBlocked}
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   >
-                    {[currentYear, currentYear - 1, currentYear + 1].map((y) => (
-                      <option key={y} value={y}>
-                        Năm {y}
-                      </option>
-                    ))}
+                    {Array.from(
+                      new Set([
+                        currentYear + 1,
+                        currentYear,
+                        currentYear - 1,
+                        ...Object.keys(selectedBook.customStartSequences || {})
+                          .map((k) => parseInt(k.split('_')[0], 10))
+                          .filter((y) => !Number.isNaN(y)),
+                      ])
+                    )
+                      .sort((a, b) => b - a)
+                      .map((y) => (
+                        <option key={y} value={y}>
+                          Năm {y}
+                        </option>
+                      ))}
                   </select>
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Loại văn bản</label>
                   <select
-                    value={seqTypeCode}
+                    value={effectiveSeqTypeCode}
                     onChange={(e) => setSeqTypeCode(e.target.value)}
-                    disabled={!canManageSelectedBook}
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg"
+                    disabled={!canManageSelectedBook || isConfigBlocked}
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   >
                     {selectedBook.numberMode === 'shared' ? (
                       <option value="SHARED">Dãy số chung (SHARED)</option>
@@ -1919,22 +2257,55 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </select>
                 </div>
 
-                <div className="space-y-1">
-                  <label className="font-bold text-slate-700">Số bắt đầu tiếp theo</label>
+                <div className="space-y-1 min-w-0">
+                  <label className="font-bold text-slate-700">Số bắt đầu đã cài</label>
                   <input
                     type="number"
                     min={1}
                     value={startSequenceVal}
                     onChange={(e) => setStartSequenceVal(parseInt(e.target.value, 10) || 1)}
-                    disabled={!canManageSelectedBook}
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold"
+                    disabled={!canManageSelectedBook || isConfigBlocked}
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-base sm:text-xs"
                   />
+                </div>
+              </div>
+
+              {/* Explicit side-by-side summary: Saved Start Sequence vs Expected Next Number */}
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="p-3 bg-sky-50 border border-sky-200 rounded-lg space-y-1 min-w-0">
+                  <span className="text-[11px] font-semibold text-sky-800 block">
+                    Số bắt đầu đã cài ({activeSeqKey})
+                  </span>
+                  <div className="font-mono text-base font-bold text-sky-950 break-words">
+                    {typeof savedStartSequence === 'number'
+                      ? `${String(savedStartSequence).padStart(2, '0')} (Mốc đã lưu)`
+                      : '01 (Mặc định chưa cài riêng)'}
+                  </div>
+                  <span className="text-[11px] text-sky-700 block">
+                    Mốc bắt đầu được giữ cố định, không bị thay đổi khi cấp số mới.
+                  </span>
+                </div>
+
+                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg space-y-1 min-w-0">
+                  <span className="text-[11px] font-semibold text-emerald-800 block">
+                    Số tiếp theo dự kiến (Năm {seqYear})
+                  </span>
+                  <div className="font-mono text-base font-bold text-emerald-950 break-words">
+                    {seqPreviewLoading
+                      ? 'Đang tính...'
+                      : seqPreview
+                      ? `${String(seqPreview.sequenceNumber).padStart(2, '0')} → ${seqPreview.previewNumber}`
+                      : 'Chưa có dữ liệu dự kiến'}
+                  </div>
+                  <span className="text-[11px] text-emerald-800 block">
+                    Tính từ max(Số bắt đầu đã cài, Số lớn nhất đã cấp/hủy: {seqPreview?.maxIssuedSequence ?? 0} + 1).
+                  </span>
                 </div>
               </div>
 
               {Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
                 <div className="p-3 bg-sky-50/70 border border-sky-200 rounded-lg text-[11px] text-sky-900">
-                  <strong className="block mb-1">Các mốc bắt đầu đang cấu hình trên sổ:</strong>
+                  <strong className="block mb-1">Các mốc Số bắt đầu đã cài trên sổ:</strong>
                   <div className="flex flex-wrap gap-2">
                     {Object.entries(selectedBook.customStartSequences).map(([k, val]) => (
                       <span key={k} className="px-2 py-0.5 bg-white border border-sky-200 rounded font-mono">
@@ -1953,16 +2324,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
               {seqSuccess && (
                 <div className="p-3 bg-emerald-50 text-emerald-800 rounded-lg text-xs flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-                  <span>Đã thiết lập số bắt đầu tiếp theo thành công!</span>
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                  <span>Đã lưu Số bắt đầu đã cài thành công!</span>
                 </div>
               )}
 
               {canManageSelectedBook && (
                 <button
                   type="submit"
-                  disabled={seqSaving}
-                  className="px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  disabled={seqSaving || isConfigBlocked}
+                  className="w-full sm:w-auto min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
                   {seqSaving ? 'Đang lưu...' : 'Lưu số bắt đầu'}
                 </button>
@@ -2028,10 +2399,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       {isAdmin && (
                         <button
                           onClick={() => handleDeleteDocType(t.id, t.code)}
-                          className="p-1 text-slate-400 hover:text-rose-600 hover:bg-slate-100 rounded transition-colors"
+                          className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center text-slate-400 hover:text-rose-600 hover:bg-slate-100 rounded transition-colors"
                           title="Xóa loại văn bản này"
                         >
-                          <Trash2 className="w-3.5 h-3.5" />
+                          <Trash2 className="w-4 h-4" />
                         </button>
                       )}
                     </div>
@@ -2042,14 +2413,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {isAdmin && (
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+            <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
               <h3 className="text-sm font-bold text-slate-900 mb-3 flex items-center gap-2">
                 <Plus className="w-4 h-4 text-sky-700" />
                 <span>Thêm loại văn bản mới</span>
               </h3>
 
               <form onSubmit={handleCreateDocType} className="grid grid-cols-1 sm:grid-cols-12 gap-3 text-xs">
-                <div className="sm:col-span-6 space-y-1">
+                <div className="sm:col-span-6 space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Tên loại văn bản *</label>
                   <input
                     type="text"
@@ -2057,11 +2428,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewTypeName(e.target.value)}
                     placeholder="Ví dụ: Hướng dẫn / Quyết định..."
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   />
                 </div>
 
-                <div className="sm:col-span-4 space-y-1">
+                <div className="sm:col-span-4 space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Ký hiệu viết tắt *</label>
                   <input
                     type="text"
@@ -2069,15 +2440,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewTypeCode(e.target.value)}
                     placeholder="Ví dụ: HD / QĐ"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg uppercase font-mono"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg uppercase font-mono text-base sm:text-xs"
                   />
                 </div>
 
                 <div className="sm:col-span-2 flex items-end">
                   <button
                     type="submit"
-                    disabled={typeSaving}
-                    className="w-full h-10 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                    disabled={typeSaving || isConfigBlocked}
+                    className="w-full min-h-[44px] h-11 sm:h-10 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                   >
                     {typeSaving ? '...' : 'Thêm'}
                   </button>
@@ -2136,7 +2507,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   {canManageSelectedBook && (
                     <button
                       onClick={() => handleDeleteBookSigner(s.id)}
-                      className="p-1.5 text-slate-400 hover:text-rose-600 hover:bg-slate-100 rounded transition-colors"
+                      className="p-2 min-w-[38px] min-h-[38px] inline-flex items-center justify-center text-slate-400 hover:text-rose-600 hover:bg-slate-100 rounded transition-colors shrink-0"
                       title="Xóa người ký này"
                     >
                       <Trash2 className="w-4 h-4" />
@@ -2148,14 +2519,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {canManageSelectedBook && (
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+            <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
               <h3 className="text-sm font-bold text-slate-900 mb-3 flex items-center gap-2">
-                <Plus className="w-4 h-4 text-sky-700" />
+                <Plus className="w-4 h-4 text-sky-700 shrink-0" />
                 <span>Thêm người ký mới vào sổ "{selectedBook.name}"</span>
               </h3>
 
               <form onSubmit={handleCreateBookSigner} className="grid grid-cols-1 sm:grid-cols-12 gap-3 text-xs">
-                <div className="sm:col-span-5 space-y-1">
+                <div className="sm:col-span-5 space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Họ và tên *</label>
                   <input
                     type="text"
@@ -2163,11 +2534,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewSignerName(e.target.value)}
                     placeholder="Ví dụ: Võ Văn Hoàng"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   />
                 </div>
 
-                <div className="sm:col-span-5 space-y-1">
+                <div className="sm:col-span-5 space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Chức vụ *</label>
                   <input
                     type="text"
@@ -2175,15 +2546,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewSignerRole(e.target.value)}
                     placeholder="Ví dụ: Phó Bí thư Đoàn trường"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   />
                 </div>
 
                 <div className="sm:col-span-2 flex items-end">
                   <button
                     type="submit"
-                    disabled={signerSaving}
-                    className="w-full h-10 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                    disabled={signerSaving || isConfigBlocked}
+                    className="w-full min-h-[44px] h-11 sm:h-10 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                   >
                     {signerSaving ? '...' : 'Thêm'}
                   </button>
@@ -2207,20 +2578,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         const maxWordMB = currentDriveCfg?.maxFileSizeMB || DEFAULT_MAX_WORD_MB;
 
         return (
-          <div className="space-y-6 max-w-3xl">
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
+          <div className="space-y-6 max-w-3xl min-w-0">
+            <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-5 min-w-0">
               <div className="flex flex-wrap items-start justify-between gap-3">
-                <div>
+                <div className="min-w-0 flex-1">
                   <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                    <HardDrive className="w-5 h-5 text-sky-700" />
+                    <HardDrive className="w-5 h-5 text-sky-700 shrink-0" />
                     <span>Lưu Trữ Tệp Google Drive — {selectedBook.name}</span>
                   </h2>
-                  <p className="text-xs text-slate-600 mt-1">
+                  <p className="text-xs text-slate-600 mt-1 break-words">
                     Cấu hình thư mục Google Drive riêng cho sổ <strong>{selectedBook.name} ({selectedBook.unitCode})</strong>. Tệp Word khi cấp số hoặc PDF văn bản đến sẽ tự đổi tên theo mẫu <code className="font-mono">Số.ký hiệu - Tên văn bản.đuôi</code> và lưu vào thư mục này.
                   </p>
                 </div>
 
-                <div className="flex flex-col items-end gap-1">
+                <div className="flex flex-col sm:items-end gap-1 shrink-0">
                   <span
                     className={`text-xs px-2.5 py-1 rounded font-semibold ${
                       currentDriveCfg?.isConfigured
@@ -2247,8 +2618,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <input
                     type="checkbox"
                     checked={gdEnabled}
-                    onChange={(e) => setGdEnabled(e.target.checked)}
-                    disabled={!canManageSelectedBook}
+                    onChange={(e) => {
+                      setGdEnabled(e.target.checked);
+                      setDriveDirty(true);
+                    }}
+                    disabled={!canManageSelectedBook || isConfigBlocked}
                     className="rounded text-sky-700 focus:ring-sky-700"
                   />
                   <span className="font-semibold text-slate-900">
@@ -2264,19 +2638,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
 
                 {canManageSelectedBook && (
-                  <div className="space-y-1.5">
+                  <div className="space-y-1.5 min-w-0">
                     <label className="font-bold text-slate-700 block">
                       URL hoặc ID thư mục Google Drive (Sổ: {selectedBook.unitCode}) *
                     </label>
                     <input
                       type="text"
                       value={gdFolderUrl}
-                      onChange={(e) => setGdFolderUrl(e.target.value)}
-                      placeholder="https://drive.google.com/drive/folders/1AbCDefGhIjkLMN... hoặc nhập trực tiếp Folder ID"
-                      className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs focus:ring-2 focus:ring-sky-600"
+                      onChange={(e) => {
+                        setGdFolderUrl(e.target.value);
+                        setDriveDirty(true);
+                      }}
+                      disabled={isConfigBlocked}
+                      placeholder="https://drive.google.com/drive/folders/1AbCDef... hoặc Folder ID"
+                      className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs focus:ring-2 focus:ring-sky-600"
                     />
                     <div className="flex flex-wrap items-center justify-between gap-2 text-[11px] text-slate-500">
-                      <span>
+                      <span className="break-all">
                         ID thư mục nhận diện:{' '}
                         {parsedPreviewFolderId ? (
                           <strong className="font-mono text-sky-800">{parsedPreviewFolderId}</strong>
@@ -2286,7 +2664,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       </span>
                       {(gdTestResult?.folderName || currentDriveCfg?.folderName) && (
                         <span className="inline-flex items-center gap-1 text-emerald-700 font-semibold">
-                          <FolderCheck className="w-3.5 h-3.5" />
+                          <FolderCheck className="w-3.5 h-3.5 shrink-0" />
                           <span>Thư mục: {gdTestResult?.folderName || currentDriveCfg?.folderName}</span>
                         </span>
                       )}
@@ -2295,7 +2673,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
 
                 {canManageSelectedBook && (
-                  <div className="space-y-2">
+                  <div className="space-y-2 min-w-0">
                     <label className="font-bold text-slate-700 block">
                       Phương thức kết nối Google Drive (Xác thực phía máy chủ)
                     </label>
@@ -2311,7 +2689,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           type="radio"
                           name="gdAuthMode"
                           checked={gdAuthMode === 'apps_script'}
-                          onChange={() => setGdAuthMode('apps_script')}
+                          onChange={() => {
+                            setGdAuthMode('apps_script');
+                            setDriveDirty(true);
+                          }}
+                          disabled={isConfigBlocked}
                           className="mt-0.5 text-sky-700"
                         />
                         <div>
@@ -2333,7 +2715,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           type="radio"
                           name="gdAuthMode"
                           checked={gdAuthMode === 'service_account'}
-                          onChange={() => setGdAuthMode('service_account')}
+                          onChange={() => {
+                            setGdAuthMode('service_account');
+                            setDriveDirty(true);
+                          }}
+                          disabled={isConfigBlocked}
                           className="mt-0.5 text-sky-700"
                         />
                         <div>
@@ -2348,10 +2734,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
 
                 {canManageSelectedBook && gdAuthMode === 'apps_script' && (
-                  <div className="space-y-4">
-                    <div className="bg-sky-50/70 border border-sky-200 rounded-xl p-4 space-y-3">
+                  <div className="space-y-4 min-w-0">
+                    <div className="bg-sky-50/70 border border-sky-200 rounded-xl p-3.5 sm:p-4 space-y-3 min-w-0">
                       <h3 className="font-bold text-sky-950 flex items-center gap-2">
-                        <CheckCircle2 className="w-4 h-4 text-sky-700" />
+                        <CheckCircle2 className="w-4 h-4 text-sky-700 shrink-0" />
                         <span>Hướng dẫn triển khai Apps Script (Hỗ trợ upload, đối soát & thay tệp)</span>
                       </h3>
                       <ol className="list-decimal pl-5 space-y-1 text-slate-700">
@@ -2360,39 +2746,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                         <li>Dán <strong>URL ứng dụng web (/exec)</strong> vào ô bên dưới (nếu dùng chung credential mặc định của hệ thống có thể để trống nếu đã cấu hình ở Sổ mặc định).</li>
                       </ol>
 
-                      <div className="relative">
-                        <pre className="p-3 bg-slate-900 text-slate-100 rounded-lg text-[11px] font-mono overflow-x-auto max-h-52 leading-relaxed">
+                      <div className="rounded-lg overflow-hidden border border-slate-800 bg-slate-900 min-w-0">
+                        <div className="flex items-center justify-between gap-2 px-3 py-2 bg-slate-800/80 border-b border-slate-700">
+                          <span className="text-[11px] font-mono text-slate-300">Apps Script Google Drive</span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              navigator.clipboard.writeText(GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE);
+                              setCopiedDriveScript(true);
+                              setTimeout(() => setCopiedDriveScript(false), 2500);
+                            }}
+                            className="px-2.5 py-1.5 min-h-[32px] text-xs font-semibold bg-sky-700 hover:bg-sky-600 text-white rounded shadow transition-colors inline-flex items-center gap-1 shrink-0"
+                          >
+                            {copiedDriveScript ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                            <span>{copiedDriveScript ? 'Đã sao chép' : 'Sao chép mã'}</span>
+                          </button>
+                        </div>
+                        <pre className="p-3 bg-slate-900 text-slate-100 text-[11px] font-mono overflow-x-auto max-h-52 leading-relaxed w-full max-w-full">
 {GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE}
                         </pre>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            navigator.clipboard.writeText(GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE);
-                            setCopiedDriveScript(true);
-                            setTimeout(() => setCopiedDriveScript(false), 2500);
-                          }}
-                          className="absolute top-2 right-2 px-2.5 py-1 text-xs font-semibold bg-sky-700 hover:bg-sky-600 text-white rounded shadow transition-colors flex items-center gap-1"
-                        >
-                          {copiedDriveScript ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                          <span>{copiedDriveScript ? 'Đã sao chép' : 'Sao chép mã Drive Script'}</span>
-                        </button>
                       </div>
                     </div>
 
-                    <div className="space-y-1.5">
-                      <div className="flex items-center justify-between">
+                    <div className="space-y-1.5 min-w-0">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
                         <label className="font-bold text-slate-700">
                           URL Web App Google Apps Script (/exec)
                         </label>
                         {currentDriveCfg?.hasAppsScriptUrl && (
-                          <div className="flex items-center gap-2">
-                            <span className="text-[11px] text-emerald-700 font-mono bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">
+                          <div className="flex flex-wrap items-center gap-2 min-w-0">
+                            <span className="text-[11px] text-emerald-700 font-mono bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200 break-all">
                               Đã lưu: {currentDriveCfg.appsScriptUrlMasked}
                             </span>
                             <button
                               type="button"
                               onClick={() => handleClearDriveCredential('apps_script')}
-                              className="text-[11px] text-rose-600 hover:underline"
+                              className="text-[11px] text-rose-600 hover:underline py-1"
                             >
                               Xóa URL
                             </button>
@@ -2402,13 +2791,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       <input
                         type="url"
                         value={gdAppsScriptUrl}
-                        onChange={(e) => setGdAppsScriptUrl(e.target.value)}
+                        onChange={(e) => {
+                          setGdAppsScriptUrl(e.target.value);
+                          setDriveDirty(true);
+                        }}
+                        disabled={isConfigBlocked}
                         placeholder={
                           currentDriveCfg?.hasAppsScriptUrl
                             ? 'Để trống nếu giữ nguyên URL đang lưu, hoặc dán URL mới để thay thế...'
                             : 'https://script.google.com/macros/s/AKfycbx.../exec'
                         }
-                        className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs focus:ring-2 focus:ring-sky-600"
+                        className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs focus:ring-2 focus:ring-sky-600"
                       />
                     </div>
                   </div>
@@ -2457,7 +2850,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
                       <textarea
                         value={gdServiceAccountJson}
-                        onChange={(e) => setGdServiceAccountJson(e.target.value)}
+                        onChange={(e) => {
+                          setGdServiceAccountJson(e.target.value);
+                          setDriveDirty(true);
+                        }}
+                        disabled={isConfigBlocked}
                         rows={4}
                         placeholder={
                           currentDriveCfg?.hasServiceAccount
@@ -2517,11 +2914,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 )}
 
                 {canManageSelectedBook && (
-                  <div className="flex flex-wrap items-center gap-3 pt-2">
+                  <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2.5 sm:gap-3 pt-2">
                     <button
                       type="submit"
-                      disabled={gdSaving}
-                      className="px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-1.5"
+                      disabled={gdSaving || isConfigBlocked}
+                      className="min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-1.5"
                     >
                       <Save className="w-3.5 h-3.5" />
                       <span>{gdSaving ? 'Đang lưu...' : 'Lưu cấu hình Google Drive'}</span>
@@ -2531,7 +2928,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       type="button"
                       onClick={handleTestGoogleDrive}
                       disabled={gdTesting || !parsedPreviewFolderId}
-                      className="px-4 py-2 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+                      className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 disabled:opacity-50 text-slate-800 font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5"
                     >
                       <RotateCw className={`w-3.5 h-3.5 ${gdTesting ? 'animate-spin' : ''}`} />
                       <span>{gdTesting ? 'Đang kiểm tra quyền ghi...' : 'Kiểm tra kết nối'}</span>
@@ -2546,12 +2943,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
       {/* SUB-TAB: GOOGLE TRANG TÍNH (ADMIN ONLY) */}
       {activeSubTab === 'googlesheets' && isAdmin && (
-        <div className="space-y-6 max-w-3xl">
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
-            <div className="flex items-start justify-between">
-              <div>
+        <div className="space-y-6 max-w-3xl min-w-0">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-5 min-w-0">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0 flex-1">
                 <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                  <span className="w-6 h-6 rounded bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shadow-2xs">
+                  <span className="w-6 h-6 rounded bg-emerald-600 text-white flex items-center justify-center text-xs font-bold shadow-2xs shrink-0">
                     GS
                   </span>
                   <span>Đồng Bộ Vào Google Trang Tính (Google Sheets)</span>
@@ -2561,7 +2958,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </p>
               </div>
 
-              <div className="text-right">
+              <div className="shrink-0">
                 <span
                   className={`text-xs px-2.5 py-1 rounded font-semibold ${
                     gsEnabled ? 'bg-emerald-50 text-emerald-800 border border-emerald-200' : 'bg-slate-100 text-slate-600'
@@ -2572,9 +2969,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-4 text-xs space-y-3">
+            <div className="bg-emerald-50/70 border border-emerald-200 rounded-xl p-3.5 sm:p-4 text-xs space-y-3 min-w-0">
               <h3 className="font-bold text-emerald-950 flex items-center gap-2">
-                <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                <CheckCircle2 className="w-4 h-4 text-emerald-700 shrink-0" />
                 <span>Cách tạo liên kết đồng bộ đến Google Sheets:</span>
               </h3>
               <ol className="list-decimal pl-5 space-y-1.5 text-slate-700">
@@ -2582,22 +2979,25 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <li>Dán đoạn mã bên dưới, bấm Lưu và Triển khai dạng Ứng dụng web (Execute as: Tôi, Access: Bất kỳ ai).</li>
               </ol>
 
-              <div className="relative">
-                <pre className="p-3 bg-slate-900 text-slate-100 rounded-lg text-[11px] font-mono overflow-x-auto max-h-56 leading-relaxed">
+              <div className="rounded-lg overflow-hidden border border-slate-800 bg-slate-900 min-w-0">
+                <div className="flex items-center justify-between gap-2 px-3 py-2 bg-slate-800/80 border-b border-slate-700">
+                  <span className="text-[11px] font-mono text-slate-300">Apps Script Google Sheets</span>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      navigator.clipboard.writeText(GOOGLE_APPS_SCRIPT_TEMPLATE);
+                      setCopiedScript(true);
+                      setTimeout(() => setCopiedScript(false), 2500);
+                    }}
+                    className="px-2.5 py-1.5 min-h-[32px] text-xs font-semibold bg-emerald-700 hover:bg-emerald-600 text-white rounded shadow transition-colors inline-flex items-center gap-1 shrink-0"
+                  >
+                    {copiedScript ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                    <span>{copiedScript ? 'Đã sao chép' : 'Sao chép mã'}</span>
+                  </button>
+                </div>
+                <pre className="p-3 bg-slate-900 text-slate-100 text-[11px] font-mono overflow-x-auto max-h-56 leading-relaxed w-full max-w-full">
 {GOOGLE_APPS_SCRIPT_TEMPLATE}
                 </pre>
-                <button
-                  type="button"
-                  onClick={() => {
-                    navigator.clipboard.writeText(GOOGLE_APPS_SCRIPT_TEMPLATE);
-                    setCopiedScript(true);
-                    setTimeout(() => setCopiedScript(false), 2500);
-                  }}
-                  className="absolute top-2 right-2 px-2.5 py-1 text-xs font-semibold bg-emerald-700 hover:bg-emerald-600 text-white rounded shadow transition-colors flex items-center gap-1"
-                >
-                  {copiedScript ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedScript ? 'Đã sao chép' : 'Sao chép mã Apps Script'}</span>
-                </button>
               </div>
             </div>
 
@@ -2615,7 +3015,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </label>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div className="space-y-1 sm:col-span-2">
+                <div className="space-y-1 sm:col-span-2 min-w-0">
                   <label className="font-bold text-slate-700">
                     URL Ứng Dụng Web Google Apps Script Master (/exec) *
                   </label>
@@ -2625,19 +3025,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setGsWebhookUrl(e.target.value)}
                     placeholder="https://script.google.com/macros/s/AKfycbx.../exec"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs focus:ring-2 focus:ring-emerald-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs focus:ring-2 focus:ring-emerald-600"
                   />
-                  <span className="text-[11px] text-slate-500">
+                  <span className="text-[11px] text-slate-500 block break-words">
                     Tự động chia mỗi sổ thành 1 tab theo Mã sổ cố định: {books.map((b) => b.code).join(', ')}.
                   </span>
                 </div>
 
-                <div className="space-y-1 sm:col-span-2">
+                <div className="space-y-1 sm:col-span-2 min-w-0">
                   <label className="font-bold text-slate-700">Sổ dùng để kiểm tra / đồng bộ theo sổ</label>
                   <select
                     value={gsTestBookId}
                     onChange={(e) => setGsTestBookId(e.target.value)}
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-xs font-semibold"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs font-semibold"
                   >
                     {books.map((b) => (
                       <option key={b.id} value={b.id}>
@@ -2664,11 +3064,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div className="p-3 bg-slate-100 text-slate-800 rounded-lg text-xs">{gsSyncResult}</div>
               )}
 
-              <div className="flex flex-wrap items-center gap-3 pt-2">
+              <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2.5 sm:gap-3 pt-2">
                 <button
                   type="submit"
-                  disabled={gsSaving}
-                  className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  disabled={gsSaving || isConfigBlocked}
+                  className="min-h-[44px] px-4 py-2.5 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
                   {gsSaving ? 'Đang lưu...' : 'Lưu cấu hình Master Sheets'}
                 </button>
@@ -2677,7 +3077,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   onClick={handleTestGoogleSheets}
                   disabled={gsTesting || !gsWebhookUrl}
-                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+                  className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5"
                 >
                   <RotateCw className={`w-3.5 h-3.5 ${gsTesting ? 'animate-spin' : ''}`} />
                   <span>{gsTesting ? 'Đang gửi kiểm tra...' : 'Gửi dòng thử nghiệm lên tab sổ'}</span>
@@ -2687,7 +3087,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   onClick={() => handleSyncAllGoogleSheets()}
                   disabled={gsSyncingAll || !gsEnabled || !gsWebhookUrl}
-                  className="px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  className="min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
                   {gsSyncingAll ? 'Đang chuyển toàn bộ...' : 'Đồng bộ toàn bộ các sổ'}
                 </button>
@@ -2710,7 +3110,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   <input
                     type="checkbox"
                     checked={bookGsEnabled}
-                    onChange={(e) => setBookGsEnabled(e.target.checked)}
+                    onChange={(e) => {
+                      setBookGsEnabled(e.target.checked);
+                      setBookGsDirty(true);
+                    }}
+                    disabled={isConfigBlocked}
                     className="rounded text-emerald-700"
                   />
                   <span className="font-semibold text-slate-800">
@@ -2721,20 +3125,24 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <input
                   type="url"
                   value={bookGsWebhookUrl}
-                  onChange={(e) => setBookGsWebhookUrl(e.target.value)}
+                  onChange={(e) => {
+                    setBookGsWebhookUrl(e.target.value);
+                    setBookGsDirty(true);
+                  }}
+                  disabled={isConfigBlocked}
                   placeholder="https://script.google.com/macros/s/.../exec (để trống nếu chỉ dùng bảng tính Master)"
-                  className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                  className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                 />
 
                 {bookGsMessage && (
                   <div className="p-2.5 rounded-lg bg-slate-100 text-slate-800 text-xs">{bookGsMessage}</div>
                 )}
 
-                <div className="flex flex-wrap items-center gap-2">
+                <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2">
                   <button
                     type="submit"
-                    disabled={bookGsSaving}
-                    className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-lg"
+                    disabled={bookGsSaving || isConfigBlocked}
+                    className="min-h-[42px] px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-semibold rounded-lg"
                   >
                     {bookGsSaving ? 'Đang lưu...' : `Lưu Sheets riêng của ${selectedBook.code}`}
                   </button>
@@ -2742,7 +3150,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     type="button"
                     onClick={() => handleSyncAllGoogleSheets(selectedBook.id)}
                     disabled={gsSyncingAll}
-                    className="px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg"
+                    className="min-h-[42px] px-3.5 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg"
                   >
                     Đồng bộ riêng sổ {selectedBook.name}
                   </button>
@@ -2756,16 +3164,16 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       {/* SUB-TAB: MICROSOFT GRAPH EXCEL (ADMIN ONLY) */}
       {activeSubTab === 'msgraph' && isAdmin && (
         <div className="space-y-6 max-w-3xl">
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs space-y-5">
-            <div className="flex items-start justify-between">
-              <div>
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-5">
+            <div className="flex flex-wrap items-start justify-between gap-2">
+              <div className="min-w-0">
                 <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                  <Cloud className="w-5 h-5 text-sky-700" />
+                  <Cloud className="w-5 h-5 text-sky-700 shrink-0" />
                   <span>Đồng Bộ Tự Động Vào Excel Trực Tuyến (OneDrive / SharePoint)</span>
                 </h2>
               </div>
               <span
-                className={`text-xs px-2.5 py-1 rounded font-semibold ${
+                className={`text-xs px-2.5 py-1 rounded font-semibold shrink-0 ${
                   msEnabled ? 'bg-emerald-50 text-emerald-800' : 'bg-slate-100 text-slate-600'
                 }`}
               >
@@ -2787,58 +3195,58 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </label>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Azure Directory (Tenant) ID</label>
                   <input
                     type="text"
                     value={msTenantId}
                     onChange={(e) => setMsTenantId(e.target.value)}
-                    className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                   />
                 </div>
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Application (Client) ID</label>
                   <input
                     type="text"
                     value={msClientId}
                     onChange={(e) => setMsClientId(e.target.value)}
-                    className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                   />
                 </div>
-                <div className="space-y-1 sm:col-span-2">
+                <div className="space-y-1 sm:col-span-2 min-w-0">
                   <label className="font-bold text-slate-700">Client Secret</label>
                   <input
                     type="password"
                     value={msClientSecret}
                     onChange={(e) => setMsClientSecret(e.target.value)}
-                    className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                   />
                 </div>
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Drive ID (Tùy chọn)</label>
                   <input
                     type="text"
                     value={msDriveId}
                     onChange={(e) => setMsDriveId(e.target.value)}
-                    className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                   />
                 </div>
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Đường dẫn file Excel</label>
                   <input
                     type="text"
                     value={msFilePath}
                     onChange={(e) => setMsFilePath(e.target.value)}
-                    className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                   />
                 </div>
-                <div className="space-y-1 sm:col-span-2">
+                <div className="space-y-1 sm:col-span-2 min-w-0">
                   <label className="font-bold text-slate-700">Tên bảng dữ liệu (Table Name)</label>
                   <input
                     type="text"
                     value={msTableName}
                     onChange={(e) => setMsTableName(e.target.value)}
-                    className="w-full h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                   />
                 </div>
               </div>
@@ -2859,11 +3267,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <div className="p-3 bg-slate-100 text-slate-800 rounded-lg text-xs">{msSyncResult}</div>
               )}
 
-              <div className="flex flex-wrap items-center gap-3 pt-2">
+              <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2.5 sm:gap-3 pt-2">
                 <button
                   type="submit"
-                  disabled={msSaving}
-                  className="px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  disabled={msSaving || isConfigBlocked}
+                  className="min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
                   {msSaving ? 'Đang lưu...' : 'Lưu cấu hình'}
                 </button>
@@ -2871,7 +3279,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   onClick={handleTestMsConnection}
                   disabled={msTesting || !msTenantId || !msClientId}
-                  className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg transition-colors flex items-center gap-1.5"
+                  className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5"
                 >
                   <RotateCw className={`w-3.5 h-3.5 ${msTesting ? 'animate-spin' : ''}`} />
                   <span>{msTesting ? 'Đang kiểm tra...' : 'Kiểm tra kết nối'}</span>
@@ -2880,7 +3288,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="button"
                   onClick={handleSyncAll}
                   disabled={msSyncingAll || !msEnabled}
-                  className="px-4 py-2 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  className="min-h-[44px] px-4 py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
                   {msSyncingAll ? 'Đang đồng bộ...' : 'Đồng bộ lại tất cả'}
                 </button>
@@ -2994,7 +3402,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             <button
                               type="button"
                               onClick={() => handleStartEditPermissions(u)}
-                              className={`px-2.5 py-1 rounded-md font-semibold text-[11px] border transition-colors flex items-center gap-1 ${
+                              className={`px-2.5 py-1.5 min-h-[36px] rounded-md font-semibold text-[11px] border transition-colors flex items-center gap-1 ${
                                 isEditingPerms
                                   ? 'bg-sky-700 text-white border-sky-700'
                                   : 'bg-sky-50 hover:bg-sky-100 text-sky-800 border-sky-200'
@@ -3008,7 +3416,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                           <button
                             type="button"
                             onClick={() => handleResetUserPass(u)}
-                            className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md font-medium text-[11px] transition-colors flex items-center gap-1"
+                            className="px-2.5 py-1.5 min-h-[36px] bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md font-medium text-[11px] transition-colors flex items-center gap-1"
                           >
                             <Lock className="w-3 h-3 text-slate-500" />
                             <span>Đổi MK</span>
@@ -3019,7 +3427,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handleToggleUserStatus(u)}
-                                className={`px-2.5 py-1 rounded-md font-medium text-[11px] transition-colors flex items-center gap-1 ${
+                                className={`px-2.5 py-1.5 min-h-[36px] rounded-md font-medium text-[11px] transition-colors flex items-center gap-1 ${
                                   u.isActive
                                     ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200'
                                     : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200'
@@ -3032,7 +3440,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                               <button
                                 type="button"
                                 onClick={() => handleDeleteUser(u)}
-                                className="p-1.5 text-slate-400 hover:text-rose-700 hover:bg-rose-50 rounded-md transition-colors"
+                                className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center text-slate-400 hover:text-rose-700 hover:bg-rose-50 rounded-md transition-colors"
                                 title="Xóa tài khoản này khỏi hệ thống"
                               >
                                 <Trash2 className="w-3.5 h-3.5" />
@@ -3045,19 +3453,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       {!isMainAdmin && isEditingPerms && (
                         <div className="pt-3 border-t border-slate-100 space-y-3">
                           {renderPermissionMatrix(editingBookPermissions, setEditingBookPermissions)}
-                          <div className="flex justify-end gap-2">
+                          <div className="flex flex-col sm:flex-row justify-end gap-2">
                             <button
                               type="button"
                               onClick={() => setEditingPermUserId(null)}
-                              className="px-3 py-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold"
+                              className="min-h-[42px] px-3 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg font-semibold"
                             >
                               Hủy
                             </button>
                             <button
                               type="button"
                               onClick={() => handleSaveUserPermissions(u)}
-                              disabled={savingPermUserId === u.id}
-                              className="px-4 py-1.5 bg-sky-700 hover:bg-sky-800 text-white rounded-lg font-semibold flex items-center gap-1.5 disabled:opacity-50"
+                              disabled={savingPermUserId === u.id || isConfigBlocked}
+                              className="min-h-[42px] px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white rounded-lg font-semibold flex items-center justify-center gap-1.5 disabled:opacity-50"
                             >
                               <Save className="w-3.5 h-3.5" />
                               <span>{savingPermUserId === u.id ? 'Đang lưu...' : 'Lưu phân quyền sổ'}</span>
@@ -3073,9 +3481,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {/* Add New User Form */}
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
             <h3 className="text-sm font-bold text-slate-900 mb-1 flex items-center gap-2">
-              <Plus className="w-4 h-4 text-sky-700" />
+              <Plus className="w-4 h-4 text-sky-700 shrink-0" />
               <span>Thêm tài khoản mới và phân quyền theo từng sổ</span>
             </h3>
             <p className="text-xs text-slate-500 mb-4">
@@ -3084,7 +3492,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
             <form onSubmit={handleCreateUser} className="space-y-4 text-xs">
               <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Tên đăng nhập *</label>
                   <input
                     type="text"
@@ -3092,11 +3500,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewUsername(e.target.value)}
                     placeholder="Ví dụ: chidoan12a"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Họ và tên (Gán cố định) *</label>
                   <input
                     type="text"
@@ -3104,11 +3512,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewFullName(e.target.value)}
                     placeholder="Ví dụ: Nguyễn Văn A"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <label className="font-bold text-slate-700">Mật khẩu khởi tạo *</label>
                   <input
                     type="password"
@@ -3116,7 +3524,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     onChange={(e) => setNewUserPass(e.target.value)}
                     placeholder="Tối thiểu 6 ký tự"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-sm"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm"
                   />
                 </div>
               </div>
@@ -3138,8 +3546,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <div className="pt-2 flex items-center justify-end">
                 <button
                   type="submit"
-                  disabled={userSaving}
-                  className="px-6 py-2.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center gap-2 disabled:opacity-50"
+                  disabled={userSaving || isConfigBlocked}
+                  className="w-full sm:w-auto min-h-[44px] px-6 py-2.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-2 disabled:opacity-50"
                 >
                   <Plus className="w-4 h-4" />
                   <span>{userSaving ? 'Đang tạo tài khoản...' : 'Tạo tài khoản & áp dụng quyền'}</span>

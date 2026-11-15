@@ -48,6 +48,9 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
   const [loading, setLoading] = useState<boolean>(true);
   const [rendering, setRendering] = useState<boolean>(false);
   const [error, setError] = useState<string | null>(null);
+  const [containerWidth, setContainerWidth] = useState<number>(0);
+  const [renderGeneration, setRenderGeneration] = useState<number>(0);
+  const lastScrolledNonceRef = useRef<number | null>(null);
 
   // Load PDF document
   useEffect(() => {
@@ -105,6 +108,31 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
     };
   }, [pdfUrl]);
 
+  // Observe preview container width (re-measures on mobile pane toggle & screen rotation)
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el) return;
+
+    const updateWidth = () => {
+      const w = el.clientWidth || 0;
+      setContainerWidth((prev) => (Math.abs(prev - w) >= 4 || (prev === 0 && w > 0) ? w : prev));
+    };
+
+    updateWidth();
+
+    let observer: ResizeObserver | null = null;
+    if (typeof ResizeObserver !== 'undefined') {
+      observer = new ResizeObserver(() => updateWidth());
+      observer.observe(el);
+    }
+    window.addEventListener('resize', updateWidth);
+
+    return () => {
+      observer?.disconnect();
+      window.removeEventListener('resize', updateWidth);
+    };
+  }, [loading, error]);
+
   // Sync external page jump requests
   useEffect(() => {
     if (jumpToPage && numPages > 0 && jumpToPage >= 1 && jumpToPage <= numPages) {
@@ -112,36 +140,20 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
     }
   }, [jumpToPage, numPages]);
 
-  // Sync highlightBox jump & smooth scroll to region
+  // Sync highlightBox page request immediately
   useEffect(() => {
     if (!highlightBox || numPages <= 0) return;
     const targetPage = Math.max(1, Math.min(numPages, highlightBox.page || 1));
     setCurrentPage(targetPage);
-
-    const timer = setTimeout(() => {
-      if (!containerRef.current || !canvasRef.current) return;
-      if (highlightBox.bbox) {
-        const canvasHeight = canvasRef.current.clientHeight || 0;
-        const containerHeight = containerRef.current.clientHeight || 0;
-        if (canvasHeight > 0) {
-          const targetTop = Math.max(0, highlightBox.bbox.y0 * canvasHeight - containerHeight * 0.25);
-          containerRef.current.scrollTo({ top: targetTop, behavior: 'smooth' });
-        }
-      } else {
-        containerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
-      }
-    }, 180);
-
-    return () => clearTimeout(timer);
   }, [highlightBox, numPages]);
 
-  // Render active page to canvas
+  // Render active page to canvas whenever pdfDoc, currentPage, scale, or visible containerWidth changes
   useEffect(() => {
     let renderTask: any = null;
     let cancelled = false;
 
     const renderPage = async () => {
-      if (!pdfDoc || !canvasRef.current) return;
+      if (!pdfDoc || !canvasRef.current || containerWidth <= 0) return;
       setRendering(true);
 
       try {
@@ -149,11 +161,9 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
         if (cancelled) return;
 
         const baseViewport = page.getViewport({ scale: 1 });
-        const containerWidth = containerRef.current?.clientWidth
-          ? Math.max(containerRef.current.clientWidth - 24, 280)
-          : 540;
-        const fitScale = containerWidth / baseViewport.width;
-        const effectiveScale = Math.max(0.4, Math.min(2.6, fitScale * scale));
+        const targetWidth = Math.max(containerWidth - 20, 260);
+        const fitScale = targetWidth / baseViewport.width;
+        const effectiveScale = Math.max(0.35, Math.min(2.6, fitScale * scale));
         const dpr = Math.min(window.devicePixelRatio || 1, 2);
 
         const viewport = page.getViewport({ scale: effectiveScale });
@@ -173,6 +183,9 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
           viewport,
         });
         await renderTask.promise;
+        if (!cancelled) {
+          setRenderGeneration((g) => g + 1);
+        }
       } catch (err: any) {
         if (err?.name !== 'RenderingCancelledException' && !cancelled) {
           console.error('Lỗi vẽ trang PDF:', err);
@@ -194,7 +207,36 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
         }
       }
     };
-  }, [pdfDoc, currentPage, scale]);
+  }, [pdfDoc, currentPage, scale, containerWidth]);
+
+  // Smooth scroll to highlightBox after canvas has rendered cleanly in a visible pane
+  useEffect(() => {
+    if (!highlightBox || numPages <= 0 || containerWidth <= 0 || rendering || renderGeneration <= 0) {
+      return;
+    }
+    const targetPage = Math.max(1, Math.min(numPages, highlightBox.page || 1));
+    if (currentPage !== targetPage) return;
+
+    const nonceKey = highlightBox.nonce ?? targetPage;
+    if (lastScrolledNonceRef.current === nonceKey) return;
+    lastScrolledNonceRef.current = nonceKey;
+
+    const raf = requestAnimationFrame(() => {
+      if (!containerRef.current || !canvasRef.current) return;
+      if (highlightBox.bbox) {
+        const canvasHeight = canvasRef.current.clientHeight || 0;
+        const containerHeight = containerRef.current.clientHeight || 0;
+        if (canvasHeight > 0) {
+          const targetTop = Math.max(0, highlightBox.bbox.y0 * canvasHeight - containerHeight * 0.25);
+          containerRef.current.scrollTo({ top: targetTop, behavior: 'smooth' });
+        }
+      } else {
+        containerRef.current.scrollTo({ top: 0, behavior: 'smooth' });
+      }
+    });
+
+    return () => cancelAnimationFrame(raf);
+  }, [highlightBox, numPages, currentPage, containerWidth, rendering, renderGeneration]);
 
   const uniqueRelevantPages = Array.from(
     new Set(relevantPages.filter((p) => p >= 1 && p <= (numPages || 999)))
@@ -203,10 +245,10 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
   return (
     <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xs flex flex-col">
       {/* Toolbar */}
-      <div className="px-3.5 py-2.5 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
-        <div className="flex items-center gap-2 min-w-0">
+      <div className="px-2.5 sm:px-3.5 py-2 bg-slate-50 border-b border-slate-200 flex flex-wrap items-center justify-between gap-2">
+        <div className="flex items-center gap-2 flex-1 min-w-0">
           <FileText className="w-4 h-4 text-sky-700 shrink-0" />
-          <span className="text-xs font-bold text-slate-800 truncate max-w-[200px]" title={fileName}>
+          <span className="text-xs font-bold text-slate-800 truncate" title={fileName}>
             {fileName || 'Bản PDF gốc'}
           </span>
         </div>
@@ -218,7 +260,7 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
               type="button"
               disabled={currentPage <= 1}
               onClick={() => setCurrentPage((p) => Math.max(1, p - 1))}
-              className="p-1.5 text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+              className="p-2 text-slate-600 hover:bg-slate-100 disabled:opacity-40 min-h-[36px] min-w-[34px] inline-flex items-center justify-center"
               title="Trang trước"
             >
               <ChevronLeft className="w-3.5 h-3.5" />
@@ -230,7 +272,7 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
               type="button"
               disabled={currentPage >= numPages}
               onClick={() => setCurrentPage((p) => Math.min(numPages, p + 1))}
-              className="p-1.5 text-slate-600 hover:bg-slate-100 disabled:opacity-40"
+              className="p-2 text-slate-600 hover:bg-slate-100 disabled:opacity-40 min-h-[36px] min-w-[34px] inline-flex items-center justify-center"
               title="Trang sau"
             >
               <ChevronRight className="w-3.5 h-3.5" />
@@ -242,7 +284,7 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
             <button
               type="button"
               onClick={() => setScale((s) => Math.max(0.6, +(s - 0.15).toFixed(2)))}
-              className="p-1.5 text-slate-600 hover:bg-slate-100"
+              className="p-2 text-slate-600 hover:bg-slate-100 min-h-[36px] min-w-[34px] inline-flex items-center justify-center"
               title="Thu nhỏ"
             >
               <ZoomOut className="w-3.5 h-3.5" />
@@ -253,7 +295,7 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
             <button
               type="button"
               onClick={() => setScale((s) => Math.min(2.0, +(s + 0.15).toFixed(2)))}
-              className="p-1.5 text-slate-600 hover:bg-slate-100"
+              className="p-2 text-slate-600 hover:bg-slate-100 min-h-[36px] min-w-[34px] inline-flex items-center justify-center"
               title="Phóng to"
             >
               <ZoomIn className="w-3.5 h-3.5" />
@@ -264,7 +306,7 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
             href={pdfUrl}
             target="_blank"
             rel="noopener noreferrer"
-            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-50 border border-slate-200 rounded-lg"
+            className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[36px] text-[11px] font-semibold text-sky-700 bg-white hover:bg-sky-50 border border-slate-200 rounded-lg"
             title="Mở bản PDF ở tab mới"
           >
             <ExternalLink className="w-3 h-3" />
@@ -316,7 +358,7 @@ export const PdfPreviewPane: React.FC<PdfPreviewPaneProps> = ({
       {/* Canvas area */}
       <div
         ref={containerRef}
-        className="bg-slate-100 p-3 overflow-auto max-h-[680px] min-h-[380px] flex flex-col items-center justify-start relative"
+        className="bg-slate-100 p-2 sm:p-3 overflow-auto max-h-[68dvh] sm:max-h-[680px] min-h-[280px] sm:min-h-[380px] flex flex-col items-center justify-start relative"
       >
         {loading ? (
           <div className="my-auto flex flex-col items-center gap-2 text-slate-500 py-16">

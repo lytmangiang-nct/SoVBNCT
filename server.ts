@@ -307,6 +307,8 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
       serviceAccountEmail: '',
       ...(loaded.settings?.googleDriveConfig || {}),
     },
+    configVersion: loaded.settings?.configVersion || 1,
+    updatedAt: loaded.settings?.updatedAt || new Date().toISOString(),
   };
 
   const paletteKeys = ['blue', 'emerald', 'amber', 'red', 'purple', 'teal', 'indigo', 'orange', 'cyan', 'pink'];
@@ -375,6 +377,8 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
     if (b.isActive === undefined) b.isActive = true;
     if (!b.customStartSequences) b.customStartSequences = {};
     if (!Array.isArray(b.signers)) b.signers = [];
+    if (!b.configVersion) b.configVersion = 1;
+    if (!b.updatedAt) b.updatedAt = b.createdAt || new Date().toISOString();
   });
 
   const bookMap = new Map<string, RegistryBook>();
@@ -729,9 +733,42 @@ function syncDefaultBookToLegacySettings(book: RegistryBook) {
   db.settings.numberMode = book.numberMode;
   db.settings.numberFormat = book.numberFormat;
   db.settings.customStartSequences = { ...(book.customStartSequences || {}) };
+  if (book.configVersion) db.settings.configVersion = book.configVersion;
+  if (book.updatedAt) db.settings.updatedAt = book.updatedAt;
   if (Array.isArray(book.signers)) {
     db.signers = book.signers.map((s) => ({ ...s }));
   }
+}
+
+function bumpBookVersion(book: RegistryBook) {
+  const nowIso = new Date().toISOString();
+  book.configVersion = (book.configVersion || 1) + 1;
+  book.updatedAt = nowIso;
+  if (book.id === DEFAULT_BOOK_ID) {
+    db.settings.configVersion = book.configVersion;
+    db.settings.updatedAt = nowIso;
+  } else {
+    db.settings.updatedAt = nowIso;
+  }
+}
+
+function checkVersionConflict(req: Request, res: Response, targetBook: RegistryBook, currentUser: User): boolean {
+  const { expectedVersion, forceOverwrite } = req.body || {};
+  if (forceOverwrite) return false;
+  if (expectedVersion === undefined || expectedVersion === null || expectedVersion === '') return false;
+  const parsedExpected = Number(expectedVersion);
+  if (!Number.isFinite(parsedExpected)) return false;
+  const serverVersion = targetBook.configVersion || 1;
+  if (parsedExpected !== serverVersion) {
+    res.status(409).json({
+      code: 'SETTINGS_CONFLICT',
+      error: 'Cài đặt đã thay đổi trên thiết bị khác. Vui lòng làm mới dữ liệu và đối chiếu trước khi lưu.',
+      serverVersion,
+      serverBook: sanitizeBookForUser(targetBook, currentUser),
+    });
+    return true;
+  }
+  return false;
 }
 
 function toSafeUser(u: User & { passwordHash?: string }): User {
@@ -887,6 +924,23 @@ function getVietnamTimeInfo(d = new Date()) {
   const day = parseInt(parts[2], 10);
   const formattedDate = `${parts[2]}/${parts[1]}/${parts[0]}`; // dd/mm/yyyy
   return { year, month, day, formattedDate };
+}
+
+function getRequestVietnamTimeInfo(req?: Request) {
+  if (
+    req &&
+    process.env.ALLOW_TIME_SIMULATION === 'true' &&
+    process.env.NODE_ENV !== 'production'
+  ) {
+    const rawHeader = req.headers['x-test-vietnam-now'];
+    if (typeof rawHeader === 'string' && rawHeader.trim()) {
+      const parsed = new Date(rawHeader.trim());
+      if (!Number.isNaN(parsed.getTime())) {
+        return getVietnamTimeInfo(parsed);
+      }
+    }
+  }
+  return getVietnamTimeInfo(new Date());
 }
 
 // --- Signed Session & HttpOnly Cookie Store (tương thích cả Node lẫn Vercel Serverless) ---
@@ -1154,7 +1208,7 @@ app.get('/api/health', (req, res) => {
   res.json({
     status: 'ok',
     app: 'Sổ Cấp Số Văn Bản Đoàn Trường THPT Nguyễn Chí Thanh',
-    timeVietnam: getVietnamTimeInfo(),
+    timeVietnam: getRequestVietnamTimeInfo(req),
   });
 });
 
@@ -1429,6 +1483,7 @@ app.get('/api/books', requireAuth, (req, res) => {
   );
   res.json({
     books: accessible.map((b) => sanitizeBookForUser(b, currentUser)),
+    serverTimeVietnam: getRequestVietnamTimeInfo(req),
   });
 });
 
@@ -1507,6 +1562,8 @@ app.put('/api/books/:id', requireAuth, (req, res) => {
     });
   }
 
+  if (checkVersionConflict(req, res, target, currentUser)) return;
+
   const { name, unitName, unitCode, isShared, numberMode, numberFormat, signers, isActive, enabledTypeCodes } = req.body || {};
   const changes: Record<string, { old: string | null; new: string | null }> = {};
 
@@ -1577,9 +1634,14 @@ app.put('/api/books/:id', requireAuth, (req, res) => {
     });
   }
 
+  bumpBookVersion(target);
   syncDefaultBookToLegacySettings(target);
   saveDatabaseSync(db);
-  broadcastSSE('books_updated', { bookId: target.id });
+  broadcastSSE('books_updated', {
+    bookId: target.id,
+    configVersion: target.configVersion,
+    updatedAt: target.updatedAt,
+  });
   if (target.id === DEFAULT_BOOK_ID) {
     broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   }
@@ -1592,6 +1654,7 @@ app.get('/api/settings', requireAuth, (req, res) => {
     settings: sanitizeSettingsForUser(db.settings, currentUser),
     documentTypes: db.documentTypes,
     signers: db.signers,
+    serverTimeVietnam: getRequestVietnamTimeInfo(req),
   });
 });
 
@@ -1600,6 +1663,8 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
   const { unitName, unitCode, numberFormat, customStartSequences, bookId } = req.body;
 
   const targetBook = getBookById(bookId || DEFAULT_BOOK_ID);
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
   if (unitName) targetBook.unitName = unitName.trim();
   if (unitCode) targetBook.unitCode = unitCode.trim();
   if (numberFormat) targetBook.numberFormat = numberFormat.trim();
@@ -1610,9 +1675,14 @@ app.put('/api/settings', requireAuth, requireAdmin, (req, res) => {
     };
   }
 
+  bumpBookVersion(targetBook);
   syncDefaultBookToLegacySettings(targetBook);
   saveDatabaseSync(db);
-  broadcastSSE('books_updated', { bookId: targetBook.id });
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   res.json({
     settings: sanitizeSettingsForUser(db.settings, currentUser),
@@ -1632,11 +1702,13 @@ app.post('/api/settings/number-mode', requireAuth, (req, res) => {
     });
   }
 
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
   if (newMode !== 'separate' && newMode !== 'shared') {
     return res.status(400).json({ error: 'Chế độ dãy số không hợp lệ' });
   }
 
-  const { year: currentYear } = getVietnamTimeInfo();
+  const { year: currentYear } = getRequestVietnamTimeInfo(req);
   const currentYearDocs = db.documents.filter(
     (d) => getDocBookId(d) === targetBook.id && d.year === currentYear && d.docCategory !== 'incoming'
   );
@@ -1652,9 +1724,14 @@ app.post('/api/settings/number-mode', requireAuth, (req, res) => {
   }
 
   targetBook.numberMode = newMode;
+  bumpBookVersion(targetBook);
   syncDefaultBookToLegacySettings(targetBook);
   saveDatabaseSync(db);
-  broadcastSSE('books_updated', { bookId: targetBook.id });
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   res.json({
     success: true,
@@ -1780,16 +1857,19 @@ app.post('/api/settings/start-sequence', requireAuth, (req, res) => {
     });
   }
 
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
   const targetYear = parseInt(year, 10);
   const nextSeq = parseInt(startSequence, 10);
+  const cleanTypeCode = String(typeCode || '').trim().toUpperCase();
 
-  if (!targetYear || isNaN(targetYear) || isNaN(nextSeq) || nextSeq < 1) {
-    return res.status(400).json({ error: 'Năm và số bắt đầu không hợp lệ' });
+  if (!targetYear || isNaN(targetYear) || isNaN(nextSeq) || nextSeq < 1 || !cleanTypeCode) {
+    return res.status(400).json({ error: 'Năm, loại văn bản và số bắt đầu không hợp lệ' });
   }
 
-  // Kiểm tra số lớn nhất hiện đã cấp trong sổ (chỉ tính văn bản đi)
+  // Kiểm tra số lớn nhất hiện đã cấp trong sổ (chỉ tính văn bản đi, gồm cả văn bản đã hủy)
   let maxIssued = 0;
-  if (targetBook.numberMode === 'shared' || typeCode === 'SHARED') {
+  if (targetBook.numberMode === 'shared' || cleanTypeCode === 'SHARED') {
     const docs = db.documents.filter(
       (d) => getDocBookId(d) === targetBook.id && d.year === targetYear && d.docCategory !== 'incoming'
     );
@@ -1800,7 +1880,7 @@ app.post('/api/settings/start-sequence', requireAuth, (req, res) => {
         getDocBookId(d) === targetBook.id &&
         d.year === targetYear &&
         d.docCategory !== 'incoming' &&
-        d.typeCode === typeCode
+        d.typeCode === cleanTypeCode
     );
     maxIssued = docs.reduce((m, d) => Math.max(m, d.sequenceNumber), 0);
   }
@@ -1811,15 +1891,22 @@ app.post('/api/settings/start-sequence', requireAuth, (req, res) => {
     });
   }
 
-  const key = `${targetYear}_${typeCode}`;
+  const key = `${targetYear}_${targetBook.numberMode === 'shared' ? 'SHARED' : cleanTypeCode}`;
   targetBook.customStartSequences[key] = nextSeq;
+  bumpBookVersion(targetBook);
   syncDefaultBookToLegacySettings(targetBook);
   saveDatabaseSync(db);
-  broadcastSSE('books_updated', { bookId: targetBook.id });
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   res.json({
     success: true,
     customStartSequences: targetBook.customStartSequences,
+    customStartSequence: nextSeq,
+    nextExpectedSeq: Math.max(nextSeq, maxIssued + 1),
     book: sanitizeBookForUser(targetBook, currentUser),
   });
 });
@@ -1837,50 +1924,69 @@ app.get('/api/documents/preview', requireAuth, (req, res) => {
     isSystemAdmin(currentUser) ||
     hasBookPermission(currentUser, book.id, 'request_number') ||
     hasBookPermission(currentUser, book.id, 'issue_number') ||
+    hasBookPermission(currentUser, book.id, 'manage_book') ||
     hasBookPermission(currentUser, book.id, 'view');
   if (!canPreview) {
     return res.status(403).json({ error: 'Bạn không có quyền truy cập sổ văn bản này.' });
   }
 
-  if (!isTypeEnabledInBook(book, typeCode)) {
+  const isSharedKey = typeCode === 'SHARED' && book.numberMode === 'shared';
+  if (!isSharedKey && !isTypeEnabledInBook(book, typeCode)) {
     return res.status(400).json({
       error: `Loại văn bản "${typeCode}" chưa được bật sử dụng trong ${book.name}.`,
     });
   }
 
-  const { year } = getVietnamTimeInfo();
+  const vietnamNow = getRequestVietnamTimeInfo(req);
+  const requestedYear = req.query.year ? parseInt(String(req.query.year), 10) : NaN;
+  const targetYear =
+    Number.isFinite(requestedYear) && requestedYear >= 2000 && requestedYear <= 2100
+      ? requestedYear
+      : vietnamNow.year;
   const mode = book.numberMode;
 
   let nextSeq = 1;
+  let maxExisting = 0;
+  let configuredStart: number | null = null;
+
   if (mode === 'shared') {
     const docs = db.documents.filter(
-      (d) => getDocBookId(d) === book.id && d.year === year && d.docCategory !== 'incoming'
+      (d) => getDocBookId(d) === book.id && d.year === targetYear && d.docCategory !== 'incoming'
     );
-    const maxExisting = docs.reduce((m, d) => Math.max(m, d.sequenceNumber), 0);
-    const customStart = book.customStartSequences[`${year}_SHARED`] || 1;
-    nextSeq = Math.max(maxExisting + 1, customStart);
+    maxExisting = docs.reduce((m, d) => Math.max(m, d.sequenceNumber), 0);
+    const rawCustom = book.customStartSequences[`${targetYear}_SHARED`];
+    configuredStart = typeof rawCustom === 'number' && rawCustom >= 1 ? rawCustom : null;
+    nextSeq = Math.max(maxExisting + 1, configuredStart || 1);
   } else {
     const docs = db.documents.filter(
       (d) =>
         getDocBookId(d) === book.id &&
-        d.year === year &&
+        d.year === targetYear &&
         d.docCategory !== 'incoming' &&
         d.typeCode === typeCode
     );
-    const maxExisting = docs.reduce((m, d) => Math.max(m, d.sequenceNumber), 0);
-    const customStart = book.customStartSequences[`${year}_${typeCode}`] || 1;
-    nextSeq = Math.max(maxExisting + 1, customStart);
+    maxExisting = docs.reduce((m, d) => Math.max(m, d.sequenceNumber), 0);
+    const rawCustom = book.customStartSequences[`${targetYear}_${typeCode}`];
+    configuredStart = typeof rawCustom === 'number' && rawCustom >= 1 ? rawCustom : null;
+    nextSeq = Math.max(maxExisting + 1, configuredStart || 1);
   }
 
   const seqStr = formatSequenceNumber(nextSeq);
-  const previewNumber = renderFullDocNumber(book.numberFormat, seqStr, typeCode, book.unitCode);
+  const sampleTypeCode = isSharedKey
+    ? book.enabledTypeCodes?.[0] || db.documentTypes[0]?.code || 'KH'
+    : typeCode;
+  const previewNumber = renderFullDocNumber(book.numberFormat, seqStr, sampleTypeCode, book.unitCode);
 
   const response: PreviewNumberResponse = {
     bookId: book.id,
     previewNumber,
     sequenceNumber: nextSeq,
-    year,
+    year: targetYear,
+    serverYear: vietnamNow.year,
+    formattedDate: vietnamNow.formattedDate,
     mode,
+    customStartSequence: configuredStart,
+    maxIssuedSequence: maxExisting,
   };
   res.json(response);
 });
@@ -2044,7 +2150,7 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
 
   const releaseLock = await atomicLock.acquire();
   try {
-    const { year, formattedDate } = getVietnamTimeInfo();
+    const { year, formattedDate } = getRequestVietnamTimeInfo(req);
     let nextSeq = 1;
     if (targetBook.numberMode === 'shared') {
       const docsThisYear = db.documents.filter(
@@ -2194,6 +2300,7 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     attachmentSize,
     conflictAction,
     customFileName,
+    expectedYear,
   } = req.body;
   const currentUser = (req as any).user as User;
   const targetBook = getBookById(bookId);
@@ -2264,8 +2371,8 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       }
     }
 
-    // 2. Tính toán năm và ngày theo giờ Việt Nam
-    const { year, formattedDate } = getVietnamTimeInfo();
+    // 2. Tính toán năm và ngày theo giờ Việt Nam (Asia/Ho_Chi_Minh)
+    const { year, formattedDate } = getRequestVietnamTimeInfo(req);
 
     // 3. Kiểm tra loại văn bản hợp lệ
     const docTypeConfig = db.documentTypes.find((t) => t.code.toUpperCase() === typeCode.toUpperCase());
@@ -2302,6 +2409,24 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       typeCode,
       targetBook.unitCode
     );
+
+    // Nếu người dùng mở biểu mẫu từ năm cũ và đồng hồ vừa chuyển sang năm mới (00:00 01/01 Asia/Ho_Chi_Minh),
+    // yêu cầu người dùng xác nhận lại trước khi ghi nhận vào dãy số năm mới (vẫn giữ nguyên dữ liệu đã nhập).
+    const parsedExpectedYear =
+      expectedYear !== undefined && expectedYear !== null && expectedYear !== ''
+        ? parseInt(String(expectedYear), 10)
+        : NaN;
+    if (Number.isFinite(parsedExpectedYear) && parsedExpectedYear !== year) {
+      return res.status(409).json({
+        code: 'YEAR_CHANGED',
+        previousYear: parsedExpectedYear,
+        currentYear: year,
+        formattedDate,
+        previewNumber: fullDocNumber,
+        sequenceNumber: nextSeq,
+        error: `Hệ thống đã bước sang năm mới ${year} (giờ Việt Nam). Số dự kiến mới là ${fullDocNumber}. Vui lòng xác nhận lại trước khi cấp số.`,
+      });
+    }
 
     // 4b. Nếu có tệp Word đính kèm, luôn tính lại tên tệp chuẩn theo SỐ CHÍNH THỨC vừa cấp
     let resolvedDriveFileName: string | undefined;
@@ -2802,7 +2927,7 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
     const parsedYear =
       dateParts.length === 3 && /^\d{4}$/.test(dateParts[2])
         ? parseInt(dateParts[2], 10)
-        : getVietnamTimeInfo().year;
+        : getRequestVietnamTimeInfo(req).year;
 
     if (!ignoreDuplicatePdf) {
       const duplicateDoc = db.documents.find(
@@ -3565,7 +3690,7 @@ app.post('/api/documents/:id/cancel', requireAuth, (req, res) => {
 // 9. THỐNG KÊ (Dashboard & Statistics - Lọc theo sổ được quyền Xem)
 app.get('/api/statistics', requireAuth, (req, res) => {
   const currentUser = (req as any).user as User;
-  const queryYear = req.query.year ? parseInt(req.query.year as string, 10) : getVietnamTimeInfo().year;
+  const queryYear = req.query.year ? parseInt(req.query.year as string, 10) : getRequestVietnamTimeInfo(req).year;
   const bookId = (req.query.bookId as string) || '';
 
   if (bookId && bookId !== 'all') {
@@ -4193,14 +4318,20 @@ app.post('/api/books/:id/google-sheets', requireAuth, (req, res) => {
       error: `Bạn cần quyền "Quản trị sổ" trong ${targetBook.name} để cấu hình Google Sheets riêng.`,
     });
   }
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
   const { enabled, webhookUrl } = req.body || {};
   targetBook.googleSheetsConfig = {
     enabled: Boolean(enabled),
     webhookUrl: typeof webhookUrl === 'string' ? webhookUrl.trim() : '',
     lastSyncTime: targetBook.googleSheetsConfig?.lastSyncTime || '',
   };
+  bumpBookVersion(targetBook);
   saveDatabaseSync(db);
-  broadcastSSE('books_updated', { bookId: targetBook.id });
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
   res.json({ book: sanitizeBookForUser(targetBook, currentUser) });
 });
 
@@ -4225,6 +4356,8 @@ app.post('/api/drive/config', requireAuth, (req, res) => {
       error: `Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để cấu hình thư mục Google Drive cho ${targetBook.name}.`,
     });
   }
+
+  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
 
   if (!db.settings.googleDriveConfig) {
     db.settings.googleDriveConfig = {
@@ -4303,8 +4436,13 @@ app.post('/api/drive/config', requireAuth, (req, res) => {
       serviceAccountJson: nextSaJson !== db.settings.googleDriveConfig.serviceAccountJson ? nextSaJson : undefined,
       serviceAccountEmail: nextSaEmail,
     };
+    bumpBookVersion(targetBook);
     saveDatabaseSync(db);
-    broadcastSSE('books_updated', { bookId: targetBook.id });
+    broadcastSSE('books_updated', {
+      bookId: targetBook.id,
+      configVersion: targetBook.configVersion,
+      updatedAt: targetBook.updatedAt,
+    });
     return res.json({
       googleDriveConfig: sanitizeDriveConfigForClient(
         db.settings.googleDriveConfig,
@@ -4341,9 +4479,14 @@ app.post('/api/drive/config', requireAuth, (req, res) => {
   };
 
   db.settings.googleDriveConfig = updatedConfig;
+  bumpBookVersion(targetBook);
   saveDatabaseSync(db);
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
-  broadcastSSE('books_updated', { bookId: targetBook.id });
+  broadcastSSE('books_updated', {
+    bookId: targetBook.id,
+    configVersion: targetBook.configVersion,
+    updatedAt: targetBook.updatedAt,
+  });
 
   res.json({
     googleDriveConfig: sanitizeDriveConfigForClient(db.settings.googleDriveConfig, true, db.settings.unitCode),

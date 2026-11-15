@@ -44,6 +44,7 @@ interface ImportPdfViewProps {
   accessibleBooks: RegistryBook[];
   onSelectBook: (bookId: string) => void;
   settings: SystemSettings;
+  serverYear?: number;
   onDocumentImported: (doc: DocumentRecord) => void;
   onDocumentUpdated: (doc: DocumentRecord) => void;
   onOpenExistingDocument: (docId: string) => void;
@@ -55,6 +56,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   accessibleBooks,
   onSelectBook,
   settings,
+  serverYear,
   onDocumentImported,
   onDocumentUpdated,
   onOpenExistingDocument,
@@ -209,7 +211,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     if (!loc) return null;
     const isEstimated = Boolean(loc.estimated || !loc.bbox);
     return (
-      <div className="inline-flex items-center gap-1">
+      <div className="inline-flex items-center gap-1 flex-wrap">
         {isEstimated && (
           <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300">
             Cần kiểm tra
@@ -218,10 +220,10 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
         <button
           type="button"
           onClick={() => handleLocateField(fieldKey, label)}
-          className="inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-semibold text-sky-700 hover:text-sky-900 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded transition-colors"
+          className="inline-flex items-center gap-1 px-2 py-1 min-h-[30px] text-[11px] font-semibold text-sky-700 hover:text-sky-900 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded transition-colors"
           title={`Xem vị trí ${label} trên trang ${loc.page}`}
         >
-          <Crosshair className="w-3 h-3" />
+          <Crosshair className="w-3 h-3 shrink-0" />
           <span>Xem vị trí (Tr.{loc.page})</span>
         </button>
       </div>
@@ -414,30 +416,30 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       : null);
 
   return (
-    <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-6">
+    <div className="max-w-7xl mx-auto py-5 sm:py-8 px-3 sm:px-6 lg:px-8 space-y-5 sm:space-y-6">
       {/* Header + Book selector */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+      <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 sm:gap-4">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
             Nhập Văn Bản PDF (Văn Bản Đến)
           </h1>
-          <p className="text-sm text-slate-600 mt-1">
+          <p className="text-xs sm:text-sm text-slate-600 mt-1">
             Tiếp nhận công văn, kế hoạch PDF từ Sở GD&amp;ĐT hoặc nguồn khác. Đọc và đối chiếu bản gốc bên cạnh, đặt tên chuẩn và lưu vào Google Drive mà{' '}
             <strong className="text-sky-800">không làm tăng dãy số văn bản đi</strong>.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0 w-full md:w-auto">
           {importableBooks.length > 1 && (
-            <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 shadow-2xs text-xs">
-              <BookOpen className="w-3.5 h-3.5 text-sky-700" />
+            <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-2.5 py-1.5 min-h-[42px] shadow-2xs text-xs flex-1 sm:flex-initial min-w-0">
+              <BookOpen className="w-3.5 h-3.5 text-sky-700 shrink-0" />
               <select
                 value={activeBook.id}
                 onChange={(e) => {
                   onSelectBook(e.target.value);
                   handleReset();
                 }}
-                className="font-semibold text-slate-800 bg-transparent focus:outline-hidden cursor-pointer"
+                className="font-semibold text-slate-800 bg-transparent focus:outline-hidden cursor-pointer flex-1 min-w-0 text-base sm:text-xs"
               >
                 {importableBooks.map((b) => (
                   <option key={b.id} value={b.id}>
@@ -452,7 +454,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
             <button
               type="button"
               onClick={handleReset}
-              className="inline-flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 rounded-lg shadow-2xs"
+              className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 min-h-[42px] text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 rounded-lg shadow-2xs w-full sm:w-auto"
             >
               <RotateCcw className="w-3.5 h-3.5" />
               <span>Nhập văn bản PDF khác</span>
@@ -474,7 +476,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       {/* Saved Result Banner (Tách biệt Trạng thái hồ sơ vs Trạng thái tệp) */}
       {savedDoc && (
         <div
-          className={`p-5 rounded-xl border shadow-xs space-y-4 ${
+          className={`p-4 sm:p-5 rounded-xl border shadow-xs space-y-4 ${
             savedDoc.driveStatus === 'saved'
               ? 'bg-emerald-50 border-emerald-200'
               : 'bg-amber-50 border-amber-200'
@@ -525,12 +527,12 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
               </div>
             </div>
 
-            <div className="flex flex-wrap items-center gap-2">
+            <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2">
               {savedDoc.driveStatus === 'saved' && savedDoc.driveFileUrl && (
                 <button
                   type="button"
                   onClick={() => handleOpenSavedDriveFile(savedDoc)}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg shadow-xs"
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 min-h-[42px] text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg shadow-xs"
                 >
                   <ExternalLink className="w-4 h-4" />
                   <span>Mở văn bản gốc</span>
@@ -540,7 +542,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 <button
                   type="button"
                   onClick={() => onOpenExistingDocument(savedDoc.id)}
-                  className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 rounded-lg"
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2 min-h-[42px] text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 rounded-lg"
                 >
                   <FileCheck2 className="w-4 h-4 text-sky-700" />
                   <span>Xem trong Sổ theo dõi</span>
@@ -616,23 +618,23 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
 
       {/* Input Selector Panel */}
       {!savedDoc && canImportActiveBook && (
-        <div className="bg-white border border-slate-200 rounded-xl p-5 sm:p-6 shadow-xs space-y-4">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div className="inline-flex bg-slate-100 p-1 rounded-lg border border-slate-200">
+        <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
+          <div className="flex flex-wrap items-center justify-between gap-2.5 sm:gap-3">
+            <div className="grid grid-cols-2 sm:inline-flex w-full sm:w-auto bg-slate-100 p-1 rounded-lg border border-slate-200">
               <button
                 type="button"
                 onClick={() => {
                   setInputMode('url');
                   setAnalyzeError(null);
                 }}
-                className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-md transition-colors ${
+                className={`flex items-center justify-center gap-1.5 px-3 py-2 min-h-[42px] text-xs font-semibold rounded-md transition-colors ${
                   inputMode === 'url'
                     ? 'bg-white text-sky-800 shadow-2xs'
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                <LinkIcon className="w-3.5 h-3.5" />
-                <span>Dán đường dẫn PDF</span>
+                <LinkIcon className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Dán đường dẫn PDF</span>
               </button>
               <button
                 type="button"
@@ -640,18 +642,18 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   setInputMode('file');
                   setAnalyzeError(null);
                 }}
-                className={`flex items-center gap-1.5 px-3.5 py-2 text-xs font-semibold rounded-md transition-colors ${
+                className={`flex items-center justify-center gap-1.5 px-3 py-2 min-h-[42px] text-xs font-semibold rounded-md transition-colors ${
                   inputMode === 'file'
                     ? 'bg-white text-sky-800 shadow-2xs'
                     : 'text-slate-600 hover:text-slate-900'
                 }`}
               >
-                <Upload className="w-3.5 h-3.5" />
-                <span>Tải PDF từ máy</span>
+                <Upload className="w-3.5 h-3.5 shrink-0" />
+                <span className="truncate">Tải PDF từ máy</span>
               </button>
             </div>
 
-            <span className="text-[11px] font-medium text-slate-600 bg-slate-50 px-2.5 py-1 rounded border border-slate-200">
+            <span className="text-[11px] font-medium text-slate-600 bg-slate-50 px-2.5 py-1 rounded border border-slate-200 max-w-full break-words">
               Sổ nhập: <strong>{activeBook.name}</strong> · Định dạng .pdf · Tối đa {maxFileSizeMB} MB
             </span>
           </div>
@@ -662,15 +664,15 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 type="url"
                 value={pdfUrlInput}
                 onChange={(e) => setPdfUrlInput(e.target.value)}
-                placeholder="Dán liên kết tệp PDF trực tiếp hoặc link chia sẻ Google Drive (https://...)"
+                placeholder="Dán liên kết tệp PDF trực tiếp hoặc link Google Drive (https://...)"
                 required
                 disabled={analyzing}
-                className="flex-1 h-11 px-3.5 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                className="flex-1 min-w-0 min-h-[44px] h-11 px-3.5 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
               />
               <button
                 type="submit"
                 disabled={analyzing || !pdfUrlInput.trim()}
-                className="h-11 px-5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-xs inline-flex items-center justify-center gap-2 shrink-0"
+                className="min-h-[44px] h-11 px-5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white text-xs font-semibold rounded-lg shadow-xs inline-flex items-center justify-center gap-2 shrink-0 w-full sm:w-auto"
               >
                 {analyzing ? (
                   <>
@@ -697,9 +699,9 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   if (f) handleAnalyzeFile(f);
                 }}
               />
-              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-4 border-2 border-dashed border-slate-300 hover:border-sky-400 rounded-xl bg-slate-50/70">
-                <div className="space-y-0.5 text-xs">
-                  <p className="font-bold text-slate-800">
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 p-3.5 sm:p-4 border-2 border-dashed border-slate-300 hover:border-sky-400 rounded-xl bg-slate-50/70">
+                <div className="space-y-0.5 text-xs min-w-0">
+                  <p className="font-bold text-slate-800 break-words">
                     {selectedPdfFile
                       ? `${selectedPdfFile.name} (${formatFileSize(selectedPdfFile.size)})`
                       : 'Chọn tệp PDF văn bản từ máy tính hoặc điện thoại'}
@@ -712,7 +714,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   type="button"
                   disabled={analyzing}
                   onClick={() => fileInputRef.current?.click()}
-                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 text-xs font-semibold bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white rounded-lg shadow-xs shrink-0"
+                  className="inline-flex items-center justify-center gap-1.5 px-4 py-2.5 min-h-[44px] text-xs font-semibold bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white rounded-lg shadow-xs shrink-0 w-full sm:w-auto"
                 >
                   {analyzing ? (
                     <>
@@ -867,37 +869,54 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
             </div>
           )}
 
-          {/* Mobile Screen Switcher: Biểu mẫu / Xem PDF (giữ nguyên mọi nội dung đang sửa) */}
-          <div className="flex lg:hidden items-center justify-between bg-white border border-slate-200 rounded-xl p-1.5 shadow-2xs">
+          {/* Mobile Screen Switcher: Thông tin văn bản / Xem PDF (giữ nguyên mọi nội dung đang sửa) */}
+          <div className="flex lg:hidden items-center justify-between gap-1.5 bg-white border border-slate-200 rounded-xl p-1.5 shadow-2xs">
             <button
               type="button"
               onClick={() => setActiveMobilePane('form')}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-bold rounded-lg transition-colors ${
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 px-2 min-h-[44px] text-xs font-bold rounded-lg transition-colors ${
                 activeMobilePane === 'form'
                   ? 'bg-sky-700 text-white shadow-2xs'
                   : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
-              <FileText className="w-3.5 h-3.5" />
-              <span>Biểu mẫu nhập liệu</span>
+              <FileText className="w-3.5 h-3.5 shrink-0" />
+              <span>Thông tin văn bản</span>
             </button>
             <button
               type="button"
               onClick={() => setActiveMobilePane('pdf')}
-              className={`flex-1 flex items-center justify-center gap-1.5 py-2 text-xs font-bold rounded-lg transition-colors ${
+              className={`flex-1 flex items-center justify-center gap-1.5 py-2.5 px-2 min-h-[44px] text-xs font-bold rounded-lg transition-colors ${
                 activeMobilePane === 'pdf'
                   ? 'bg-sky-700 text-white shadow-2xs'
                   : 'text-slate-600 hover:bg-slate-50'
               }`}
             >
-              <Eye className="w-3.5 h-3.5" />
+              <Eye className="w-3.5 h-3.5 shrink-0" />
               <span>Xem PDF</span>
             </button>
           </div>
 
-          <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+          <div className="grid grid-cols-1 lg:grid-cols-12 gap-5 lg:gap-6 items-start">
             {/* Left: Side-by-side PDF Viewer (always mounted to preserve page/zoom) */}
-            <div className={`lg:col-span-6 ${activeMobilePane === 'pdf' ? 'block' : 'hidden lg:block'}`}>
+            <div className={`lg:col-span-6 min-w-0 ${activeMobilePane === 'pdf' ? 'block' : 'hidden lg:block'}`}>
+              {activeMobilePane === 'pdf' && (
+                <div className="lg:hidden mb-2.5 flex flex-wrap items-center justify-between gap-2 bg-sky-50 border border-sky-200 rounded-lg px-3 py-2 text-xs">
+                  <span className="text-sky-950 font-semibold min-w-0 truncate">
+                    {highlightBox?.label
+                      ? `Đang đối chiếu: ${highlightBox.label} (Tr.${highlightBox.page})`
+                      : 'Đang xem bản PDF gốc'}
+                  </span>
+                  <button
+                    type="button"
+                    onClick={() => setActiveMobilePane('form')}
+                    className="inline-flex items-center gap-1 px-2.5 py-1.5 min-h-[34px] bg-white hover:bg-sky-100 border border-sky-300 text-sky-800 font-bold rounded-md shrink-0"
+                  >
+                    <FileText className="w-3.5 h-3.5" />
+                    <span>Quay lại Thông tin văn bản</span>
+                  </button>
+                </div>
+              )}
               <PdfPreviewPane
                 pdfUrl={api.getStagedPdfUrl(analysis.stageToken)}
                 fileName={analysis.originalFileName}
@@ -913,12 +932,12 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 e.preventDefault();
                 submitImport();
               }}
-              className={`lg:col-span-6 bg-white border border-slate-200 rounded-xl p-5 sm:p-6 shadow-xs space-y-4 ${
+              className={`lg:col-span-6 min-w-0 bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4 ${
                 activeMobilePane === 'form' ? 'block' : 'hidden lg:block'
               }`}
             >
               <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-100 pb-3">
-                <div>
+                <div className="min-w-0">
                   <h2 className="text-base font-bold text-slate-900">
                     Thông tin văn bản đến
                   </h2>
@@ -927,13 +946,13 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   </p>
                 </div>
                 {importableBooks.length > 1 ? (
-                  <div className="inline-flex items-center gap-1.5 text-xs bg-sky-50 border border-sky-200 rounded-md px-2.5 py-1 shrink-0">
-                    <BookOpen className="w-3.5 h-3.5 text-sky-700" />
+                  <div className="inline-flex items-center gap-1.5 text-xs bg-sky-50 border border-sky-200 rounded-md px-2.5 py-1.5 min-h-[38px] max-w-full">
+                    <BookOpen className="w-3.5 h-3.5 text-sky-700 shrink-0" />
                     <select
                       aria-label="Sổ tiếp nhận văn bản đến"
                       value={activeBook.id}
                       onChange={(e) => onSelectBook(e.target.value)}
-                      className="font-bold text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
+                      className="font-bold text-sky-900 bg-transparent focus:outline-hidden cursor-pointer min-w-0 text-base sm:text-xs"
                     >
                       {importableBooks.map((b) => (
                         <option key={b.id} value={b.id}>
@@ -950,7 +969,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                       Số / Ký hiệu gốc <span className="text-rose-600">*</span>
@@ -966,11 +985,11 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     }}
                     placeholder="Ví dụ: 1234/SGDĐT-GDTrH"
                     required
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                       Cơ quan ban hành
@@ -982,12 +1001,12 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     value={issuingAgency}
                     onChange={(e) => setIssuingAgency(e.target.value)}
                     placeholder="Ví dụ: Sở GD&ĐT, Trường THPT..."
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
               </div>
 
-              <div className="space-y-1">
+              <div className="space-y-1 min-w-0">
                 <div className="flex items-center justify-between gap-1 flex-wrap">
                   <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                     Tên văn bản <span className="text-rose-600">*</span>
@@ -1002,11 +1021,11 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     setIsEditingFileName(false);
                   }}
                   placeholder="Tên ngắn gọn của văn bản (dùng để đặt tên tệp lưu trữ)..."
-                  className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                  className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                 />
               </div>
 
-              <div className="space-y-1">
+              <div className="space-y-1 min-w-0">
                 <div className="flex items-center justify-between gap-1 flex-wrap">
                   <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                     Trích yếu / Nội dung (V/v)
@@ -1018,12 +1037,12 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   onChange={(e) => setTitle(e.target.value)}
                   rows={2}
                   placeholder="Nội dung trích yếu sau V/v..."
-                  className="w-full p-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                  className="w-full p-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                 />
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                       Ngày ban hành
@@ -1036,11 +1055,11 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     onChange={(e) => setIssueDate(e.target.value)}
                     onBlur={(e) => setIssueDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
                     placeholder="dd/mm/yyyy (để trống nếu chưa có)"
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                       Ngày ký
@@ -1053,13 +1072,13 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     onChange={(e) => setSignDate(e.target.value)}
                     onBlur={(e) => setSignDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
                     placeholder="dd/mm/yyyy (chỉ điền nếu có ngày ký riêng)"
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                       Họ tên người ký
@@ -1071,17 +1090,17 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     value={signer}
                     onChange={(e) => setSigner(e.target.value)}
                     placeholder="Họ và tên người ký..."
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                   {analysis.extraction.signerCandidates &&
                     analysis.extraction.signerCandidates.length > 1 && (
-                      <div className="flex flex-wrap gap-1 pt-1">
+                      <div className="flex flex-wrap gap-1.5 pt-1">
                         {analysis.extraction.signerCandidates.map((cand) => (
                           <button
                             key={cand}
                             type="button"
                             onClick={() => setSigner(cand)}
-                            className={`text-[11px] px-2 py-0.5 rounded border ${
+                            className={`text-[11px] px-2.5 py-1 min-h-[32px] rounded border ${
                               signer === cand
                                 ? 'bg-sky-700 text-white border-sky-700'
                                 : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-sky-50'
@@ -1094,7 +1113,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     )}
                 </div>
 
-                <div className="space-y-1">
+                <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                       Chức vụ người ký
@@ -1106,12 +1125,12 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     value={signerRole}
                     onChange={(e) => setSignerRole(e.target.value)}
                     placeholder="Ví dụ: Hiệu trưởng, Phó Giám đốc..."
-                    className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
               </div>
 
-              <div className="space-y-1">
+              <div className="space-y-1 min-w-0">
                 <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                   Ghi chú <span className="text-slate-400 font-normal lowercase">(không bắt buộc)</span>
                 </label>
@@ -1120,15 +1139,15 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   value={notes}
                   onChange={(e) => setNotes(e.target.value)}
                   placeholder="Ghi chú phân công, hạn xử lý..."
-                  className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                  className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                 />
               </div>
 
               {/* Tên tệp sẽ lưu */}
-              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2">
+              <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-2 min-w-0">
                 <div className="flex flex-wrap items-center justify-between gap-2">
                   <span className="text-xs font-bold text-slate-800 uppercase tracking-wide flex items-center gap-1.5">
-                    <FileText className="w-4 h-4 text-sky-700" />
+                    <FileText className="w-4 h-4 text-sky-700 shrink-0" />
                     <span>Tên tệp sẽ lưu</span>
                   </span>
                   <div className="flex items-center gap-2">
@@ -1143,7 +1162,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                           setCustomFileName('');
                         }
                       }}
-                      className="text-[11px] font-semibold text-sky-700 hover:underline"
+                      className="text-xs font-semibold text-sky-700 hover:underline py-1"
                     >
                       {isEditingFileName ? 'Dùng tên tự động' : 'Sửa tên tệp'}
                     </button>
@@ -1155,17 +1174,17 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     type="text"
                     value={customFileName}
                     onChange={(e) => setCustomFileName(e.target.value)}
-                    className="w-full h-10 px-3 bg-white border border-sky-400 rounded-lg font-mono text-xs sm:text-sm font-bold text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-sky-400 rounded-lg font-mono text-base sm:text-sm font-bold text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 ) : (
-                  <div className="flex items-center gap-2">
-                    <div className="flex-1 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs sm:text-sm font-bold text-sky-950 overflow-x-auto whitespace-nowrap">
+                  <div className="flex flex-col sm:flex-row sm:items-center gap-2 min-w-0">
+                    <div className="flex-1 min-w-0 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs sm:text-sm font-bold text-sky-950 overflow-x-auto whitespace-nowrap">
                       {computedDriveFileName}
                     </div>
                     <button
                       type="button"
                       onClick={handleCopyFileName}
-                      className="px-3 py-2 text-xs font-semibold bg-white hover:bg-sky-50 border border-slate-300 rounded-lg text-slate-700 shrink-0 flex items-center gap-1"
+                      className="px-3 py-2 min-h-[40px] text-xs font-semibold bg-white hover:bg-sky-50 border border-slate-300 rounded-lg text-slate-700 shrink-0 inline-flex items-center justify-center gap-1 w-full sm:w-auto"
                     >
                       {copiedFileName ? (
                         <>
@@ -1181,13 +1200,13 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     </button>
                   </div>
                 )}
-                <p className="text-[11px] text-slate-500">
+                <p className="text-[11px] text-slate-500 break-words">
                   Lưu vào Google Drive tại thư mục:{' '}
                   <strong className="text-slate-700">
-                    {activeBook.name} → {(issueDate || signDate).match(/(\d{4})$/)?.[1] || new Date().getFullYear()} → Văn bản đến
+                    {activeBook.name} → {(issueDate || signDate).match(/(\d{4})$/)?.[1] || serverYear || Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric' }).format(new Date()))} → Văn bản đến
                   </strong>{' '}
                   bằng đúng tên ở ô này (giữ nguyên số gốc{' '}
-                  <strong className="font-mono text-slate-700">{fullDocNumber || '...'}</strong> trong sổ).
+                  <strong className="font-mono text-slate-700 break-all">{fullDocNumber || '...'}</strong> trong sổ).
                 </p>
               </div>
 
@@ -1260,15 +1279,15 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 <span className="text-[11px] text-slate-500">
                   Người nhập: <strong className="text-slate-700">{currentUser.fullName}</strong>
                 </span>
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-2 bg-slate-100 border border-slate-200 rounded-lg text-xs font-bold text-slate-700">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2 w-full sm:w-auto">
+                  <span className="inline-flex items-center justify-center gap-1.5 px-2.5 py-2 bg-slate-100 border border-slate-200 rounded-lg text-xs font-bold text-slate-700">
                     <BookOpen className="w-3.5 h-3.5 text-sky-700" />
                     <span>{activeBook.name}</span>
                   </span>
                   <button
                     type="submit"
                     disabled={submitting}
-                    className="h-11 px-6 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white text-sm font-semibold rounded-lg shadow-sm inline-flex items-center gap-2"
+                    className="min-h-[48px] h-12 sm:h-11 px-6 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white text-sm font-semibold rounded-lg shadow-sm inline-flex items-center justify-center gap-2 w-full sm:w-auto"
                   >
                     {submitting ? (
                       <>

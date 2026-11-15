@@ -36,6 +36,16 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
   );
 
   const [selectedYear, setSelectedYear] = useState<number>(currentYear);
+  const prevCurrentYearRef = React.useRef<number>(currentYear);
+  useEffect(() => {
+    if (prevCurrentYearRef.current !== currentYear) {
+      if (selectedYear === prevCurrentYearRef.current) {
+        setSelectedYear(currentYear);
+      }
+      prevCurrentYearRef.current = currentYear;
+    }
+  }, [currentYear, selectedYear]);
+
   const [statsBookId, setStatsBookId] = useState<string>(() => {
     if (viewableBooks.some((b) => b.id === activeBookId)) return activeBookId;
     return viewableBooks.length > 1 ? 'all' : viewableBooks[0]?.id || 'all';
@@ -74,7 +84,7 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
 
   useEffect(() => {
     fetchStats(selectedYear, statsBookId);
-  }, [selectedYear, statsBookId]);
+  }, [selectedYear, statsBookId, currentYear]);
 
   const selectedBookObj = viewableBooks.find((b) => b.id === statsBookId);
 
@@ -84,25 +94,25 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
     : 1;
 
   return (
-    <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-8">
+    <div className="max-w-7xl mx-auto py-5 sm:py-8 px-3 sm:px-6 lg:px-8 space-y-5 sm:space-y-8">
       {/* Header & Year / Book Selector */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
             Thống Kê Sổ Văn Bản
           </h1>
-          <p className="text-sm text-slate-600 mt-1">
+          <p className="text-xs sm:text-sm text-slate-600 mt-1">
             {selectedBookObj
               ? `Báo cáo tổng hợp cho sổ: ${selectedBookObj.name} (${selectedBookObj.unitCode}).`
               : 'Báo cáo tổng hợp số lượng văn bản đi, văn bản đến theo năm, theo loại và theo từng tháng trên các sổ bạn có quyền xem.'}
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5">
+        <div className="flex flex-wrap items-center gap-2 w-full sm:w-auto">
           {viewableBooks.length > 0 && (
-            <div className="flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs">
+            <div className="flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 min-h-[42px] rounded-lg shadow-2xs w-full sm:w-auto min-w-0">
               <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />
-              <span className="text-xs font-semibold text-slate-700">Sổ:</span>
+              <span className="text-xs font-semibold text-slate-700 shrink-0">Sổ:</span>
               <select
                 value={statsBookId}
                 onChange={(e) => {
@@ -110,7 +120,7 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
                   setStatsBookId(val);
                   if (val !== 'all') onSelectBookId(val);
                 }}
-                className="text-xs font-bold text-sky-800 bg-transparent border-0 cursor-pointer focus:outline-hidden max-w-[200px]"
+                className="text-base sm:text-xs font-bold text-sky-800 bg-transparent border-0 cursor-pointer focus:outline-hidden flex-1 sm:flex-initial min-w-0 sm:max-w-[200px]"
               >
                 {viewableBooks.length > 1 && <option value="all">Tất cả sổ có quyền xem</option>}
                 {viewableBooks.map((b) => (
@@ -122,13 +132,13 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
             </div>
           )}
 
-          <div className="flex items-center gap-2 bg-white border border-slate-200 px-3 py-1.5 rounded-lg shadow-2xs">
-            <Calendar className="w-4 h-4 text-slate-500" />
-            <span className="text-xs font-semibold text-slate-700">Năm:</span>
+          <div className="flex items-center gap-2 flex-1 sm:flex-initial bg-white border border-slate-200 px-3 py-1.5 min-h-[42px] rounded-lg shadow-2xs min-w-0">
+            <Calendar className="w-4 h-4 text-slate-500 shrink-0" />
+            <span className="text-xs font-semibold text-slate-700 shrink-0">Năm:</span>
             <select
               value={selectedYear}
               onChange={(e) => setSelectedYear(parseInt(e.target.value, 10))}
-              className="text-xs font-bold text-sky-800 bg-transparent border-0 cursor-pointer focus:outline-hidden"
+              className="text-base sm:text-xs font-bold text-sky-800 bg-transparent border-0 cursor-pointer focus:outline-hidden flex-1 sm:flex-initial min-w-0"
             >
               {[currentYear - 2, currentYear - 1, currentYear, currentYear + 1].map((y) => (
                 <option key={y} value={y}>
@@ -139,11 +149,13 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
           </div>
 
           <button
+            type="button"
             onClick={() => fetchStats(selectedYear, statsBookId)}
-            className="p-2 text-slate-500 hover:text-sky-700 bg-white border border-slate-200 rounded-lg shadow-2xs transition-colors"
+            className="min-h-[42px] px-3 py-2 text-xs font-semibold text-slate-600 hover:text-sky-700 bg-white border border-slate-200 rounded-lg shadow-2xs transition-colors inline-flex items-center justify-center gap-1.5 shrink-0"
             title="Làm mới thống kê"
           >
             <RefreshCw className="w-4 h-4" />
+            <span className="sm:hidden">Làm mới</span>
           </button>
         </div>
       </div>
@@ -237,28 +249,28 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
           </div>
 
           {/* Section: Breakdown by Document Type */}
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
             <h2 className="text-base font-bold text-slate-900 mb-4">
               Số Lượng Theo Từng Loại Văn Bản
             </h2>
 
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
               {stats.byType.map((t) => (
                 <div
                   key={t.typeCode}
-                  className="p-4 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between"
+                  className="p-3.5 sm:p-4 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between gap-2 min-w-0"
                 >
-                  <div>
+                  <div className="min-w-0">
                     <span className="text-xs font-bold text-sky-800 bg-sky-100 px-2 py-0.5 rounded font-mono">
                       {t.typeCode}
                     </span>
-                    <h3 className="text-sm font-semibold text-slate-900 mt-1.5">{t.typeName}</h3>
+                    <h3 className="text-sm font-semibold text-slate-900 mt-1.5 break-words">{t.typeName}</h3>
                     <p className="text-xs text-slate-500 mt-0.5">
                       Đã hủy: <span className="font-mono text-rose-600">{t.cancelledCount}</span>
                     </p>
                   </div>
 
-                  <div className="text-right">
+                  <div className="text-right shrink-0">
                     <span className="text-2xl font-bold font-mono text-slate-900">{t.count}</span>
                     <span className="block text-[11px] text-slate-400">văn bản</span>
                   </div>
@@ -268,8 +280,8 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
           </div>
 
           {/* Section: Monthly Breakdown */}
-          <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-xs">
-            <div className="flex items-center justify-between mb-4">
+          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
               <h2 className="text-base font-bold text-slate-900">
                 Phân Bổ Theo 12 Tháng Trong Năm {stats.year}
               </h2>

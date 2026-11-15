@@ -49,6 +49,7 @@ interface DocumentRegistryViewProps {
   onSelectBookId: (bookId: string) => void;
   currentUser: User;
   settings?: SystemSettings;
+  serverYear?: number;
   onRefresh: () => void;
   onDocumentUpdated: (doc: DocumentRecord) => void;
   initialOpenDocId?: string | null;
@@ -95,6 +96,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   onSelectBookId,
   currentUser,
   settings,
+  serverYear,
   onRefresh,
   onDocumentUpdated,
   initialOpenDocId,
@@ -346,9 +348,19 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   // Derive unique years and signers
   const availableYears = useMemo(() => {
     const years = Array.from(new Set(documents.map((d) => d.year)));
-    if (years.length === 0) years.push(new Date().getFullYear());
+    if (years.length === 0) {
+      years.push(
+        serverYear ||
+          Number(
+            new Intl.DateTimeFormat('en-CA', {
+              timeZone: 'Asia/Ho_Chi_Minh',
+              year: 'numeric',
+            }).format(new Date())
+          )
+      );
+    }
     return years.sort((a, b) => b - a);
-  }, [documents]);
+  }, [documents, serverYear]);
 
   const availableSigners = useMemo(() => {
     return Array.from(new Set(documents.map((d) => d.signer))).filter(Boolean);
@@ -588,26 +600,27 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   };
 
   return (
-    <div className="max-w-7xl mx-auto py-8 px-4 sm:px-6 lg:px-8 space-y-6">
+    <div className="max-w-7xl mx-auto py-5 sm:py-8 px-3 sm:px-6 lg:px-8 space-y-5 sm:space-y-6">
       {/* Header bar */}
-      <div className="flex flex-col md:flex-row md:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+      <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3 sm:gap-4">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
             Sổ Theo Dõi Văn Bản
           </h1>
-          <p className="text-sm text-slate-600 mt-1">
+          <p className="text-xs sm:text-sm text-slate-600 mt-1 leading-relaxed">
             Tra cứu nhanh văn bản đi và văn bản đến, theo dõi trạng thái tệp trên Google Drive và xuất báo cáo Excel chuẩn.
           </p>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2.5 shrink-0">
+        <div className="flex flex-wrap items-center gap-2 shrink-0 w-full lg:w-auto">
           {viewableBooks.length > 0 && (
-            <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-3 py-2 shadow-2xs text-xs">
-              <BookOpen className="w-3.5 h-3.5 text-sky-700" />
+            <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-3 py-2 min-h-[42px] shadow-2xs text-xs w-full sm:w-auto min-w-0">
+              <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />
               <select
+                aria-label="Lọc theo sổ văn bản"
                 value={viewableBooks.length === 1 ? viewableBooks[0].id : activeBookId}
                 onChange={(e) => onSelectBookId(e.target.value)}
-                className="font-semibold text-slate-800 bg-transparent focus:outline-hidden cursor-pointer"
+                className="flex-1 sm:flex-initial min-w-0 font-semibold text-base sm:text-xs text-slate-800 bg-transparent focus:outline-hidden cursor-pointer"
               >
                 {viewableBooks.length > 1 && (
                   <option value="all">Tất cả sổ có quyền ({viewableBooks.length})</option>
@@ -624,10 +637,10 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
           <button
             type="button"
             onClick={onRefresh}
-            className="flex items-center gap-1.5 px-3 py-2 text-xs font-semibold bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg shadow-2xs transition-colors"
+            className="flex-1 sm:flex-initial justify-center flex items-center gap-1.5 min-h-[42px] px-3.5 py-2 text-xs font-semibold bg-white border border-slate-300 hover:bg-slate-50 text-slate-700 rounded-lg shadow-2xs transition-colors"
           >
-            <RefreshCw className="w-4 h-4 text-slate-500" />
-            <span>Làm mới</span>
+            <RefreshCw className="w-4 h-4 text-sky-700 shrink-0" />
+            <span>Làm mới dữ liệu</span>
           </button>
 
           {canExportScope && (
@@ -635,17 +648,17 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               type="button"
               onClick={handleExportExcel}
               disabled={isExporting}
-              className="flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white rounded-lg shadow-xs transition-colors"
+              className="flex-1 sm:flex-initial justify-center flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 disabled:opacity-60 text-white rounded-lg shadow-xs transition-colors"
               title="Xuất đúng danh sách đang lọc & sắp xếp hiện tại ra Excel .xlsx"
             >
               {isExporting ? (
                 <>
-                  <Loader2 className="w-4 h-4 animate-spin" />
+                  <Loader2 className="w-4 h-4 animate-spin shrink-0" />
                   <span>Đang xuất Excel...</span>
                 </>
               ) : (
                 <>
-                  <FileSpreadsheet className="w-4 h-4" />
+                  <FileSpreadsheet className="w-4 h-4 shrink-0" />
                   <span>Tải Excel .xlsx</span>
                 </>
               )}
@@ -656,9 +669,9 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
       {(exportError || fileActionError) && (
         <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 flex items-center justify-between gap-2">
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 min-w-0">
             <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
-            <span>{exportError || fileActionError}</span>
+            <span className="break-words min-w-0">{exportError || fileActionError}</span>
           </div>
           <button
             type="button"
@@ -666,7 +679,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               setExportError(null);
               setFileActionError(null);
             }}
-            className="text-rose-600 hover:text-rose-800 p-1"
+            className="text-rose-600 hover:text-rose-800 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center shrink-0"
           >
             <X className="w-4 h-4" />
           </button>
@@ -674,24 +687,25 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
       )}
 
       {/* Filter & Search Bar */}
-      <div className="bg-white border border-slate-200 rounded-xl p-4 shadow-xs space-y-3">
-        <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-12 gap-2.5">
-          <div className="sm:col-span-2 md:col-span-3 relative">
-            <Search className="w-4 h-4 absolute left-3 top-3 text-slate-400" />
+      <div className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 shadow-xs space-y-3">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 xl:grid-cols-12 gap-2.5">
+          <div className="sm:col-span-2 lg:col-span-2 xl:col-span-3 relative min-w-0">
+            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
             <input
               type="text"
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               placeholder="Tìm số VB, tên VB, cơ quan, tên tệp..."
-              className="w-full h-10 pl-9 pr-3 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+              className="w-full min-h-[44px] h-11 sm:h-10 pl-9 pr-3 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
             />
           </div>
 
-          <div className="md:col-span-2">
+          <div className="lg:col-span-1 xl:col-span-2 min-w-0">
             <select
+              aria-label="Lọc nhóm văn bản"
               value={selectedCategory}
               onChange={(e) => setSelectedCategory(e.target.value as any)}
-              className="w-full h-10 px-2.5 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600 font-semibold text-slate-700"
+              className="w-full min-h-[44px] h-11 sm:h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600 font-semibold text-slate-700"
             >
               <option value="all">Tất cả nhóm VB</option>
               <option value="outgoing">Văn bản đi</option>
@@ -699,11 +713,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             </select>
           </div>
 
-          <div className="md:col-span-1">
+          <div className="lg:col-span-1 xl:col-span-1 min-w-0">
             <select
+              aria-label="Lọc theo năm"
               value={selectedYear}
               onChange={(e) => setSelectedYear(e.target.value)}
-              className="w-full h-10 px-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+              className="w-full min-h-[44px] h-11 sm:h-10 px-2 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
             >
               <option value="all">Mọi năm</option>
               {availableYears.map((yr) => (
@@ -714,11 +729,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             </select>
           </div>
 
-          <div className="md:col-span-1">
+          <div className="lg:col-span-1 xl:col-span-1 min-w-0">
             <select
+              aria-label="Lọc theo tháng"
               value={selectedMonth}
               onChange={(e) => setSelectedMonth(e.target.value)}
-              className="w-full h-10 px-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+              className="w-full min-h-[44px] h-11 sm:h-10 px-2 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
             >
               <option value="all">Mọi tháng</option>
               {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
@@ -729,11 +745,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             </select>
           </div>
 
-          <div className="md:col-span-2">
+          <div className="lg:col-span-1 xl:col-span-2 min-w-0">
             <select
+              aria-label="Lọc theo loại văn bản"
               value={selectedType}
               onChange={(e) => setSelectedType(e.target.value)}
-              className="w-full h-10 px-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+              className="w-full min-h-[44px] h-11 sm:h-10 px-2 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
             >
               <option value="all">Tất cả loại VB</option>
               <option value="VBD">Văn bản đến (VBD)</option>
@@ -745,11 +762,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             </select>
           </div>
 
-          <div className="md:col-span-1">
+          <div className="lg:col-span-1 xl:col-span-1 min-w-0">
             <select
+              aria-label="Lọc trạng thái hồ sơ"
               value={selectedStatus}
               onChange={(e) => setSelectedStatus(e.target.value)}
-              className="w-full h-10 px-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+              className="w-full min-h-[44px] h-11 sm:h-10 px-2 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
             >
               <option value="all">Hồ sơ</option>
               <option value="active">Hiệu lực</option>
@@ -757,11 +775,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             </select>
           </div>
 
-          <div className="md:col-span-2">
+          <div className="lg:col-span-1 xl:col-span-2 min-w-0">
             <select
+              aria-label="Lọc trạng thái tệp Drive"
               value={selectedDriveStatus}
               onChange={(e) => setSelectedDriveStatus(e.target.value)}
-              className="w-full h-10 px-2 text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+              className="w-full min-h-[44px] h-11 sm:h-10 px-2 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
             >
               <option value="all">Tất cả trạng thái tệp</option>
               <option value="saved">Đã lưu lên Drive</option>
@@ -772,8 +791,8 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         </div>
 
         {/* Sub-bar: Sort & Signer + Counts + Mobile switcher */}
-        <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-3 text-xs text-slate-500">
-          <div className="flex items-center gap-3 flex-wrap">
+        <div className="pt-2.5 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 text-xs text-slate-500">
+          <div className="flex items-center gap-2.5 flex-wrap min-w-0">
             <div className="flex items-center gap-1.5">
               <span>Hiển thị:</span>
               <strong className="text-slate-800 font-mono">{filteredDocuments.length}</strong>
@@ -784,9 +803,10 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
             {availableSigners.length > 0 && (
               <select
+                aria-label="Lọc theo người ký"
                 value={selectedSigner}
                 onChange={(e) => setSelectedSigner(e.target.value)}
-                className="h-7 px-2 text-xs bg-slate-50 border border-slate-200 rounded text-slate-700 focus:outline-hidden"
+                className="min-h-[36px] h-9 sm:h-8 max-w-full min-w-0 px-2 text-sm sm:text-xs bg-slate-50 border border-slate-200 rounded-md text-slate-700 focus:outline-hidden"
               >
                 <option value="all">Mọi người ký</option>
                 {availableSigners.map((s) => (
@@ -798,12 +818,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             )}
           </div>
 
-          <div className="flex items-center gap-3">
+          <div className="flex items-center justify-between sm:justify-end gap-2.5 flex-wrap">
             <div className="flex md:hidden items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
               <button
                 type="button"
                 onClick={() => setMobileViewMode('cards')}
-                className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
+                className={`min-h-[34px] px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
                   mobileViewMode === 'cards' ? 'bg-white text-sky-800 shadow-2xs' : 'text-slate-600'
                 }`}
               >
@@ -813,7 +833,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               <button
                 type="button"
                 onClick={() => setMobileViewMode('table')}
-                className={`px-2 py-0.5 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
+                className={`min-h-[34px] px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
                   mobileViewMode === 'table' ? 'bg-white text-sky-800 shadow-2xs' : 'text-slate-600'
                 }`}
               >
@@ -825,9 +845,10 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             <div className="flex items-center gap-1.5">
               <span>Sắp xếp:</span>
               <select
+                aria-label="Sắp xếp danh sách"
                 value={sortBy}
                 onChange={(e: any) => setSortBy(e.target.value)}
-                className="h-8 px-2 text-xs bg-transparent border-0 font-medium text-slate-700 cursor-pointer focus:outline-hidden"
+                className="min-h-[36px] h-9 px-2 text-sm sm:text-xs bg-slate-50 sm:bg-transparent border border-slate-200 sm:border-0 rounded-md font-medium text-slate-700 cursor-pointer focus:outline-hidden"
               >
                 <option value="newest">Mới nhất trước</option>
                 <option value="oldest">Cũ nhất trước</option>
@@ -863,12 +884,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               return (
                 <div
                   key={doc.id}
-                  className={`bg-white border rounded-xl p-4 shadow-2xs space-y-3 ${
+                  className={`bg-white border rounded-xl p-3.5 sm:p-4 shadow-2xs space-y-3 min-w-0 ${
                     isCancelled ? 'border-rose-200 bg-rose-50/20' : 'border-slate-200'
                   }`}
                 >
                   <div className="flex items-start justify-between gap-2">
-                    <div className="flex items-center gap-1.5 flex-wrap">
+                    <div className="flex items-center gap-1.5 flex-wrap min-w-0">
                       <span className={`text-[11px] font-bold px-2 py-0.5 rounded ${typeColor.badgeBg} ${typeColor.badgeText} border ${typeColor.badgeBorder}`}>
                         {isIncoming ? 'Văn bản đến' : doc.typeName || doc.typeCode}
                       </span>
@@ -877,13 +898,13 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                           Cần kiểm tra
                         </span>
                       )}
-                      <span className="font-mono font-bold text-slate-900 text-sm">
+                      <span className="font-mono font-bold text-slate-900 text-sm break-all">
                         {doc.fullDocNumber}
                       </span>
                       <button
                         type="button"
                         onClick={() => handleCopy(doc.id, doc.fullDocNumber)}
-                        className="p-1 text-slate-400 hover:text-slate-800"
+                        className="p-1.5 min-w-[32px] min-h-[32px] flex items-center justify-center text-slate-400 hover:text-slate-800 rounded"
                         title="Sao chép số văn bản"
                       >
                         {copiedId === doc.id ? (
@@ -899,11 +920,11 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     </span>
                   </div>
 
-                  <div>
-                    <h3 className={`text-sm font-bold text-slate-900 leading-snug ${isCancelled ? 'line-through text-slate-400' : ''}`}>
+                  <div className="min-w-0">
+                    <h3 className={`text-sm font-bold text-slate-900 leading-snug break-words ${isCancelled ? 'line-through text-slate-400' : ''}`}>
                       {doc.docName || doc.title}
                     </h3>
-                    <p className="text-[11px] text-slate-600 mt-1">
+                    <p className="text-[11px] text-slate-600 mt-1 break-words">
                       <span className="text-slate-400">Cơ quan / Đơn vị:</span>{' '}
                       <strong className="text-slate-800">{unitDisplay}</strong> ·{' '}
                       <span className="text-slate-400">Ngày BH:</span>{' '}
@@ -927,13 +948,13 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                       {getDriveStatusLabel(doc)}
                     </span>
 
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex items-center gap-1.5 flex-wrap">
                       {doc.driveStatus === 'saved' && doc.driveFileUrl && (
                         <button
                           type="button"
                           onClick={() => handleOpenDriveFile(doc)}
                           disabled={openingFileId === doc.id}
-                          className="inline-flex items-center gap-1 font-semibold text-emerald-700 bg-white px-2 py-0.5 rounded border border-emerald-200"
+                          className="inline-flex items-center gap-1 min-h-[34px] font-semibold text-emerald-700 bg-white px-2.5 py-1 rounded border border-emerald-200"
                         >
                           <ExternalLink className="w-3 h-3" />
                           <span>Mở tệp</span>
@@ -943,7 +964,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openUploadModal(doc, 'replace')}
-                          className="font-semibold text-sky-700 bg-white px-2 py-0.5 rounded border border-sky-200"
+                          className="min-h-[34px] font-semibold text-sky-700 bg-white px-2.5 py-1 rounded border border-sky-200"
                         >
                           Thay tệp
                         </button>
@@ -952,7 +973,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openUploadModal(doc, 'retry')}
-                          className="font-semibold text-rose-700 bg-white px-2 py-0.5 rounded border border-rose-200"
+                          className="min-h-[34px] font-semibold text-rose-700 bg-white px-2.5 py-1 rounded border border-rose-200"
                         >
                           Thử lưu lại
                         </button>
@@ -961,7 +982,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openUploadModal(doc, 'retry')}
-                          className="inline-flex items-center gap-1 font-semibold text-sky-700 bg-white px-2 py-0.5 rounded border border-sky-200"
+                          className="inline-flex items-center gap-1 min-h-[34px] font-semibold text-sky-700 bg-white px-2.5 py-1 rounded border border-sky-200"
                         >
                           <FileUp className="w-3 h-3" />
                           <span>Đính kèm</span>
@@ -972,7 +993,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
                   {/* Footer Actions */}
                   <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs">
-                    <span className="text-[11px] text-slate-500 truncate">
+                    <span className="text-[11px] text-slate-500 truncate min-w-0">
                       {bookObj?.name || doc.bookName}
                     </span>
 
@@ -980,7 +1001,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                       <button
                         type="button"
                         onClick={() => setDetailModalDoc(doc)}
-                        className="p-1.5 text-slate-600 hover:text-sky-700 hover:bg-white rounded"
+                        className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-600 hover:text-sky-700 hover:bg-white rounded"
                         title="Xem chi tiết"
                       >
                         <Eye className="w-4 h-4" />
@@ -989,7 +1010,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openEditModal(doc)}
-                          className="p-1.5 text-slate-600 hover:text-amber-600 hover:bg-white rounded"
+                          className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-600 hover:text-amber-600 hover:bg-white rounded"
                           title="Sửa văn bản"
                         >
                           <Edit2 className="w-4 h-4" />
@@ -999,7 +1020,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         <button
                           type="button"
                           onClick={() => openCancelModal(doc)}
-                          className="p-1.5 text-slate-600 hover:text-amber-700 hover:bg-white rounded"
+                          className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-600 hover:text-amber-700 hover:bg-white rounded"
                           title="Hủy số văn bản"
                         >
                           <Ban className="w-4 h-4" />
@@ -1009,7 +1030,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         <button
                           type="button"
                           onClick={() => setDeleteModalDoc(doc)}
-                          className="p-1.5 text-slate-600 hover:text-rose-600 hover:bg-white rounded"
+                          className="p-2 min-w-[36px] min-h-[36px] flex items-center justify-center text-slate-600 hover:text-rose-600 hover:bg-white rounded"
                           title="Xóa văn bản"
                         >
                           <Trash2 className="w-4 h-4" />
@@ -1279,12 +1300,12 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         const signDateDisplay = normalizeDateOnlyDdMmYyyy(detailModalDoc.signDate) || '—';
 
         return (
-          <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-            <div className="bg-white rounded-xl max-w-2xl w-full p-6 shadow-xl max-h-[90vh] overflow-y-auto space-y-5 animate-scaleUp">
-              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                <div className="flex items-center gap-2 flex-wrap">
+          <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
+            <div className="bg-white rounded-xl max-w-2xl w-full p-4 sm:p-6 shadow-xl max-h-[92dvh] overflow-y-auto space-y-5 animate-scaleUp">
+              <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+                <div className="flex items-center gap-2 flex-wrap min-w-0">
                   <h3 className="text-base font-bold text-slate-900">Chi tiết hồ sơ văn bản</h3>
-                  <span className="font-mono text-sm font-bold text-sky-800 bg-sky-50 px-2.5 py-0.5 rounded border border-sky-200">
+                  <span className="font-mono text-sm font-bold text-sky-800 bg-sky-50 px-2.5 py-0.5 rounded border border-sky-200 break-all">
                     {detailModalDoc.fullDocNumber}
                   </span>
                   <span className={`text-[11px] font-bold px-2 py-0.5 rounded border ${recordStatus.className}`}>
@@ -1294,7 +1315,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setDetailModalDoc(null)}
-                  className="text-slate-400 hover:text-slate-700 p-1"
+                  className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center shrink-0"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -1623,17 +1644,17 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         const bookObj = bookMap.get(docBookId);
 
         return (
-          <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-            <div className="bg-white rounded-xl max-w-lg w-full p-6 shadow-xl space-y-4 animate-scaleUp max-h-[90vh] overflow-y-auto">
-              <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-                <div>
+          <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
+            <div className="bg-white rounded-xl max-w-lg w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[92dvh] overflow-y-auto">
+              <div className="flex items-center justify-between border-b border-slate-100 pb-3 gap-2">
+                <div className="min-w-0">
                   <h3 className="text-base font-bold text-slate-900">Sửa thông tin văn bản</h3>
-                  <span className="font-mono text-xs text-sky-800 font-semibold">{editModalDoc.fullDocNumber}</span>
+                  <span className="font-mono text-xs text-sky-800 font-semibold break-all">{editModalDoc.fullDocNumber}</span>
                 </div>
                 <button
                   type="button"
                   onClick={() => setEditModalDoc(null)}
-                  className="text-slate-400 hover:text-slate-700 p-1"
+                  className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center shrink-0"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -1646,13 +1667,13 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     type="text"
                     value={editFullDocNumber}
                     onChange={(e) => setEditFullDocNumber(e.target.value)}
-                    className="w-full h-8 px-2.5 bg-white border border-slate-300 rounded font-mono font-bold text-xs"
+                    className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded font-mono font-bold text-base sm:text-xs"
                   />
                 </div>
               ) : canManageThisBook ? (
                 <div className="p-3 bg-sky-50 border border-sky-200 rounded-lg text-sky-950 text-xs space-y-2">
                   <strong className="block font-semibold">Quyền Quản trị sổ: Có thể điều chỉnh số văn bản</strong>
-                  <div className="grid grid-cols-2 gap-3 pt-1">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-3 pt-1">
                     <div>
                       <label className="font-bold text-slate-700 block mb-1">Số thứ tự (STT)</label>
                       <input
@@ -1665,7 +1686,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                           const seqStr = val < 10 ? `0${val}` : `${val}`;
                           setEditFullDocNumber(`${seqStr}-${editModalDoc.typeCode}/${bookObj?.unitCode || settings?.unitCode || 'ĐTN'}`);
                         }}
-                        className="w-full h-8 px-2.5 bg-white border border-slate-300 rounded font-mono font-bold text-xs"
+                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded font-mono font-bold text-base sm:text-xs"
                       />
                     </div>
                     <div>
@@ -1674,7 +1695,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         type="text"
                         value={editFullDocNumber}
                         onChange={(e) => setEditFullDocNumber(e.target.value)}
-                        className="w-full h-8 px-2.5 bg-white border border-slate-300 rounded font-mono font-bold text-xs"
+                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded font-mono font-bold text-base sm:text-xs"
                       />
                     </div>
                   </div>
@@ -1689,7 +1710,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     value={editDocName}
                     onChange={(e) => setEditDocName(e.target.value)}
                     required
-                    className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg text-xs font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
 
@@ -1701,7 +1722,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         type="text"
                         value={editIssuingAgency}
                         onChange={(e) => setEditIssuingAgency(e.target.value)}
-                        className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg text-xs"
+                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                       />
                     </div>
                     <div className="space-y-1">
@@ -1712,7 +1733,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         onChange={(e) => setEditIssueDate(e.target.value)}
                         onBlur={(e) => setEditIssueDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
                         placeholder="dd/mm/yyyy"
-                        className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                       />
                     </div>
                     <div className="space-y-1">
@@ -1723,7 +1744,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         onChange={(e) => setEditSignDate(e.target.value)}
                         onBlur={(e) => setEditSignDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
                         placeholder="dd/mm/yyyy"
-                        className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg font-mono text-xs"
+                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
                       />
                     </div>
                   </div>
@@ -1735,11 +1756,11 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     value={editTitle}
                     onChange={(e) => setEditTitle(e.target.value)}
                     rows={3}
-                    className="w-full p-2.5 bg-white border border-slate-300 rounded-lg text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    className="w-full p-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
 
-                <div className="grid grid-cols-2 gap-3">
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <div className="space-y-1">
                     <label className="font-bold text-slate-700">Người ký *</label>
                     <input
@@ -1747,7 +1768,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                       value={editSigner}
                       onChange={(e) => setEditSigner(e.target.value)}
                       required
-                      className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg text-xs"
+                      className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                     />
                   </div>
                   <div className="space-y-1">
@@ -1757,7 +1778,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                       value={editSignerRole}
                       onChange={(e) => setEditSignerRole(e.target.value)}
                       required
-                      className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg text-xs"
+                      className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                     />
                   </div>
                 </div>
@@ -1768,7 +1789,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     type="text"
                     value={editNotes}
                     onChange={(e) => setEditNotes(e.target.value)}
-                    className="w-full h-9 px-2.5 bg-white border border-slate-300 rounded-lg text-xs"
+                    className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   />
                 </div>
 
@@ -1780,14 +1801,14 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                   <button
                     type="button"
                     onClick={() => setEditModalDoc(null)}
-                    className="px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                    className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
                   >
                     Hủy
                   </button>
                   <button
                     type="submit"
                     disabled={editSubmitting}
-                    className="px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs"
+                    className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs"
                   >
                     {editSubmitting ? 'Đang lưu...' : 'Lưu thay đổi'}
                   </button>
@@ -1800,15 +1821,15 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
       {/* MODAL 3: HỦY SỐ VĂN BẢN */}
       {cancelModalDoc && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-md w-full p-6 shadow-xl space-y-4 animate-scaleUp">
-            <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <div>
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
+          <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[92dvh] overflow-y-auto">
+            <div className="flex items-center justify-between border-b border-slate-100 pb-3 gap-2">
+              <div className="min-w-0">
                 <h3 className="text-base font-bold text-rose-700 flex items-center gap-2">
-                  <AlertTriangle className="w-5 h-5 text-rose-600" />
+                  <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0" />
                   <span>Xác nhận hủy số văn bản</span>
                 </h3>
-                <span className="font-mono text-xs font-bold text-slate-900">{cancelModalDoc.fullDocNumber}</span>
+                <span className="font-mono text-xs font-bold text-slate-900 break-all">{cancelModalDoc.fullDocNumber}</span>
               </div>
               <button
                 type="button"
@@ -1864,17 +1885,17 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
       {/* MODAL 4: XÓA VĨNH VIỄN (ADMIN) */}
       {deleteModalDoc && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-md w-full p-6 shadow-xl space-y-4 animate-scaleUp">
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
+          <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[92dvh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <h3 className="text-base font-bold text-rose-700 flex items-center gap-2">
-                <Trash2 className="w-5 h-5 text-rose-600" />
+                <Trash2 className="w-5 h-5 text-rose-600 shrink-0" />
                 <span>Xác nhận xóa vĩnh viễn văn bản</span>
               </h3>
               <button
                 type="button"
                 onClick={() => setDeleteModalDoc(null)}
-                className="text-slate-400 hover:text-slate-700 p-1"
+                className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center shrink-0"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1883,9 +1904,9 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-900 text-xs leading-relaxed space-y-1.5">
               <p>
                 Bạn có chắc chắn muốn xóa văn bản số{' '}
-                <strong className="font-mono text-rose-950 font-bold">{deleteModalDoc.fullDocNumber}</strong>?
+                <strong className="font-mono text-rose-950 font-bold break-all">{deleteModalDoc.fullDocNumber}</strong>?
               </p>
-              <p className="text-[11px] text-rose-800">
+              <p className="text-[11px] text-rose-800 break-words">
                 <strong>Tên văn bản:</strong> {deleteModalDoc.docName || deleteModalDoc.title}
               </p>
             </div>
@@ -1896,7 +1917,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               <button
                 type="button"
                 onClick={() => setDeleteModalDoc(null)}
-                className="px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
               >
                 Hủy bỏ
               </button>
@@ -1904,7 +1925,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 type="button"
                 onClick={handleConfirmDelete}
                 disabled={deleteSubmitting}
-                className="px-4 py-2 text-xs font-semibold bg-rose-700 hover:bg-rose-800 text-white rounded-lg shadow-xs"
+                className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-rose-700 hover:bg-rose-800 text-white rounded-lg shadow-xs"
               >
                 {deleteSubmitting ? 'Đang xóa...' : 'Xác nhận xóa vĩnh viễn'}
               </button>
@@ -1919,8 +1940,8 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         const isReplace = uploadModalMode === 'replace';
 
         return (
-          <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-            <div className="bg-white rounded-xl max-w-lg w-full p-6 shadow-xl space-y-4 animate-scaleUp">
+          <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-2.5 sm:p-4">
+            <div className="bg-white rounded-xl max-w-lg w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[92dvh] overflow-y-auto">
               <div className="flex items-center justify-between border-b border-slate-100 pb-3">
                 <div>
                   <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">

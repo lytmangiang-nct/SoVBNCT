@@ -31,7 +31,9 @@
       "appsScriptUrl": "",
       "serviceAccountJson": "",
       "serviceAccountEmail": ""
-    }
+    },
+    "configVersion": 1,
+    "updatedAt": "2026-11-15T13:46:14.996Z"
   },
   "documentTypes": [
     {
@@ -338,7 +340,9 @@
       ],
       "isActive": true,
       "createdAt": "2026-11-14T14:47:03.620Z",
-      "code": "DOAN_TRUONG"
+      "code": "DOAN_TRUONG",
+      "configVersion": 1,
+      "updatedAt": "2026-11-14T14:47:03.620Z"
     },
     {
       "id": "book-chi-bo",
@@ -363,7 +367,9 @@
         }
       ],
       "isActive": true,
-      "createdAt": "2026-11-15T12:31:28.400Z"
+      "createdAt": "2026-11-15T12:31:28.400Z",
+      "configVersion": 1,
+      "updatedAt": "2026-11-15T12:31:28.400Z"
     },
     {
       "id": "book-nha-truong",
@@ -388,7 +394,9 @@
         }
       ],
       "isActive": true,
-      "createdAt": "2026-11-15T12:31:28.400Z"
+      "createdAt": "2026-11-15T12:31:28.400Z",
+      "configVersion": 1,
+      "updatedAt": "2026-11-15T12:31:28.400Z"
     }
   ],
   "numberRequests": [],

@@ -137,6 +137,13 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     if (errorData.conflictingFileName) err.conflictingFileName = errorData.conflictingFileName;
     if (errorData.suggestedSuffixName) err.suggestedSuffixName = errorData.suggestedSuffixName;
     if (errorData.officialDocNumberPreview) err.officialDocNumberPreview = errorData.officialDocNumberPreview;
+    if (errorData.serverVersion !== undefined) err.serverVersion = errorData.serverVersion;
+    if (errorData.serverBook) err.serverBook = errorData.serverBook;
+    if (errorData.previousYear !== undefined) err.previousYear = errorData.previousYear;
+    if (errorData.currentYear !== undefined) err.currentYear = errorData.currentYear;
+    if (errorData.formattedDate) err.formattedDate = errorData.formattedDate;
+    if (errorData.previewNumber) err.previewNumber = errorData.previewNumber;
+    if (errorData.sequenceNumber !== undefined) err.sequenceNumber = errorData.sequenceNumber;
     throw err;
   }
 
@@ -173,6 +180,14 @@ function buildExportQuery(params: ExportFilterParams, token: string | null): str
 }
 
 export const api = {
+  getHealth: async (): Promise<{
+    status: string;
+    app: string;
+    timeVietnam: { year: number; month: number; day: number; formattedDate: string };
+  }> => {
+    return request('/api/health');
+  },
+
   // Auth
   login: async (username: string, password: string, rememberMe = false): Promise<AuthResponse> => {
     return request<AuthResponse>('/api/auth/login', {
@@ -245,8 +260,14 @@ export const api = {
   },
 
   // Registry Books
-  getBooks: async (): Promise<{ books: RegistryBook[] }> => {
-    return request<{ books: RegistryBook[] }>('/api/books');
+  getBooks: async (): Promise<{
+    books: RegistryBook[];
+    serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+  }> => {
+    return request<{
+      books: RegistryBook[];
+      serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+    }>('/api/books');
   },
 
   createBook: async (payload: {
@@ -277,6 +298,8 @@ export const api = {
       enabledTypeCodes: string[];
       signers: SignerConfig[];
       isActive: boolean;
+      expectedVersion: number;
+      forceOverwrite: boolean;
     }>
   ): Promise<{ book: RegistryBook }> => {
     return request<{ book: RegistryBook }>(`/api/books/${encodeURIComponent(id)}`, {
@@ -332,11 +355,23 @@ export const api = {
   },
 
   // Settings
-  getSettings: async (): Promise<{ settings: SystemSettings; documentTypes: DocumentTypeConfig[]; signers: SignerConfig[] }> => {
-    return request<{ settings: SystemSettings; documentTypes: DocumentTypeConfig[]; signers: SignerConfig[] }>('/api/settings');
+  getSettings: async (): Promise<{
+    settings: SystemSettings;
+    documentTypes: DocumentTypeConfig[];
+    signers: SignerConfig[];
+    serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+  }> => {
+    return request<{
+      settings: SystemSettings;
+      documentTypes: DocumentTypeConfig[];
+      signers: SignerConfig[];
+      serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+    }>('/api/settings');
   },
 
-  updateSettings: async (settings: Partial<SystemSettings> & { bookId?: string }): Promise<{ settings: SystemSettings; book?: RegistryBook }> => {
+  updateSettings: async (
+    settings: Partial<SystemSettings> & { bookId?: string; expectedVersion?: number; forceOverwrite?: boolean }
+  ): Promise<{ settings: SystemSettings; book?: RegistryBook }> => {
     return request<{ settings: SystemSettings; book?: RegistryBook }>('/api/settings', {
       method: 'PUT',
       body: JSON.stringify(settings),
@@ -346,11 +381,13 @@ export const api = {
   updateNumberMode: async (
     newMode: 'separate' | 'shared',
     confirmationText?: string,
-    bookId?: string
+    bookId?: string,
+    expectedVersion?: number,
+    forceOverwrite?: boolean
   ): Promise<{ success: boolean; settings: SystemSettings; book?: RegistryBook }> => {
     return request<{ success: boolean; settings: SystemSettings; book?: RegistryBook }>('/api/settings/number-mode', {
       method: 'POST',
-      body: JSON.stringify({ newMode, confirmationText, bookId }),
+      body: JSON.stringify({ newMode, confirmationText, bookId, expectedVersion, forceOverwrite }),
     });
   },
 
@@ -358,11 +395,25 @@ export const api = {
     year: number,
     typeCode: string,
     startSequence: number,
-    bookId?: string
-  ): Promise<{ success: boolean; book?: RegistryBook }> => {
-    return request<{ success: boolean; book?: RegistryBook }>('/api/settings/start-sequence', {
+    bookId?: string,
+    expectedVersion?: number,
+    forceOverwrite?: boolean
+  ): Promise<{
+    success: boolean;
+    customStartSequences?: Record<string, number>;
+    customStartSequence?: number;
+    nextExpectedSeq?: number;
+    book?: RegistryBook;
+  }> => {
+    return request<{
+      success: boolean;
+      customStartSequences?: Record<string, number>;
+      customStartSequence?: number;
+      nextExpectedSeq?: number;
+      book?: RegistryBook;
+    }>('/api/settings/start-sequence', {
       method: 'POST',
-      body: JSON.stringify({ year, typeCode, startSequence, bookId }),
+      body: JSON.stringify({ year, typeCode, startSequence, bookId, expectedVersion, forceOverwrite }),
     });
   },
 
@@ -409,9 +460,10 @@ export const api = {
   },
 
   // Number Preview
-  previewNumber: async (typeCode: string, bookId?: string): Promise<PreviewNumberResponse> => {
+  previewNumber: async (typeCode: string, bookId?: string, year?: number): Promise<PreviewNumberResponse> => {
     const q = new URLSearchParams({ typeCode });
     if (bookId) q.append('bookId', bookId);
+    if (year) q.append('year', String(year));
     return request<PreviewNumberResponse>(`/api/documents/preview?${q.toString()}`);
   },
 
@@ -465,6 +517,7 @@ export const api = {
     attachmentSize?: number;
     conflictAction?: 'suffix' | 'overwrite';
     customFileName?: string;
+    expectedYear?: number;
   }): Promise<{ document: DocumentRecord; duplicatePrevented?: boolean }> => {
     return request<{ document: DocumentRecord; duplicatePrevented?: boolean }>('/api/documents/issue', {
       method: 'POST',
@@ -740,7 +793,7 @@ export const api = {
 
   saveBookGoogleSheetsConfig: async (
     bookId: string,
-    config: { enabled: boolean; webhookUrl: string }
+    config: { enabled: boolean; webhookUrl: string; expectedVersion?: number; forceOverwrite?: boolean }
   ): Promise<{ book: RegistryBook }> => {
     return request<{ book: RegistryBook }>(`/api/books/${encodeURIComponent(bookId)}/google-sheets`, {
       method: 'POST',
@@ -759,6 +812,8 @@ export const api = {
     serviceAccountJson?: string;
     clearServiceAccountJson?: boolean;
     scopeUnitCode?: string;
+    expectedVersion?: number;
+    forceOverwrite?: boolean;
   }): Promise<{ googleDriveConfig: GoogleDriveConfig; book?: RegistryBook }> => {
     return request<{ googleDriveConfig: GoogleDriveConfig; book?: RegistryBook }>('/api/drive/config', {
       method: 'POST',

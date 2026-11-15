@@ -54,6 +54,9 @@ interface IssueNumberViewProps {
   signers: SignerConfig[];
   documents?: DocumentRecord[];
   numberRequests: NumberRequest[];
+  serverYear?: number;
+  serverFormattedDate?: string;
+  onServerTimeUpdate?: (year: number, formattedDate?: string) => void;
   onRefreshRequests: () => void;
   onDocumentIssued: (doc: DocumentRecord) => void;
   onDocumentUpdated?: (doc: DocumentRecord) => void;
@@ -72,6 +75,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   signers: globalSigners,
   documents = [],
   numberRequests,
+  serverYear,
+  serverFormattedDate,
+  onServerTimeUpdate,
   onRefreshRequests,
   onDocumentIssued,
   onDocumentUpdated,
@@ -156,7 +162,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   const maxWordFileSizeMB = settings.googleDriveConfig?.maxFileSizeMB || DEFAULT_MAX_WORD_MB;
   const maxWordFileSizeBytes = settings.googleDriveConfig?.maxFileSizeBytes || maxWordFileSizeMB * 1024 * 1024;
 
-  const [todayVietnam] = useState<string>(() => {
+  const [todayVietnam, setTodayVietnam] = useState<string>(() => {
+    if (serverFormattedDate) return serverFormattedDate;
     const formatter = new Intl.DateTimeFormat('en-CA', {
       timeZone: 'Asia/Ho_Chi_Minh',
       year: 'numeric',
@@ -166,6 +173,45 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     const [y, m, d] = formatter.format(new Date()).split('-');
     return `${d}/${m}/${y}`;
   });
+
+  const [formYear, setFormYear] = useState<number>(() => {
+    if (serverYear) return serverYear;
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      year: 'numeric',
+    });
+    return parseInt(formatter.format(new Date()), 10);
+  });
+
+  const [yearRolloverNotice, setYearRolloverNotice] = useState<{
+    fromYear: number;
+    toYear: number;
+    newPreviewNumber?: string;
+    confirmed: boolean;
+  } | null>(null);
+
+  const hasOpenFormDraft = Boolean(docName.trim() || title.trim() || notes.trim() || selectedFile);
+
+  useEffect(() => {
+    if (serverFormattedDate) {
+      setTodayVietnam(serverFormattedDate);
+    }
+  }, [serverFormattedDate]);
+
+  useEffect(() => {
+    if (!serverYear || serverYear === formYear) return;
+    if (hasOpenFormDraft) {
+      setYearRolloverNotice({
+        fromYear: formYear,
+        toYear: serverYear,
+        newPreviewNumber: nextNumber && nextNumber !== '...' && nextNumber !== '---' ? nextNumber : undefined,
+        confirmed: false,
+      });
+    } else {
+      setFormYear(serverYear);
+      setYearRolloverNotice(null);
+    }
+  }, [serverYear, formYear, hasOpenFormDraft, nextNumber]);
 
   // Reset signer default when book changes
   useEffect(() => {
@@ -198,6 +244,26 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         const res = await api.previewNumber(typeCode, activeBook.id);
         if (active) {
           setNextNumber(res.previewNumber);
+          if (res.formattedDate) {
+            setTodayVietnam(res.formattedDate);
+          }
+          const latestSrvYear = res.serverYear || res.year;
+          if (latestSrvYear) {
+            onServerTimeUpdate?.(latestSrvYear, res.formattedDate);
+            if (latestSrvYear !== formYear) {
+              if (docName.trim() || title.trim() || notes.trim() || selectedFile) {
+                setYearRolloverNotice({
+                  fromYear: formYear,
+                  toYear: latestSrvYear,
+                  newPreviewNumber: res.previewNumber,
+                  confirmed: false,
+                });
+              } else {
+                setFormYear(latestSrvYear);
+                setYearRolloverNotice(null);
+              }
+            }
+          }
         }
       } catch {
         if (active) {
@@ -223,7 +289,18 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       window.removeEventListener('focus', handleRecheck);
       document.removeEventListener('visibilitychange', handleRecheck);
     };
-  }, [typeCode, activeBook.id, activeBook.numberMode, documents.length, documents[0]?.id, canIssue, canRequest, canView]);
+  }, [
+    typeCode,
+    activeBook.id,
+    activeBook.numberMode,
+    activeBook.configVersion,
+    serverYear,
+    documents.length,
+    documents[0]?.id,
+    canIssue,
+    canRequest,
+    canView,
+  ]);
 
   const handleSignerSelect = (e: React.ChangeEvent<HTMLSelectElement>) => {
     const val = e.target.value;
@@ -349,6 +426,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       }
     }
 
+    if (yearRolloverNotice && !yearRolloverNotice.confirmed) {
+      setSubmitError(
+        `Hệ thống vừa chuyển sang năm mới ${yearRolloverNotice.toYear} (giờ Việt Nam). Vui lòng xác nhận chuyển năm ở khung thông báo phía trên trước khi cấp số.`
+      );
+      return;
+    }
+
     setIsSubmitting(true);
     setUploadStep(selectedFile ? 'issuing' : 'idle');
     setRetryError(null);
@@ -370,14 +454,19 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         attachmentName: fileToUpload?.name,
         attachmentSize: fileToUpload?.size,
         conflictAction,
+        expectedYear: yearRolloverNotice?.confirmed ? yearRolloverNotice.toYear : formYear,
       });
 
       issuedDoc = res.document;
+      setYearRolloverNotice(null);
+      setFormYear(issuedDoc.year);
       setIssuedSuccessDoc(issuedDoc);
       onDocumentIssued(issuedDoc);
 
       api.previewNumber(typeCode.trim().toUpperCase(), activeBook.id).then((preview) => {
         setNextNumber(preview.previewNumber);
+        if (preview.formattedDate) setTodayVietnam(preview.formattedDate);
+        if (preview.serverYear) onServerTimeUpdate?.(preview.serverYear, preview.formattedDate);
       }).catch(() => {});
 
       if (fileToUpload) {
@@ -414,7 +503,18 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       }
     } catch (err: any) {
       setUploadStep('idle');
-      if (err.code === 'FILENAME_CONFLICT' && err.existingDocument) {
+      if (err.code === 'YEAR_CHANGED' && err.currentYear) {
+        if (err.previewNumber) setNextNumber(err.previewNumber);
+        if (err.formattedDate) setTodayVietnam(err.formattedDate);
+        onServerTimeUpdate?.(err.currentYear, err.formattedDate);
+        setYearRolloverNotice({
+          fromYear: err.previousYear || formYear,
+          toYear: err.currentYear,
+          newPreviewNumber: err.previewNumber,
+          confirmed: false,
+        });
+        setSubmitError(null);
+      } else if (err.code === 'FILENAME_CONFLICT' && err.existingDocument) {
         setFilenameConflict({
           conflictingFileName: err.conflictingFileName || '',
           suggestedSuffixName: err.suggestedSuffixName || '',
@@ -523,12 +623,19 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     setPendingRetryFile(null);
     setRetryError(null);
     setUploadStep('idle');
+    setYearRolloverNotice(null);
+    if (serverYear) setFormYear(serverYear);
     if (fileInputRef.current) fileInputRef.current.value = '';
     setIdempotencyKey(generateKey());
 
     if (typeCode) {
       api.previewNumber(typeCode, activeBook.id).then((preview) => {
         setNextNumber(preview.previewNumber);
+        if (preview.formattedDate) setTodayVietnam(preview.formattedDate);
+        if (preview.serverYear) {
+          setFormYear(preview.serverYear);
+          onServerTimeUpdate?.(preview.serverYear, preview.formattedDate);
+        }
       }).catch(() => {});
     }
   };
@@ -631,14 +738,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   );
 
   return (
-    <div className="max-w-4xl mx-auto py-8 px-4 sm:px-6 space-y-6">
+    <div className="max-w-4xl mx-auto py-5 sm:py-8 px-3 sm:px-6 space-y-5 sm:space-y-6">
       {/* Banner Intro + Book Switcher */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
-        <div>
-          <h1 className="text-2xl font-bold tracking-tight text-slate-900">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
+        <div className="min-w-0">
+          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
             {canIssue ? 'Cấp Số Văn Bản Tự Động' : 'Xin Số Văn Bản'}
           </h1>
-          <p className="text-sm text-slate-600 mt-1">
+          <p className="text-xs sm:text-sm text-slate-600 mt-1 leading-relaxed">
             {canIssue
               ? `Cấp số chính thức vào ${activeBook.name} (${activeBook.unitCode}) theo thứ tự nguyên tử và chống trùng số.`
               : `Gửi yêu cầu xin số vào ${activeBook.name} (${activeBook.unitCode}) để người có quyền Cấp số duyệt và cấp số chính thức.`}
@@ -646,9 +753,10 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         </div>
 
         {issueAccessibleBooks.length > 1 && (
-          <div className="flex items-center gap-1.5 bg-white border border-slate-300 rounded-lg px-3 py-2 shadow-2xs text-xs shrink-0">
-            <BookOpen className="w-3.5 h-3.5 text-sky-700" />
+          <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-3 py-2 min-h-[44px] sm:min-h-[40px] shadow-2xs text-xs w-full sm:w-auto min-w-0 shrink-0">
+            <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />
             <select
+              aria-label="Chọn sổ làm việc"
               value={activeBook.id}
               onChange={(e) => {
                 onSelectBook(e.target.value);
@@ -656,7 +764,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 setRequestSuccess(null);
                 setSubmitError(null);
               }}
-              className="font-semibold text-slate-800 bg-transparent focus:outline-hidden cursor-pointer"
+              className="flex-1 sm:flex-initial min-w-0 font-semibold text-base sm:text-xs text-slate-800 bg-transparent focus:outline-hidden cursor-pointer"
             >
               {issueAccessibleBooks.map((b) => (
                 <option key={b.id} value={b.id}>
@@ -787,16 +895,16 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         const driveSaved = issuedSuccessDoc.driveStatus === 'saved';
 
         return (
-          <div className={`p-6 ${successStyle.previewBg} border ${successStyle.previewBorder} rounded-xl shadow-xs transition-all animate-fadeIn`}>
-            <div className="flex items-start gap-4">
-              <div className={`w-12 h-12 rounded-full ${successStyle.dotColor} flex items-center justify-center text-white shrink-0 shadow-xs`}>
-                <CheckCircle2 className="w-7 h-7" />
+          <div className={`p-4 sm:p-6 ${successStyle.previewBg} border ${successStyle.previewBorder} rounded-xl shadow-xs transition-all animate-fadeIn`}>
+            <div className="flex flex-col sm:flex-row items-start gap-3 sm:gap-4">
+              <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full ${successStyle.dotColor} flex items-center justify-center text-white shrink-0 shadow-xs`}>
+                <CheckCircle2 className="w-6 h-6 sm:w-7 sm:h-7" />
               </div>
 
-              <div className="flex-1 min-w-0">
-                <div className="flex flex-wrap items-center justify-between gap-3">
-                  <div>
-                    <div className="flex flex-wrap items-center gap-2 mb-1">
+              <div className="flex-1 w-full min-w-0">
+                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
+                  <div className="min-w-0">
+                    <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 mb-1">
                       {driveFailed ? (
                         <span className="text-xs font-bold px-2.5 py-0.5 rounded bg-rose-100 text-rose-900 border border-rose-300">
                           Đã cấp số · Lưu tệp thất bại
@@ -828,12 +936,12 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       </span>
                     </div>
 
-                    <div className={`text-3xl font-extrabold ${successStyle.previewText} font-mono tracking-tight mt-1 flex items-center gap-3 flex-wrap`}>
-                      <span>{issuedSuccessDoc.fullDocNumber}</span>
+                    <div className={`text-2xl sm:text-3xl font-extrabold ${successStyle.previewText} font-mono tracking-tight mt-1 flex items-center gap-2.5 sm:gap-3 flex-wrap`}>
+                      <span className="break-all">{issuedSuccessDoc.fullDocNumber}</span>
                       <button
                         type="button"
                         onClick={() => handleCopyDocNumber(issuedSuccessDoc.fullDocNumber)}
-                        className={`inline-flex items-center gap-1.5 px-3 py-1 text-xs font-semibold rounded-md bg-white border ${successStyle.badgeBorder} ${successStyle.badgeText} hover:bg-slate-50 transition-colors shadow-2xs`}
+                        className={`inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-md bg-white border ${successStyle.badgeBorder} ${successStyle.badgeText} hover:bg-slate-50 transition-colors shadow-2xs`}
                         title="Sao chép số văn bản"
                       >
                         {copied ? (
@@ -851,13 +959,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2">
+                  <div className="flex flex-wrap items-center gap-2">
                     <button
                       type="button"
                       onClick={handleIssueNext}
-                      className="flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs transition-colors"
+                      className="flex-1 sm:flex-initial justify-center flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs transition-colors"
                     >
-                      <RotateCcw className="w-4 h-4" />
+                      <RotateCcw className="w-4 h-4 shrink-0" />
                       <span>Cấp số tiếp theo</span>
                     </button>
 
@@ -865,10 +973,10 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       <button
                         type="button"
                         onClick={onNavigateToRegistry}
-                        className="flex items-center gap-2 px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 rounded-lg shadow-2xs transition-colors"
+                        className="flex-1 sm:flex-initial justify-center flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 rounded-lg shadow-2xs transition-colors"
                       >
                         <span>Xem sổ theo dõi</span>
-                        <ArrowRight className="w-4 h-4 text-slate-500" />
+                        <ArrowRight className="w-4 h-4 text-slate-500 shrink-0" />
                       </button>
                     )}
                   </div>
@@ -876,19 +984,19 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
                 {/* Record Summary */}
                 <div className={`mt-4 pt-4 border-t ${successStyle.previewBorder} grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-700`}>
-                  <div>
+                  <div className="min-w-0">
                     <span className="text-slate-500 block">Tên văn bản:</span>
-                    <p className="font-bold text-slate-900 mt-0.5">{issuedSuccessDoc.docName || issuedSuccessDoc.title}</p>
+                    <p className="font-bold text-slate-900 mt-0.5 break-words">{issuedSuccessDoc.docName || issuedSuccessDoc.title}</p>
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <span className="text-slate-500 block">Trích yếu:</span>
-                    <p className="font-medium text-slate-700 mt-0.5 line-clamp-2">
+                    <p className="font-medium text-slate-700 mt-0.5 line-clamp-2 break-words">
                       {issuedSuccessDoc.title || <span className="italic text-slate-400">Không có</span>}
                     </p>
                   </div>
-                  <div>
+                  <div className="min-w-0">
                     <span className="text-slate-500 block">Người ký:</span>
-                    <p className="font-medium text-slate-900 mt-0.5">
+                    <p className="font-medium text-slate-900 mt-0.5 break-words">
                       {issuedSuccessDoc.signer} ({issuedSuccessDoc.signerRole})
                     </p>
                   </div>
@@ -910,17 +1018,17 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     <div className="mt-4 pt-3.5 border-t border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white/95 p-3.5 rounded-lg border border-slate-200/90 shadow-2xs">
                       <div className="space-y-0.5 min-w-0">
                         <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wide flex items-center gap-1.5">
-                          <FileText className="w-3.5 h-3.5 text-sky-600" />
-                          <span>Tên tệp sẽ lưu (theo số chính thức {issuedSuccessDoc.fullDocNumber}):</span>
+                          <FileText className="w-3.5 h-3.5 text-sky-600 shrink-0" />
+                          <span>Tên tệp sẽ lưu ({issuedSuccessDoc.fullDocNumber}):</span>
                         </span>
-                        <p className="font-mono text-xs sm:text-sm font-bold text-slate-900 truncate">
+                        <p className="font-mono text-xs sm:text-sm font-bold text-slate-900 break-all sm:break-words">
                           {officialFileName}
                         </p>
                       </div>
                       <button
                         type="button"
                         onClick={() => handleCopyFileName(officialFileName, true)}
-                        className="inline-flex items-center gap-1.5 px-3.5 py-1.5 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-md shadow-2xs transition-colors shrink-0"
+                        className="inline-flex items-center justify-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-md shadow-2xs transition-colors shrink-0 w-full sm:w-auto"
                       >
                         {copiedSuccessFileName ? (
                           <>
@@ -948,7 +1056,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             <FolderCheck className="w-4 h-4 text-emerald-600 shrink-0" />
                             <span>Đã đổi tên và lưu tệp lên Google Drive</span>
                           </div>
-                          <p className="font-mono text-xs font-semibold text-emerald-800 truncate">
+                          <p className="font-mono text-xs font-semibold text-emerald-800 break-all">
                             {issuedSuccessDoc.driveFileName}
                           </p>
                           {issuedSuccessDoc.driveFileSize && (
@@ -1043,17 +1151,17 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
       {/* Main Form (Issue or Request depending on permission) */}
       {(canIssue || canRequest) && (
-        <div className="bg-white border border-slate-200 rounded-xl p-6 sm:p-8 shadow-xs">
-          <form onSubmit={handleSubmit} className="space-y-6">
+        <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-8 shadow-xs">
+          <form onSubmit={handleSubmit} className="space-y-5 sm:space-y-6">
             {/* Top row: Loại văn bản & Số dự kiến */}
             {(() => {
               const selectedDocType = activeTypes.find((t) => t.code === typeCode);
               const currentStyle = getTypeColorStyle(typeCode, selectedDocType?.color);
 
               return (
-                <div className="grid grid-cols-1 md:grid-cols-12 gap-6 items-start">
-                  <div className="md:col-span-7 space-y-2">
-                    <div className="flex items-center justify-between">
+                <div className="grid grid-cols-1 md:grid-cols-12 gap-4 sm:gap-6 items-start">
+                  <div className="md:col-span-7 space-y-2 min-w-0">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
                       <label htmlFor="doc-type" className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                         Loại văn bản <span className="text-rose-600">*</span>
                       </label>
@@ -1067,7 +1175,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             setAddTypeError(null);
                             setShowAddTypeModal(true);
                           }}
-                          className="text-xs font-semibold text-sky-700 hover:text-sky-900 transition-colors flex items-center gap-1"
+                          className="text-xs font-semibold text-sky-700 hover:text-sky-900 transition-colors flex items-center gap-1 min-h-[32px]"
                         >
                           <Plus className="w-3.5 h-3.5" />
                           <span>Thêm loại văn bản</span>
@@ -1079,7 +1187,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       id="doc-type"
                       value={typeCode}
                       onChange={(e) => setTypeCode(e.target.value)}
-                      className="w-full h-10 px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors"
+                      className="w-full min-h-[44px] h-11 px-3 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors"
                       disabled={isSubmitting}
                     >
                       {activeTypes.map((type) => (
@@ -1088,13 +1196,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         </option>
                       ))}
                     </select>
-                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
-                      <span className="text-xs text-slate-500">
-                        Sổ: <strong className="text-slate-700">{activeBook.name}</strong> · Ký hiệu đơn vị:{' '}
-                        <strong className="text-slate-700">{activeBook.unitCode}</strong> ({activeBook.unitName})
+                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
+                      <span className="text-xs text-slate-500 break-words">
+                        Sổ đang chọn: <strong className="text-slate-800">{activeBook.name}</strong> · Ký hiệu:{' '}
+                        <strong className="text-slate-800">{activeBook.unitCode}</strong>
                       </span>
                       {issueAccessibleBooks.length > 1 && (
-                        <div className="inline-flex items-center gap-1.5 text-xs bg-sky-50 border border-sky-200 rounded-md px-2 py-1">
+                        <div className="inline-flex items-center gap-1.5 text-xs bg-sky-50 border border-sky-200 rounded-md px-2.5 py-1.5 min-h-[38px] w-full sm:w-auto min-w-0">
                           <BookOpen className="w-3.5 h-3.5 text-sky-700 shrink-0" />
                           <select
                             aria-label="Chọn sổ cấp số"
@@ -1106,7 +1214,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                               setSubmitError(null);
                             }}
                             disabled={isSubmitting}
-                            className="font-bold text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
+                            className="flex-1 sm:flex-initial min-w-0 font-bold text-base sm:text-xs text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
                           >
                             {issueAccessibleBooks.map((b) => (
                               <option key={b.id} value={b.id}>
@@ -1120,17 +1228,17 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   </div>
 
                   {/* Số dự kiến tiếp theo */}
-                  <div className={`md:col-span-5 ${currentStyle.previewBg} border ${currentStyle.previewBorder} rounded-xl p-4 flex flex-col justify-between shadow-xs transition-all`}>
-                    <div className="flex items-center justify-between text-xs mb-1.5 gap-1.5">
+                  <div className={`md:col-span-5 ${currentStyle.previewBg} border ${currentStyle.previewBorder} rounded-xl p-4 flex flex-col justify-between shadow-xs transition-all min-w-0`}>
+                    <div className="flex items-center justify-between text-xs mb-1.5 gap-1.5 flex-wrap">
                       <span className={`font-bold uppercase tracking-wider ${currentStyle.previewText} flex items-center gap-1.5`}>
-                        <span className={`w-2 h-2 rounded-full ${currentStyle.dotColor}`} />
-                        <span>{canIssue ? 'Số cấp tiếp theo (dự kiến)' : 'Số tham khảo hiện tại'}</span>
+                        <span className={`w-2 h-2 rounded-full shrink-0 ${currentStyle.dotColor}`} />
+                        <span>{canIssue ? 'Số dự kiến tiếp theo' : 'Số tham khảo hiện tại'}</span>
                       </span>
                       <span className={`text-[11px] font-semibold px-2 py-0.5 rounded-md border ${currentStyle.previewTag}`}>
                         {selectedDocType?.name || typeCode}
                       </span>
                     </div>
-                    <div className={`text-2xl sm:text-3xl font-black font-mono ${currentStyle.previewText} tracking-tight flex items-center gap-2 py-1`}>
+                    <div className={`text-2xl sm:text-3xl font-black font-mono ${currentStyle.previewText} tracking-tight flex items-center gap-2 py-1 break-all`}>
                       {loadingNextNumber ? (
                         <span className="text-xs font-normal text-slate-500">Đang cập nhật...</span>
                       ) : (
@@ -1139,7 +1247,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     </div>
                     <div className="flex items-center justify-between mt-1 text-[11px] text-slate-600 gap-1.5 flex-wrap">
                       <span className="font-semibold text-slate-700">
-                        {activeBook.name} · {activeBook.numberMode === 'shared' ? 'Dãy số chung' : `Dãy riêng ${typeCode}`}
+                        {activeBook.name} · {activeBook.numberMode === 'shared' ? 'Dãy số chung' : `Dãy riêng ${typeCode}`} · Năm {yearRolloverNotice ? yearRolloverNotice.toYear : formYear}
                       </span>
                       <span className="font-medium text-emerald-700 bg-white/90 px-1.5 py-0.5 rounded border border-emerald-200">
                         Tự động nối tiếp
@@ -1152,11 +1260,11 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
             {/* Tên văn bản */}
             <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <label htmlFor="doc-name" className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                   Tên văn bản <span className="text-rose-600">*</span>
                 </label>
-                <span className="text-[11px] text-rose-600 font-semibold bg-rose-50 px-2 py-0.5 rounded border border-rose-200">
+                <span className="text-[11px] text-rose-600 font-semibold bg-rose-50 px-2 py-0.5 rounded border border-rose-200 shrink-0">
                   Bắt buộc
                 </span>
               </div>
@@ -1167,7 +1275,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 onChange={(e) => setDocName(e.target.value)}
                 placeholder="Ví dụ: Kế hoạch tổ chức hoạt động chào mừng ngày 20-11..."
                 required
-                className="w-full h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors placeholder:text-slate-400"
+                className="w-full min-h-[44px] h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors placeholder:text-slate-400"
                 disabled={isSubmitting}
               />
 
@@ -1177,10 +1285,10 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 const suggestedFileName = generateSuggestedFileName(previewDocNumber, docName);
 
                 return (
-                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 sm:p-4 space-y-2 mt-2">
+                  <div className="bg-slate-50 border border-slate-200 rounded-xl p-3 sm:p-4 space-y-2 mt-2">
                     <div className="flex items-center justify-between flex-wrap gap-2">
                       <div className="flex items-center gap-1.5 text-xs font-bold text-slate-800 uppercase tracking-wide">
-                        <FileText className="w-4 h-4 text-sky-600" />
+                        <FileText className="w-4 h-4 text-sky-600 shrink-0" />
                         <span>Tên tệp dự kiến (Số ký hiệu - Tên văn bản)</span>
                       </div>
                       <span className="text-[11px] font-medium text-slate-600 bg-white px-2 py-0.5 rounded border border-slate-200">
@@ -1188,8 +1296,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       </span>
                     </div>
 
-                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                      <div className="flex-1 px-3.5 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs sm:text-sm font-bold text-slate-900 select-all overflow-x-auto whitespace-nowrap shadow-2xs flex items-center min-h-10">
+                    <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 min-w-0">
+                      <div className="flex-1 min-w-0 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs sm:text-sm font-bold text-slate-900 select-all break-all sm:break-words sm:overflow-x-auto shadow-2xs flex items-center min-h-[42px]">
                         {suggestedFileName ? (
                           <span className="text-sky-950 font-bold">{suggestedFileName}</span>
                         ) : (
@@ -1203,7 +1311,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         type="button"
                         onClick={() => handleCopyFileName(suggestedFileName)}
                         disabled={!suggestedFileName}
-                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-slate-700 hover:text-sky-700 border border-slate-300 hover:border-sky-300 rounded-lg shadow-2xs transition-colors shrink-0 disabled:opacity-50"
+                        className="inline-flex items-center justify-center gap-1.5 min-h-[42px] px-4 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-slate-700 hover:text-sky-700 border border-slate-300 hover:border-sky-300 rounded-lg shadow-2xs transition-colors shrink-0 disabled:opacity-50 w-full sm:w-auto"
                       >
                         {copiedFileName ? (
                           <>
@@ -1225,11 +1333,11 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
             {/* Trích yếu */}
             <div className="space-y-1.5">
-              <div className="flex items-center justify-between">
+              <div className="flex items-center justify-between gap-2">
                 <label htmlFor="doc-title" className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                   Trích yếu / Nội dung văn bản
                 </label>
-                <span className="text-[11px] text-slate-400 font-normal">Không bắt buộc</span>
+                <span className="text-[11px] text-slate-400 font-normal shrink-0">Không bắt buộc</span>
               </div>
               <textarea
                 id="doc-title"
@@ -1237,14 +1345,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 onChange={(e) => setTitle(e.target.value)}
                 placeholder="Tóm tắt mục đích, nội dung chính của văn bản (nếu có)..."
                 rows={3}
-                className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors placeholder:text-slate-400"
+                className="w-full px-3.5 py-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors placeholder:text-slate-400"
                 disabled={isSubmitting}
               />
             </div>
 
             {/* Signer & Role */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
-              <div className="space-y-1.5">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6">
+              <div className="space-y-1.5 min-w-0">
                 <label htmlFor="signer-select" className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                   Người ký <span className="text-rose-600">*</span>
                 </label>
@@ -1254,7 +1362,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     id="signer-select"
                     value={signer}
                     onChange={handleSignerSelect}
-                    className="w-full h-11 px-3 py-2 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors"
+                    className="w-full min-h-[44px] h-11 px-3 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors"
                     disabled={isSubmitting}
                   >
                     {effectiveSigners.map((s) => (
@@ -1272,7 +1380,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       onChange={(e) => setSigner(e.target.value)}
                       placeholder="Họ và tên người ký"
                       required
-                      className="w-full h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                      className="w-full min-h-[44px] h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                       disabled={isSubmitting}
                     />
                     <button
@@ -1284,7 +1392,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                           setSignerRole(effectiveSigners[0].role);
                         }
                       }}
-                      className="text-xs text-sky-700 hover:underline font-medium"
+                      className="text-xs text-sky-700 hover:underline font-medium min-h-[32px]"
                     >
                       Chọn lại từ danh sách có sẵn
                     </button>
@@ -1292,7 +1400,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 )}
               </div>
 
-              <div className="space-y-1.5">
+              <div className="space-y-1.5 min-w-0">
                 <label htmlFor="signer-role" className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                   Chức vụ người ký <span className="text-rose-600">*</span>
                 </label>
@@ -1303,33 +1411,33 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   onChange={(e) => setSignerRole(e.target.value)}
                   placeholder="Ví dụ: Bí thư Đoàn trường / Phó Bí thư..."
                   required
-                  className="w-full h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                  className="w-full min-h-[44px] h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   disabled={isSubmitting}
                 />
               </div>
             </div>
 
             {/* Automatic Issuer & Date Info */}
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 p-4 bg-slate-50 border border-slate-200 rounded-lg">
-              <div className="flex items-center gap-3">
+            <div className="grid grid-cols-1 md:grid-cols-2 gap-4 sm:gap-6 p-3.5 sm:p-4 bg-slate-50 border border-slate-200 rounded-lg">
+              <div className="flex items-center gap-3 min-w-0">
                 <div className="w-9 h-9 rounded-md bg-slate-200 flex items-center justify-center text-slate-700 shrink-0">
                   <Shield className="w-5 h-5 text-slate-600" />
                 </div>
-                <div className="flex flex-col">
+                <div className="flex flex-col min-w-0">
                   <span className="text-xs text-slate-500 font-medium">
                     {canIssue ? 'Người lấy số (Tự động)' : 'Người xin số (Tự động)'}
                   </span>
-                  <span className="text-sm font-semibold text-slate-900">
+                  <span className="text-sm font-semibold text-slate-900 break-words">
                     {currentUser.fullName} <span className="text-slate-400 font-normal">({currentUser.username})</span>
                   </span>
                 </div>
               </div>
 
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-3 min-w-0">
                 <div className="w-9 h-9 rounded-md bg-slate-200 flex items-center justify-center text-slate-700 shrink-0">
                   <Clock className="w-5 h-5 text-slate-600" />
                 </div>
-                <div className="flex flex-col">
+                <div className="flex flex-col min-w-0">
                   <span className="text-xs text-slate-500 font-medium">Ngày cấp số (Múi giờ Việt Nam)</span>
                   <span className="text-sm font-semibold font-mono text-slate-900">
                     {todayVietnam} <span className="text-xs font-normal text-slate-500">(dd/mm/yyyy)</span>
@@ -1349,7 +1457,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 value={notes}
                 onChange={(e) => setNotes(e.target.value)}
                 placeholder="Ghi chú thêm (nơi nhận, số lượng bản phát hành, lưu ý...)"
-                className="w-full h-10 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 placeholder:text-slate-400"
+                className="w-full min-h-[44px] h-11 px-3.5 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 placeholder:text-slate-400"
                 disabled={isSubmitting}
               />
             </div>
@@ -1362,17 +1470,17 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 : '';
 
               return (
-                <div className="space-y-2.5 p-4 bg-slate-50/80 border border-slate-200 rounded-xl">
+                <div className="space-y-2.5 p-3.5 sm:p-4 bg-slate-50/80 border border-slate-200 rounded-xl">
                   <div className="flex flex-wrap items-center justify-between gap-2">
                     <div className="flex items-center gap-2">
-                      <FileUp className="w-4 h-4 text-sky-700" />
+                      <FileUp className="w-4 h-4 text-sky-700 shrink-0" />
                       <span className="text-xs font-bold text-slate-800 uppercase tracking-wide">
                         Tệp Word đính kèm
                       </span>
                       <span className="text-[11px] text-slate-500 font-normal">(không bắt buộc)</span>
                     </div>
                     <span className="text-[11px] font-medium text-slate-600 bg-white px-2 py-0.5 rounded border border-slate-200">
-                      Định dạng .doc, .docx · Tối đa {maxWordFileSizeMB} MB
+                      .doc, .docx · Tối đa {maxWordFileSizeMB} MB
                     </span>
                   </div>
 
@@ -1388,8 +1496,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
                   {!selectedFile ? (
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white border border-dashed border-slate-300 rounded-lg p-3.5">
-                      <div className="text-xs text-slate-600 space-y-0.5">
-                        <p className="font-medium text-slate-800">
+                      <div className="text-xs text-slate-600 space-y-0.5 min-w-0">
+                        <p className="font-medium text-slate-800 leading-relaxed">
                           Đính kèm tệp Word để tự động đổi tên theo số chính thức và lưu vào Google Drive của {activeBook.name}
                         </p>
                         <p className="text-[11px] text-slate-500">
@@ -1400,21 +1508,21 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         type="button"
                         onClick={() => fileInputRef.current?.click()}
                         disabled={isSubmitting}
-                        className="inline-flex items-center justify-center gap-1.5 px-4 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-sky-800 border border-sky-300 rounded-lg shadow-2xs transition-colors shrink-0 disabled:opacity-50"
+                        className="inline-flex items-center justify-center gap-1.5 min-h-[44px] px-4 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-sky-800 border border-sky-300 rounded-lg shadow-2xs transition-colors shrink-0 disabled:opacity-50 w-full sm:w-auto"
                       >
-                        <Upload className="w-3.5 h-3.5" />
+                        <Upload className="w-4 h-4" />
                         <span>Chọn tệp Word</span>
                       </button>
                     </div>
                   ) : (
                     <div className="bg-white border border-sky-200 rounded-lg p-3.5 space-y-2.5">
-                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
                         <div className="flex items-center gap-2.5 min-w-0">
                           <div className="w-9 h-9 rounded-lg bg-sky-50 border border-sky-200 flex items-center justify-center text-sky-700 shrink-0">
                             <FileText className="w-4 h-4" />
                           </div>
                           <div className="min-w-0">
-                            <p className="text-xs font-bold text-slate-900 truncate">{selectedFile.name}</p>
+                            <p className="text-xs font-bold text-slate-900 break-all sm:truncate">{selectedFile.name}</p>
                             <p className="text-[11px] text-slate-500">
                               Dung lượng: <strong className="text-slate-700">{formatFileSize(selectedFile.size)}</strong>
                             </p>
@@ -1426,7 +1534,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             type="button"
                             onClick={() => fileInputRef.current?.click()}
                             disabled={isSubmitting}
-                            className="px-2.5 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-md disabled:opacity-50"
+                            className="flex-1 sm:flex-initial min-h-[38px] px-3 py-1.5 text-xs font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-md disabled:opacity-50"
                           >
                             Chọn lại
                           </button>
@@ -1434,26 +1542,26 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                             type="button"
                             onClick={handleClearSelectedFile}
                             disabled={isSubmitting}
-                            className="px-2.5 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-md disabled:opacity-50"
+                            className="flex-1 sm:flex-initial min-h-[38px] px-3 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-md disabled:opacity-50"
                           >
                             Bỏ chọn
                           </button>
                         </div>
                       </div>
 
-                      <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-xs space-y-0.5">
+                      <div className="bg-slate-50 border border-slate-200 rounded-md px-3 py-2 text-xs space-y-0.5 min-w-0">
                         <span className="text-[11px] font-semibold text-slate-500 block">
-                          Tên tệp sẽ lưu (dự kiến — nếu người khác vừa cấp số trước, máy chủ sẽ tự tính lại theo số chính thức):
+                          Tên tệp sẽ lưu (dự kiến — máy chủ tự tính lại theo số chính thức):
                         </span>
-                        <span className="font-mono font-bold text-sky-900 break-all">{expectedDriveName}</span>
+                        <span className="font-mono font-bold text-sky-900 break-all block">{expectedDriveName}</span>
                       </div>
 
                       {!driveConfigured && (
                         <div className="p-3 bg-amber-50 border border-amber-200 rounded-lg text-amber-900 text-xs flex items-start gap-2">
                           <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
-                          <div className="space-y-1">
+                          <div className="space-y-1 min-w-0">
                             <strong className="block font-bold">Thư mục Google Drive chưa được cấu hình hợp lệ</strong>
-                            <p className="text-amber-800">
+                            <p className="text-amber-800 break-words">
                               {driveConfig?.lastCheckMessage || 'Chưa thiết lập thư mục Google Drive cho sổ này.'}
                             </p>
                           </div>
@@ -1465,7 +1573,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   {fileError && (
                     <div className="p-2.5 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-xs flex items-center gap-2">
                       <AlertCircle className="w-4 h-4 text-rose-600 shrink-0" />
-                      <span>{fileError}</span>
+                      <span className="break-words min-w-0">{fileError}</span>
                     </div>
                   )}
                 </div>
@@ -1514,6 +1622,44 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
               </div>
             )}
 
+            {/* Year Rollover Confirmation Banner (00:00 01/01 Asia/Ho_Chi_Minh) */}
+            {yearRolloverNotice && (
+              <div className="p-4 bg-amber-50 border-2 border-amber-400 rounded-xl space-y-3 text-xs text-amber-950 shadow-xs">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <strong className="font-bold text-sm block text-amber-950">
+                      Hệ thống vừa bước sang năm mới {yearRolloverNotice.toYear} (giờ Việt Nam)
+                    </strong>
+                    <p className="text-amber-900">
+                      Biểu mẫu này được mở từ năm <strong>{yearRolloverNotice.fromYear}</strong>. Toàn bộ nội dung bạn đang nhập và tệp Word đã chọn vẫn được giữ nguyên. Số văn bản dự kiến theo dãy năm <strong>{yearRolloverNotice.toYear}</strong> đã được cập nhật thành{' '}
+                      <strong className="font-mono text-sky-900">{yearRolloverNotice.newPreviewNumber || nextNumber}</strong>.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  {!yearRolloverNotice.confirmed ? (
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setFormYear(yearRolloverNotice.toYear);
+                        setYearRolloverNotice({ ...yearRolloverNotice, confirmed: true });
+                        setSubmitError(null);
+                      }}
+                      className="px-4 py-2 bg-amber-700 hover:bg-amber-800 text-white font-semibold rounded-lg shadow-2xs transition-colors"
+                    >
+                      Xác nhận chuyển sang cấp số năm {yearRolloverNotice.toYear}
+                    </button>
+                  ) : (
+                    <span className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-emerald-100 text-emerald-900 border border-emerald-300 rounded-lg font-semibold">
+                      <CheckCircle2 className="w-4 h-4 text-emerald-700" />
+                      <span>Đã xác nhận cấp số theo năm {yearRolloverNotice.toYear}. Bấm "Cấp số và lưu" để hoàn tất.</span>
+                    </span>
+                  )}
+                </div>
+              </div>
+            )}
+
             {/* Submit Error Callout */}
             {submitError && (
               <div className="p-4 bg-rose-50 border border-rose-200 rounded-lg text-rose-800 text-sm flex items-start gap-3">
@@ -1526,7 +1672,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
             )}
 
             {/* Submit Button & Active Book Confirm */}
-            <div className="pt-2 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4 border-t border-slate-100">
+            <div className="pt-3 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 sm:gap-4 border-t border-slate-100">
               <div className="text-xs text-slate-500 flex items-center gap-2">
                 <Sparkles className="w-4 h-4 text-sky-600 shrink-0" />
                 <span>
@@ -1538,7 +1684,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
                 {issueAccessibleBooks.length > 1 ? (
-                  <div className="inline-flex items-center justify-between gap-1.5 h-12 px-3 bg-sky-50 border border-sky-200 rounded-lg text-xs">
+                  <div className="inline-flex items-center justify-between gap-1.5 min-h-[44px] h-11 sm:h-12 px-3 bg-sky-50 border border-sky-200 rounded-lg text-xs min-w-0">
                     <span className="text-sky-700 font-medium whitespace-nowrap">Sổ:</span>
                     <select
                       aria-label="Xác nhận sổ khi cấp số"
@@ -1550,7 +1696,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         setSubmitError(null);
                       }}
                       disabled={isSubmitting}
-                      className="font-bold text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
+                      className="flex-1 sm:flex-initial min-w-0 font-bold text-base sm:text-xs text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
                     >
                       {issueAccessibleBooks.map((b) => (
                         <option key={b.id} value={b.id}>
@@ -1560,16 +1706,20 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     </select>
                   </div>
                 ) : (
-                  <span className="inline-flex items-center justify-center gap-1.5 h-12 px-3 bg-slate-100 border border-slate-200 rounded-lg text-xs font-bold text-slate-700">
-                    <BookOpen className="w-3.5 h-3.5 text-sky-700" />
-                    <span>{activeBook.name}</span>
+                  <span className="inline-flex items-center justify-center gap-1.5 min-h-[44px] h-11 sm:h-12 px-3 bg-slate-100 border border-slate-200 rounded-lg text-xs font-bold text-slate-700">
+                    <BookOpen className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+                    <span className="truncate">{activeBook.name}</span>
                   </span>
                 )}
 
                 <button
                   type="submit"
-                  disabled={isSubmitting || Boolean(canIssue && selectedFile && !driveConfigured)}
-                  className="w-full sm:w-auto sm:min-w-[200px] h-12 px-6 bg-sky-700 hover:bg-sky-800 active:bg-sky-900 text-white font-semibold text-sm rounded-lg shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
+                  disabled={
+                    isSubmitting ||
+                    Boolean(canIssue && selectedFile && !driveConfigured) ||
+                    Boolean(yearRolloverNotice && !yearRolloverNotice.confirmed)
+                  }
+                  className="w-full sm:w-auto sm:min-w-[210px] min-h-[48px] h-12 px-6 bg-sky-700 hover:bg-sky-800 active:bg-sky-900 text-white font-semibold text-base sm:text-sm rounded-lg shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {isSubmitting ? (
                     <>
@@ -1652,17 +1802,17 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
       {/* Modal: Quick Add Type (Admin Only) */}
       {showAddTypeModal && (
-        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-4">
-          <div className="bg-white rounded-xl max-w-md w-full p-6 shadow-xl space-y-4 animate-scaleUp">
+        <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[90dvh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
               <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <Plus className="w-5 h-5 text-sky-700" />
+                <Plus className="w-5 h-5 text-sky-700 shrink-0" />
                 <span>Thêm loại văn bản mới</span>
               </h3>
               <button
                 type="button"
                 onClick={() => setShowAddTypeModal(false)}
-                className="text-slate-400 hover:text-slate-700 p-1"
+                className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center"
               >
                 <X className="w-5 h-5" />
               </button>
@@ -1677,7 +1827,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   onChange={(e) => setNewTypeName(e.target.value)}
                   placeholder="Ví dụ: Quyết định, Hướng dẫn, Tờ trình..."
                   required
-                  className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg text-xs"
+                  className="w-full min-h-[44px] h-11 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                 />
               </div>
 
@@ -1689,7 +1839,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   onChange={(e) => setNewTypeCode(e.target.value)}
                   placeholder="Ví dụ: QĐ, HD, TTr"
                   required
-                  className="w-full h-10 px-3 bg-white border border-slate-300 rounded-lg uppercase font-mono text-xs font-bold"
+                  className="w-full min-h-[44px] h-11 px-3 bg-white border border-slate-300 rounded-lg uppercase font-mono text-base sm:text-xs font-bold"
                 />
                 <span className="text-[11px] text-slate-500 block">
                   Số văn bản sẽ hiển thị theo mẫu: 01-<strong>{newTypeCode || 'KÍ_HIỆU'}</strong>/{activeBook.unitCode}
@@ -1704,7 +1854,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       key={colorOpt.key}
                       type="button"
                       onClick={() => setNewTypeColor(colorOpt.key)}
-                      className={`flex flex-col items-center gap-1 p-1.5 rounded-lg border text-[10px] transition-all ${
+                      className={`flex flex-col items-center gap-1 p-1.5 min-h-[44px] justify-center rounded-lg border text-[10px] transition-all ${
                         newTypeColor === colorOpt.key
                           ? `${colorOpt.tagBg} ${colorOpt.tagBorder} ring-2 ring-sky-600 font-bold shadow-xs`
                           : 'bg-white border-slate-200 hover:bg-slate-50 text-slate-600'
@@ -1727,14 +1877,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 <button
                   type="button"
                   onClick={() => setShowAddTypeModal(false)}
-                  className="px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
+                  className="min-h-[40px] px-3.5 py-2 text-xs font-semibold text-slate-600 hover:bg-slate-100 rounded-lg"
                 >
                   Hủy
                 </button>
                 <button
                   type="submit"
                   disabled={addTypeSaving}
-                  className="px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs"
+                  className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs"
                 >
                   {addTypeSaving ? 'Đang tạo...' : 'Lưu và áp dụng'}
                 </button>

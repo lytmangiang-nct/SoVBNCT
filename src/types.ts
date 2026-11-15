@@ -95,6 +95,8 @@ export interface RegistryBook {
   googleSheetsConfig?: GoogleSheetsConfig; // Tùy chọn tệp Google Sheets riêng cho bộ phận nếu cần chia sẻ trực tiếp
   isActive: boolean;
   createdAt: string;
+  configVersion?: number;
+  updatedAt?: string;
 }
 
 export interface SystemSettings {
@@ -106,6 +108,8 @@ export interface SystemSettings {
   msGraphConfig: MsGraphConfig;
   googleSheetsConfig?: GoogleSheetsConfig;
   googleDriveConfig?: GoogleDriveConfig;
+  configVersion?: number;
+  updatedAt?: string;
 }
 
 export type DocumentCategory = 'outgoing' | 'incoming';
@@ -327,5 +331,9 @@ export interface PreviewNumberResponse {
   previewNumber: string;
   sequenceNumber: number;
   year: number;
+  serverYear?: number;
+  formattedDate?: string;
   mode: NumberMode;
+  customStartSequence?: number | null;
+  maxIssuedSequence?: number;
 }

@@ -25,13 +25,39 @@ import {
   hasBookPermission,
   isSystemAdmin,
 } from './utils/permissions';
-import { Bell, BookOpen, FileText } from 'lucide-react';
+import { AlertTriangle, Bell, BookOpen, Clock, FileText, RefreshCw } from 'lucide-react';
+
+function getClientVietnamTimeFallback() {
+  try {
+    const formatter = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    });
+    const parts = formatter.format(new Date()).split('-');
+    return {
+      year: parseInt(parts[0], 10),
+      formattedDate: `${parts[2]}/${parts[1]}/${parts[0]}`,
+    };
+  } catch {
+    const now = new Date();
+    return {
+      year: now.getFullYear(),
+      formattedDate: now.toLocaleDateString('vi-VN'),
+    };
+  }
+}
 
 export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<AppTab>('issue');
   const [pendingOpenDocId, setPendingOpenDocId] = useState<string | null>(null);
+
+  const initialVnTime = useMemo(() => getClientVietnamTimeFallback(), []);
+  const [serverYear, setServerYear] = useState<number>(initialVnTime.year);
+  const [serverFormattedDate, setServerFormattedDate] = useState<string>(initialVnTime.formattedDate);
 
   // Core Data
   const [settings, setSettings] = useState<SystemSettings>({
@@ -57,6 +83,10 @@ export default function App() {
   const [signers, setSigners] = useState<SignerConfig[]>([]);
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [loadingData, setLoadingData] = useState<boolean>(false);
+  const [settingsLoaded, setSettingsLoaded] = useState<boolean>(false);
+  const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
+  const [syncError, setSyncError] = useState<string | null>(null);
+  const syncInFlightRef = React.useRef<boolean>(false);
 
   // Live Toast Notification
   const [liveToast, setLiveToast] = useState<{ message: string; type?: 'info' | 'success' } | null>(null);
@@ -65,6 +95,16 @@ export default function App() {
     setLiveToast({ message, type });
     setTimeout(() => setLiveToast(null), 4000);
   };
+
+  const applyServerTime = useCallback((timeVn?: { year?: number; formattedDate?: string }) => {
+    if (!timeVn) return;
+    if (typeof timeVn.year === 'number' && Number.isFinite(timeVn.year)) {
+      setServerYear((prev) => (prev !== timeVn.year ? timeVn.year! : prev));
+    }
+    if (typeof timeVn.formattedDate === 'string' && timeVn.formattedDate) {
+      setServerFormattedDate((prev) => (prev !== timeVn.formattedDate ? timeVn.formattedDate! : prev));
+    }
+  }, []);
 
   // 1. Initial Auth Check
   useEffect(() => {
@@ -84,6 +124,10 @@ export default function App() {
 
     const handleExpired = () => {
       setCurrentUser(null);
+      setSettingsLoaded(false);
+      setBooks([]);
+      setDocuments([]);
+      setNumberRequests([]);
     };
     window.addEventListener('auth_expired', handleExpired);
     return () => window.removeEventListener('auth_expired', handleExpired);
@@ -94,10 +138,11 @@ export default function App() {
     try {
       const res = await api.getBooks();
       setBooks(res.books);
+      applyServerTime(res.serverTimeVietnam);
     } catch (err) {
       console.error('Lỗi tải danh sách sổ:', err);
     }
-  }, [currentUser]);
+  }, [currentUser, applyServerTime]);
 
   const refreshRequests = useCallback(async () => {
     if (!currentUser) return;
@@ -109,38 +154,75 @@ export default function App() {
     }
   }, [currentUser]);
 
-  // 2. Load Core Application Data
+  // 2. Load Core Application Data (Single Server Source of Truth, In-place refresh)
   const loadAppData = useCallback(async () => {
-    if (!currentUser) return;
+    if (!currentUser || syncInFlightRef.current) return;
+    syncInFlightRef.current = true;
     setLoadingData(true);
     try {
-      const [settingsRes, docsRes, booksRes, reqsRes] = await Promise.all([
+      const [meRes, settingsRes, docsRes, booksRes, reqsRes] = await Promise.all([
+        api.getCurrentUser(),
         api.getSettings(),
         api.getDocuments({}),
-        api.getBooks().catch(() => ({ books: [] as RegistryBook[] })),
+        api.getBooks(),
         api.getNumberRequests().catch(() => ({ requests: [] as NumberRequest[] })),
       ]);
+
+      if (!meRes.user.isActive) {
+        clearAuth();
+        setCurrentUser(null);
+        setSettingsLoaded(false);
+        return;
+      }
+
+      setCurrentUser((prev) => {
+        if (!prev) return meRes.user;
+        if (
+          JSON.stringify(prev.bookPermissions || {}) !== JSON.stringify(meRes.user.bookPermissions || {}) ||
+          prev.role !== meRes.user.role ||
+          prev.isActive !== meRes.user.isActive ||
+          prev.fullName !== meRes.user.fullName
+        ) {
+          return meRes.user;
+        }
+        return prev;
+      });
 
       setSettings(settingsRes.settings);
       setDocumentTypes(settingsRes.documentTypes);
       setSigners(settingsRes.signers);
       setDocuments(docsRes.documents);
-      if (booksRes.books.length > 0) {
-        setBooks(booksRes.books);
-      }
+      setBooks(booksRes.books);
       setNumberRequests(reqsRes.requests);
+      applyServerTime(settingsRes.serverTimeVietnam || booksRes.serverTimeVietnam);
+
+      setSettingsLoaded(true);
+      setSyncError(null);
+      setLastSyncAt(new Date());
     } catch (err: any) {
       console.error('Lỗi khi tải dữ liệu ứng dụng:', err);
+      if (err?.status !== 401) {
+        setSyncError(err?.message || 'Không thể đồng bộ dữ liệu mới nhất từ máy chủ.');
+      }
     } finally {
+      syncInFlightRef.current = false;
       setLoadingData(false);
     }
-  }, [currentUser]);
+  }, [currentUser?.id, applyServerTime]);
 
   useEffect(() => {
-    if (currentUser) {
+    if (currentUser?.id) {
       loadAppData();
     }
-  }, [currentUser, loadAppData]);
+  }, [currentUser?.id, loadAppData]);
+
+  // Tự động nạp dữ liệu mới nhất khi chuyển sổ hoặc mở Sổ theo dõi / Thống kê / Cài đặt
+  useEffect(() => {
+    if (!currentUser?.id || !settingsLoaded) return;
+    if (activeTab === 'settings' || activeTab === 'registry' || activeTab === 'statistics') {
+      loadAppData();
+    }
+  }, [activeTab, activeBookId, currentUser?.id, settingsLoaded, loadAppData]);
 
   // 3. Server-Sent Events (SSE) for Real-Time Multi-Device Updates
   useEffect(() => {
@@ -209,21 +291,13 @@ export default function App() {
       eventSource.addEventListener('user_permissions_updated', async (e: MessageEvent) => {
         try {
           const data = JSON.parse(e.data || '{}');
-          if (!data.targetUserId || data.targetUserId === currentUser.id) {
-            try {
-              const meRes = await api.getCurrentUser();
-              if (!meRes.user.isActive) {
-                clearAuth();
-                setCurrentUser(null);
-                return;
-              }
-              setCurrentUser(meRes.user);
-              refreshBooks();
-              showToast('Quyền truy cập sổ văn bản của bạn vừa được cập nhật.', 'info');
-            } catch {
-              clearAuth();
-              setCurrentUser(null);
-            }
+          const matchesMe =
+            (!data.userId && !data.targetUserId) ||
+            data.userId === currentUser.id ||
+            data.targetUserId === currentUser.id;
+          if (matchesMe) {
+            await loadAppData();
+            showToast('Quyền truy cập sổ văn bản của bạn vừa được cập nhật.', 'info');
           }
         } catch {
           // ignore
@@ -239,7 +313,10 @@ export default function App() {
           const data = JSON.parse(e.data);
           if (data.settings) {
             if (isSystemAdmin(currentUser) || hasAnyBookPermission(currentUser, 'manage_book')) {
-              api.getSettings().then((res) => setSettings(res.settings)).catch(() => {});
+              api.getSettings().then((res) => {
+                setSettings(res.settings);
+                applyServerTime(res.serverTimeVietnam);
+              }).catch(() => {});
             } else {
               setSettings(data.settings);
             }
@@ -259,34 +336,22 @@ export default function App() {
 
     connectSSE();
 
-    // Fallback polling mỗi 4 giây khi tab đang mở để đảm bảo đồng bộ giữa điện thoại & máy tính
+    // Kiểm tra lại định kỳ mỗi 30 giây khi tab đang mở + khi quay lại tab hoặc có mạng trở lại
     const syncLiveState = () => {
       if (document.visibilityState !== 'visible') return;
       loadAppData();
-      api
-        .getCurrentUser()
-        .then((res) => {
-          setCurrentUser((prev) => {
-            if (!prev) return res.user;
-            if (
-              JSON.stringify(prev.bookPermissions || {}) !== JSON.stringify(res.user.bookPermissions || {}) ||
-              prev.role !== res.user.role ||
-              prev.isActive !== res.user.isActive
-            ) {
-              return res.user;
-            }
-            return prev;
-          });
-        })
-        .catch(() => {});
     };
 
-    const pollInterval = setInterval(syncLiveState, 4000);
+    const pollInterval = setInterval(syncLiveState, 30000);
 
     const handleVisibilityOrFocus = () => {
       syncLiveState();
     };
+    const handleOnline = () => {
+      loadAppData();
+    };
     window.addEventListener('focus', handleVisibilityOrFocus);
+    window.addEventListener('online', handleOnline);
     document.addEventListener('visibilitychange', handleVisibilityOrFocus);
 
     return () => {
@@ -294,9 +359,10 @@ export default function App() {
       clearTimeout(reconnectTimeout);
       clearInterval(pollInterval);
       window.removeEventListener('focus', handleVisibilityOrFocus);
+      window.removeEventListener('online', handleOnline);
       document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
     };
-  }, [currentUser?.id, loadAppData, refreshBooks, refreshRequests]);
+  }, [currentUser?.id, loadAppData, refreshBooks, refreshRequests, applyServerTime]);
 
   const accessibleBooks = useMemo(
     () => getAccessibleBooks(currentUser, books),
@@ -388,6 +454,9 @@ export default function App() {
   const handleLogout = async () => {
     await api.logout();
     setCurrentUser(null);
+    setSettingsLoaded(false);
+    setLastSyncAt(null);
+    setSyncError(null);
     setBooks([]);
     setDocuments([]);
     setNumberRequests([]);
@@ -399,12 +468,14 @@ export default function App() {
       if (prev.some((d) => d.id === newDoc.id)) return prev;
       return [newDoc, ...prev];
     });
+    setLastSyncAt(new Date());
   };
 
   const handleDocumentUpdated = (updatedDoc: DocumentRecord) => {
     setDocuments((prev) =>
       prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
     );
+    setLastSyncAt(new Date());
   };
 
   const handleOpenExistingDocument = (docId: string) => {
@@ -427,59 +498,101 @@ export default function App() {
     return <LoginModal onLoginSuccess={(user) => setCurrentUser(user)} />;
   }
 
-  // Quick stats summary for current year on active book
-  const currentYear = new Date().getFullYear();
+  // Quick stats summary for server Vietnam year on active book
+  const currentYear = serverYear;
   const currentYearDocs = documents.filter(
     (d) => d.year === currentYear && getDocBookId(d) === activeBook.id
   );
   const totalCount = currentYearDocs.length;
   const incomingCount = currentYearDocs.filter((d) => d.docCategory === 'incoming').length;
+  const noBookPermission = settingsLoaded && accessibleBooks.length === 0;
 
   return (
-    <div className="min-h-screen bg-slate-50 text-slate-900 flex flex-col font-sans">
+    <div className="min-h-[100dvh] bg-slate-50 text-slate-900 flex flex-col font-sans overflow-x-clip">
       {/* Top Navigation Bar */}
       <Navbar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
         currentUser={currentUser}
         books={books}
+        accessibleBooks={accessibleBooks}
+        activeBook={activeBook}
+        onSelectBook={setActiveBookId}
         onLogout={handleLogout}
+        lastSyncAt={lastSyncAt}
+        syncingData={loadingData}
+        onRefreshData={loadAppData}
       />
 
       {/* Global Dashboard Summary Banner */}
-      <section className="bg-sky-900 text-white border-b border-sky-950 py-3.5 px-4 sm:px-6 lg:px-8">
-        <div className="max-w-7xl mx-auto flex flex-col md:flex-row items-start md:items-center justify-between gap-4">
-          <div className="flex items-center gap-3">
-            <div className="w-9 h-9 rounded-lg bg-sky-800/80 flex items-center justify-center shrink-0 border border-sky-700/60">
-              <FileText className="w-5 h-5 text-sky-200" />
+      <section className="bg-sky-900 text-white border-b border-sky-950 py-3 px-3 sm:px-6 lg:px-8">
+        <div className="max-w-7xl mx-auto flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
+            <div className="flex items-start sm:items-center gap-2.5 min-w-0">
+              <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg bg-sky-800/80 flex items-center justify-center shrink-0 border border-sky-700/60 mt-0.5 sm:mt-0">
+                <FileText className="w-4 h-4 sm:w-5 sm:h-5 text-sky-200" />
+              </div>
+              <div className="min-w-0 space-y-0.5">
+                <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
+                  <span className="text-xs uppercase font-bold tracking-wider text-sky-200">
+                    Năm {currentYear}
+                  </span>
+                  <span className="text-[11px] text-sky-300">·</span>
+                  <span className="text-xs text-sky-200">
+                    Tổng: <strong className="font-mono text-white font-bold">{totalCount}</strong> văn bản
+                  </span>
+                </div>
+                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-sky-300">
+                  <span className="truncate max-w-full">
+                    {activeBook.unitName} ({activeBook.unitCode})
+                  </span>
+                  {lastSyncAt && (
+                    <>
+                      <span className="hidden sm:inline">·</span>
+                      <span className="inline-flex items-center gap-1 text-sky-200 font-mono">
+                        <Clock className="w-3 h-3 shrink-0" />
+                        Cập nhật lần cuối:{' '}
+                        {lastSyncAt.toLocaleTimeString('vi-VN', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          second: '2-digit',
+                        })}
+                      </span>
+                    </>
+                  )}
+                </div>
+              </div>
             </div>
-            <div>
-              <div className="flex items-center gap-2 flex-wrap">
-                <span className="text-xs uppercase font-bold tracking-wider text-sky-200">
-                  Năm {currentYear}
-                </span>
-                <span className="text-[11px] text-sky-300">·</span>
-                <span className="text-xs text-sky-200">
-                  Tổng: <strong className="font-mono text-white font-bold">{totalCount}</strong> văn bản
-                </span>
-                {accessibleBooks.length > 1 && (
-                  <>
-                    <span className="text-[11px] text-sky-300">·</span>
-                    <span className="inline-flex items-center gap-1 text-[11px] bg-sky-800 border border-sky-700 px-2 py-0.5 rounded text-sky-100 font-semibold">
-                      <BookOpen className="w-3 h-3" />
-                      {activeBook.name}
-                    </span>
-                  </>
+
+            {/* Always-visible Book Selector on all screens */}
+            {accessibleBooks.length > 0 && (
+              <div className="flex items-center gap-2 bg-sky-800/90 border border-sky-600/80 rounded-lg px-2.5 py-1.5 min-h-[40px] sm:min-h-[36px] shrink-0 w-full sm:w-auto min-w-0">
+                <BookOpen className="w-3.5 h-3.5 text-sky-200 shrink-0" />
+                <span className="text-[11px] text-sky-200 font-medium whitespace-nowrap">Sổ:</span>
+                {accessibleBooks.length > 1 ? (
+                  <select
+                    aria-label="Sổ đang chọn"
+                    value={activeBook.id}
+                    onChange={(e) => setActiveBookId(e.target.value)}
+                    className="flex-1 sm:flex-initial min-w-0 bg-transparent text-white text-xs sm:text-sm font-bold focus:outline-hidden cursor-pointer [&>option]:text-slate-900"
+                  >
+                    {accessibleBooks.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {b.name} ({b.unitCode})
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <span className="text-xs font-bold text-white truncate">
+                    {activeBook.name} ({activeBook.unitCode})
+                  </span>
                 )}
               </div>
-              <p className="text-[11px] text-sky-300">
-                {activeBook.unitName} ({activeBook.unitCode})
-              </p>
-            </div>
+            )}
           </div>
 
           {/* Quick counts for book-enabled types + Văn bản đến */}
-          <div className="flex items-center gap-2 flex-wrap text-xs">
+          <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap text-[11px] sm:text-xs">
             {getBookEnabledTypes(activeBook, documentTypes).map((t) => {
               const count = currentYearDocs.filter(
                 (d) => d.docCategory !== 'incoming' && d.typeCode === t.code
@@ -487,14 +600,14 @@ export default function App() {
               return (
                 <div
                   key={t.code}
-                  className="bg-sky-800/80 border border-sky-700/60 px-2.5 py-1 rounded-md flex items-center gap-1.5"
+                  className="bg-sky-800/80 border border-sky-700/60 px-2 sm:px-2.5 py-1 rounded-md flex items-center gap-1.5"
                 >
-                  <span className="text-sky-300 font-medium">{t.name}:</span>
+                  <span className="text-sky-200 font-medium">{t.name}:</span>
                   <span className="font-mono font-bold text-white">{count}</span>
                 </div>
               );
             })}
-            <div className="bg-indigo-800/80 border border-indigo-600/70 px-2.5 py-1 rounded-md flex items-center gap-1.5">
+            <div className="bg-indigo-800/80 border border-indigo-600/70 px-2 sm:px-2.5 py-1 rounded-md flex items-center gap-1.5">
               <span className="text-indigo-200 font-medium">Văn bản đến:</span>
               <span className="font-mono font-bold text-white">{incomingCount}</span>
             </div>
@@ -502,94 +615,149 @@ export default function App() {
         </div>
       </section>
 
+      {/* Sync Failure Banner */}
+      {syncError && (
+        <div className="bg-rose-50 border-b border-rose-200 px-3 sm:px-6 lg:px-8 py-2.5">
+          <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2 text-xs text-rose-900">
+            <div className="flex items-center gap-2 min-w-0">
+              <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+              <span className="break-words min-w-0">
+                <strong>Chưa cập nhật được dữ liệu</strong> — {syncError}
+              </span>
+            </div>
+            <button
+              type="button"
+              onClick={loadAppData}
+              disabled={loadingData}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-md transition-colors disabled:opacity-50"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? 'animate-spin' : ''}`} />
+              <span>Thử lại</span>
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* Live Toast Notification */}
       {liveToast && (
-        <div className="fixed bottom-6 right-6 z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center gap-3 animate-slideUp border border-slate-700 text-xs">
+        <div className="fixed bottom-3 left-3 right-3 sm:left-auto sm:bottom-6 sm:right-6 sm:max-w-sm z-50 bg-slate-900 text-white px-4 py-3 rounded-xl shadow-xl flex items-center gap-3 animate-slideUp border border-slate-700 text-xs">
           <Bell className="w-4 h-4 text-amber-400 shrink-0" />
-          <span>{liveToast.message}</span>
+          <span className="break-words min-w-0">{liveToast.message}</span>
         </div>
       )}
 
       {/* Main View Area */}
       <main className="flex-1">
-        {activeTab === 'issue' && (
-          <IssueNumberView
-            currentUser={currentUser}
-            activeBook={activeBook}
-            accessibleBooks={accessibleBooks.length > 0 ? accessibleBooks : [activeBook]}
-            onSelectBook={setActiveBookId}
-            settings={settings}
-            documentTypes={documentTypes}
-            signers={signers}
-            documents={documents}
-            numberRequests={numberRequests}
-            onRefreshRequests={refreshRequests}
-            onDocumentIssued={handleDocumentIssued}
-            onDocumentUpdated={handleDocumentUpdated}
-            onNavigateToRegistry={() => setActiveTab('registry')}
-            onOpenExistingDocument={handleOpenExistingDocument}
-            onDocumentTypeAdded={(newType) => {
-              setDocumentTypes((prev) => {
-                if (prev.some((t) => t.code === newType.code)) return prev;
-                return [...prev, newType];
-              });
-              showToast(`Đã thêm loại văn bản mới: ${newType.name} (${newType.code})`, 'success');
-            }}
-          />
-        )}
+        {noBookPermission ? (
+          <div className="max-w-2xl mx-auto my-12 px-4">
+            <div className="bg-amber-50 border border-amber-200 rounded-xl p-6 text-center space-y-3">
+              <AlertTriangle className="w-8 h-8 text-amber-600 mx-auto" />
+              <h2 className="text-base font-bold text-amber-950">
+                Tài khoản chưa được phân quyền trên sổ văn bản nào
+              </h2>
+              <p className="text-xs text-amber-900">
+                Quyền truy cập của bạn có thể vừa được điều chỉnh bởi Quản trị viên. Vui lòng liên hệ Quản trị viên hoặc bấm Làm mới dữ liệu để kiểm tra lại.
+              </p>
+              <button
+                type="button"
+                onClick={loadAppData}
+                className="inline-flex items-center gap-1.5 px-4 py-2 bg-amber-700 hover:bg-amber-800 text-white text-xs font-semibold rounded-lg"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? 'animate-spin' : ''}`} />
+                <span>Làm mới dữ liệu</span>
+              </button>
+            </div>
+          </div>
+        ) : (
+          <>
+            {activeTab === 'issue' && (
+              <IssueNumberView
+                currentUser={currentUser}
+                activeBook={activeBook}
+                accessibleBooks={accessibleBooks.length > 0 ? accessibleBooks : [activeBook]}
+                onSelectBook={setActiveBookId}
+                settings={settings}
+                documentTypes={documentTypes}
+                signers={signers}
+                documents={documents}
+                numberRequests={numberRequests}
+                serverYear={serverYear}
+                serverFormattedDate={serverFormattedDate}
+                onServerTimeUpdate={(year, formattedDate) => applyServerTime({ year, formattedDate })}
+                onRefreshRequests={refreshRequests}
+                onDocumentIssued={handleDocumentIssued}
+                onDocumentUpdated={handleDocumentUpdated}
+                onNavigateToRegistry={() => setActiveTab('registry')}
+                onOpenExistingDocument={handleOpenExistingDocument}
+                onDocumentTypeAdded={(newType) => {
+                  setDocumentTypes((prev) => {
+                    if (prev.some((t) => t.code === newType.code)) return prev;
+                    return [...prev, newType];
+                  });
+                  showToast(`Đã thêm loại văn bản mới: ${newType.name} (${newType.code})`, 'success');
+                }}
+              />
+            )}
 
-        {activeTab === 'import_pdf' && (
-          <ImportPdfView
-            currentUser={currentUser}
-            activeBook={activeBook}
-            accessibleBooks={accessibleBooks.length > 0 ? accessibleBooks : [activeBook]}
-            onSelectBook={setActiveBookId}
-            settings={settings}
-            onDocumentImported={handleDocumentIssued}
-            onDocumentUpdated={handleDocumentUpdated}
-            onOpenExistingDocument={handleOpenExistingDocument}
-          />
-        )}
+            {activeTab === 'import_pdf' && (
+              <ImportPdfView
+                currentUser={currentUser}
+                activeBook={activeBook}
+                accessibleBooks={accessibleBooks.length > 0 ? accessibleBooks : [activeBook]}
+                onSelectBook={setActiveBookId}
+                settings={settings}
+                serverYear={serverYear}
+                onDocumentImported={handleDocumentIssued}
+                onDocumentUpdated={handleDocumentUpdated}
+                onOpenExistingDocument={handleOpenExistingDocument}
+              />
+            )}
 
-        {activeTab === 'registry' && (
-          <DocumentRegistryView
-            documents={documents}
-            documentTypes={documentTypes}
-            books={books.length > 0 ? books : [activeBook]}
-            activeBookId={activeBook.id}
-            onSelectBookId={setActiveBookId}
-            settings={settings}
-            currentUser={currentUser}
-            onRefresh={loadAppData}
-            onDocumentUpdated={handleDocumentUpdated}
-            initialOpenDocId={pendingOpenDocId}
-            onClearInitialOpenDocId={() => setPendingOpenDocId(null)}
-          />
-        )}
+            {activeTab === 'registry' && (
+              <DocumentRegistryView
+                documents={documents}
+                documentTypes={documentTypes}
+                books={books.length > 0 ? books : [activeBook]}
+                activeBookId={activeBook.id}
+                onSelectBookId={setActiveBookId}
+                settings={settings}
+                serverYear={serverYear}
+                currentUser={currentUser}
+                onRefresh={loadAppData}
+                onDocumentUpdated={handleDocumentUpdated}
+                initialOpenDocId={pendingOpenDocId}
+                onClearInitialOpenDocId={() => setPendingOpenDocId(null)}
+              />
+            )}
 
-        {activeTab === 'statistics' && (
-          <StatisticsView
-            currentYear={currentYear}
-            books={books.length > 0 ? books : [activeBook]}
-            activeBookId={activeBook.id}
-            onSelectBookId={setActiveBookId}
-            currentUser={currentUser}
-          />
-        )}
+            {activeTab === 'statistics' && (
+              <StatisticsView
+                currentYear={currentYear}
+                books={books.length > 0 ? books : [activeBook]}
+                activeBookId={activeBook.id}
+                onSelectBookId={setActiveBookId}
+                currentUser={currentUser}
+              />
+            )}
 
-        {activeTab === 'settings' && (
-          <SettingsView
-            currentUser={currentUser}
-            books={books.length > 0 ? books : [activeBook]}
-            activeBookId={activeBook.id}
-            onSelectBookId={setActiveBookId}
-            settings={settings}
-            documentTypes={documentTypes}
-            signers={signers}
-            onSettingsUpdated={(newSettings) => setSettings(newSettings)}
-            onBooksUpdated={refreshBooks}
-            onRefreshData={loadAppData}
-          />
+            {activeTab === 'settings' && (
+              <SettingsView
+                currentUser={currentUser}
+                books={books.length > 0 ? books : [activeBook]}
+                activeBookId={activeBook.id}
+                onSelectBookId={setActiveBookId}
+                settings={settings}
+                documentTypes={documentTypes}
+                signers={signers}
+                serverYear={serverYear}
+                configLoaded={settingsLoaded}
+                syncError={syncError}
+                onSettingsUpdated={(newSettings) => setSettings(newSettings)}
+                onBooksUpdated={refreshBooks}
+                onRefreshData={loadAppData}
+              />
+            )}
+          </>
         )}
       </main>
 
