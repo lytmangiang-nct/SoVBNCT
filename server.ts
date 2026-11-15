@@ -72,6 +72,16 @@ const PORT = process.env.PORT ? parseInt(process.env.PORT, 10) : 3000;
 const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME);
 
 app.set('trust proxy', 1);
+app.set('etag', false);
+
+app.use('/api', (req, res, next) => {
+  if (req.path !== '/events') {
+    res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
+    res.setHeader('Pragma', 'no-cache');
+    res.setHeader('Expires', '0');
+  }
+  next();
+});
 
 const extraCorsOrigins = (process.env.CORS_ORIGINS || '')
   .split(',')
@@ -604,6 +614,8 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
   };
 }
 
+let lastDbMtimeMs = 0;
+
 function loadDatabase(): DatabaseSchema {
   const sourceFile = fs.existsSync(DB_FILE)
     ? DB_FILE
@@ -646,6 +658,26 @@ function saveDatabaseSync(data: DatabaseSchema) {
   const tmpFile = `${DB_FILE}.tmp.${Date.now()}.${Math.random().toString(36).slice(2, 6)}`;
   fs.writeFileSync(tmpFile, JSON.stringify(data, null, 2), 'utf-8');
   fs.renameSync(tmpFile, DB_FILE);
+  try {
+    lastDbMtimeMs = fs.statSync(DB_FILE).mtimeMs;
+  } catch {
+    lastDbMtimeMs = Date.now();
+  }
+}
+
+function reloadDatabaseFromDiskIfNewer() {
+  if (!fs.existsSync(DB_FILE)) return;
+  try {
+    const stat = fs.statSync(DB_FILE);
+    if (stat.mtimeMs > lastDbMtimeMs) {
+      const content = fs.readFileSync(DB_FILE, 'utf-8');
+      const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
+      db = migrateDatabaseIdempotent(loaded);
+      lastDbMtimeMs = stat.mtimeMs;
+    }
+  } catch (err) {
+    console.error('Lỗi đọc lại dữ liệu mới từ ổ đĩa:', err);
+  }
 }
 
 db = loadDatabase();
@@ -2044,6 +2076,7 @@ app.get('/api/events', (req, res) => {
 
 // 5. System Settings, Books, Document Types, Signers
 app.get('/api/books', requireAuth, (req, res) => {
+  reloadDatabaseFromDiskIfNewer();
   const currentUser = (req as any).user as User;
   const accessible = db.books.filter(
     (b) => isSystemAdmin(currentUser) || (b.isActive && getUserBookPermissions(currentUser, b.id).length > 0)
@@ -2216,6 +2249,7 @@ app.put('/api/books/:id', requireAuth, (req, res) => {
 });
 
 app.get('/api/settings', requireAuth, (req, res) => {
+  reloadDatabaseFromDiskIfNewer();
   const currentUser = (req as any).user as User;
   res.json({
     settings: sanitizeSettingsForUser(db.settings, currentUser),
@@ -2322,29 +2356,125 @@ app.post('/api/settings/number-mode', requireAuth, (req, res) => {
 });
 
 // Quản lý loại văn bản
-app.post('/api/document-types', requireAuth, (req, res) => {
-  const { name, code, color } = req.body;
-  if (!name || !code) {
-    return res.status(400).json({ error: 'Vui lòng nhập tên loại văn bản và ký hiệu' });
+app.post('/api/document-types', requireAuth, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const { name, code, color, bookId, enableExistingForBook } = req.body || {};
+
+  const targetBook =
+    typeof bookId === 'string' && bookId.trim() ? findBookExplicitly(bookId.trim()) : null;
+  if (typeof bookId === 'string' && bookId.trim() && !targetBook) {
+    return res.status(404).json({ error: 'Không tìm thấy sổ văn bản đang chọn.' });
   }
 
-  const cleanCode = code.trim().toUpperCase();
-  if (db.documentTypes.some((t) => t.code.toUpperCase() === cleanCode)) {
-    return res.status(400).json({ error: `Ký hiệu viết tắt "${cleanCode}" đã tồn tại` });
+  const canManageCatalog =
+    isSystemAdmin(currentUser) ||
+    (targetBook
+      ? hasBookPermission(currentUser, targetBook.id, 'manage_book')
+      : db.books.some((b) => hasBookPermission(currentUser, b.id, 'manage_book')));
+
+  if (!canManageCatalog) {
+    return res.status(403).json({
+      error: 'Bạn không có quyền thêm hoặc quản lý danh mục loại văn bản.',
+    });
   }
 
-  const newType: DocumentTypeConfig = {
-    id: cleanCode,
-    name: name.trim(),
-    code: cleanCode,
-    color: color || DEFAULT_TYPE_COLORS[cleanCode] || 'blue',
-    isActive: true,
-  };
+  const cleanName = String(name || '').trim().replace(/\s+/g, ' ');
+  const cleanCode = String(code || '').trim().replace(/\s+/g, '').toUpperCase();
+  if (!cleanName || !cleanCode) {
+    return res.status(400).json({ error: 'Vui lòng nhập đầy đủ tên loại văn bản và ký hiệu' });
+  }
 
-  db.documentTypes.push(newType);
-  saveDatabaseSync(db);
-  broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
-  res.json({ documentType: newType });
+  const releaseLock = await atomicLock.acquire();
+  try {
+    reloadDatabaseFromDiskIfNewer();
+    const scopedBook = targetBook ? findBookExplicitly(targetBook.id) : null;
+    const existingType = db.documentTypes.find(
+      (t) => t.code.trim().replace(/\s+/g, '').toUpperCase() === cleanCode
+    );
+
+    if (existingType) {
+      const bookHasCustomFilter = Boolean(
+        scopedBook && Array.isArray(scopedBook.enabledTypeCodes) && scopedBook.enabledTypeCodes.length > 0
+      );
+      const alreadyEnabledInBook = scopedBook
+        ? isTypeEnabledInBook(scopedBook, existingType.code) && existingType.isActive
+        : true;
+
+      if (scopedBook && (!alreadyEnabledInBook || !existingType.isActive)) {
+        if (enableExistingForBook) {
+          existingType.isActive = true;
+          if (bookHasCustomFilter) {
+            const currentCodes = scopedBook.enabledTypeCodes || [];
+            if (!currentCodes.some((c) => c.trim().toUpperCase() === existingType.code.toUpperCase())) {
+              scopedBook.enabledTypeCodes = [...currentCodes, existingType.code];
+            }
+          }
+          bumpBookVersion(scopedBook);
+          saveDatabaseSync(db);
+          broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
+          broadcastSSE('books_updated', {
+            bookId: scopedBook.id,
+            configVersion: scopedBook.configVersion,
+            updatedAt: scopedBook.updatedAt,
+          });
+          return res.json({
+            documentType: existingType,
+            book: sanitizeBookForUser(scopedBook, currentUser),
+            enabledExisting: true,
+          });
+        }
+
+        return res.status(409).json({
+          code: 'TYPE_EXISTS_IN_CATALOG_NOT_ENABLED',
+          documentType: existingType,
+          bookId: scopedBook.id,
+          bookName: scopedBook.name,
+          error: `Ký hiệu "${existingType.code}" (${existingType.name}) đã có trong danh mục chung nhưng chưa bật cho sổ "${scopedBook.name}". Bạn có thể bật loại này cho sổ hiện tại.`,
+        });
+      }
+
+      return res.status(400).json({
+        error: `Ký hiệu viết tắt "${existingType.code}" đã tồn tại (${existingType.name})`,
+      });
+    }
+
+    const newType: DocumentTypeConfig = {
+      id: cleanCode,
+      name: cleanName,
+      code: cleanCode,
+      color: color || DEFAULT_TYPE_COLORS[cleanCode] || 'blue',
+      isActive: true,
+    };
+
+    db.documentTypes.push(newType);
+
+    let updatedBookPayload: RegistryBook | undefined;
+    if (scopedBook) {
+      if (Array.isArray(scopedBook.enabledTypeCodes) && scopedBook.enabledTypeCodes.length > 0) {
+        if (!scopedBook.enabledTypeCodes.some((c) => c.trim().toUpperCase() === cleanCode)) {
+          scopedBook.enabledTypeCodes = [...scopedBook.enabledTypeCodes, cleanCode];
+          bumpBookVersion(scopedBook);
+        }
+      }
+      updatedBookPayload = sanitizeBookForUser(scopedBook, currentUser);
+    }
+
+    saveDatabaseSync(db);
+    broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
+    if (scopedBook && updatedBookPayload) {
+      broadcastSSE('books_updated', {
+        bookId: scopedBook.id,
+        configVersion: scopedBook.configVersion,
+        updatedAt: scopedBook.updatedAt,
+      });
+    }
+    res.json({
+      documentType: newType,
+      ...(updatedBookPayload ? { book: updatedBookPayload } : {}),
+    });
+  } finally {
+    releaseLock();
+  }
 });
 
 app.delete('/api/document-types/:id', requireAuth, requireAdmin, (req, res) => {
@@ -2428,6 +2558,7 @@ app.delete('/api/signers/:id', requireAuth, requireAdmin, (req, res) => {
 
 // Đọc cấu hình số bắt đầu theo khóa (mã sổ + năm áp dụng + mã loại văn bản)
 app.get('/api/settings/start-sequence', requireAuth, (req, res) => {
+  reloadDatabaseFromDiskIfNewer();
   const currentUser = (req as any).user as User;
   const bookIdParam = typeof req.query.bookId === 'string' ? req.query.bookId : undefined;
   const targetBook = findBookExplicitly(bookIdParam);
@@ -2521,6 +2652,7 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
 
   const releaseLock = await atomicLock.acquire();
   try {
+    reloadDatabaseFromDiskIfNewer();
     const beforeState = computeSeriesSequenceState(targetBook, targetYear, canonicalType);
     if (nextSeq <= beforeState.maxIssuedSequence) {
       return res.status(400).json({
@@ -2559,8 +2691,35 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
   }
 });
 
+function buildPreviewResponseForSeries(
+  book: RegistryBook,
+  targetYear: number,
+  typeCode: string,
+  vietnamNow: { year: number; formattedDate: string }
+): PreviewNumberResponse {
+  const seriesState = computeSeriesSequenceState(book, targetYear, typeCode);
+  return {
+    bookId: book.id,
+    bookCode: book.code,
+    typeCode: seriesState.typeCode,
+    seriesKey: seriesState.seriesKey,
+    storageKey: seriesState.storageKey,
+    previewNumber: seriesState.previewNumber,
+    sequenceNumber: seriesState.nextExpectedSeq,
+    year: targetYear,
+    serverYear: vietnamNow.year,
+    formattedDate: vietnamNow.formattedDate,
+    mode: book.numberMode,
+    customStartSequence: seriesState.customStartSequence,
+    maxIssuedSequence: seriesState.maxIssuedSequence,
+    configVersion: book.configVersion || 1,
+    serverTimeMs: Date.now(),
+  };
+}
+
 // 6. Tính toán số văn bản dự kiến theo sổ (Preview ONLY - Chưa lưu, chưa cấp)
 app.get('/api/documents/preview', requireAuth, (req, res) => {
+  reloadDatabaseFromDiskIfNewer();
   const currentUser = (req as any).user as User;
   const book = findBookExplicitly(typeof req.query.bookId === 'string' ? req.query.bookId : undefined);
   if (!book) {
@@ -2600,20 +2759,7 @@ app.get('/api/documents/preview', requireAuth, (req, res) => {
       ? requestedYear
       : vietnamNow.year;
 
-  const seriesState = computeSeriesSequenceState(book, targetYear, typeCode);
-
-  const response: PreviewNumberResponse = {
-    bookId: book.id,
-    previewNumber: seriesState.previewNumber,
-    sequenceNumber: seriesState.nextExpectedSeq,
-    year: targetYear,
-    serverYear: vietnamNow.year,
-    formattedDate: vietnamNow.formattedDate,
-    mode: book.numberMode,
-    customStartSequence: seriesState.customStartSequence,
-    maxIssuedSequence: seriesState.maxIssuedSequence,
-  };
-  res.json(response);
+  res.json(buildPreviewResponseForSeries(book, targetYear, typeCode, vietnamNow));
 });
 
 // 6b. Kiểm tra trùng tên tệp trong sổ trước khi lưu lên Google Drive
@@ -2773,8 +2919,10 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
     return res.status(400).json({ error: 'Yêu cầu xin số này đã được xử lý trước đó.' });
   }
 
+  let issuedDocForSync: DocumentRecord | null = null;
   const releaseLock = await atomicLock.acquire();
   try {
+    reloadDatabaseFromDiskIfNewer();
     const { year, formattedDate } = getRequestVietnamTimeInfo(req);
     const canonicalReqType = resolveCanonicalTypeCode(reqItem.typeCode, db.documentTypes);
     const seriesState = computeSeriesSequenceState(targetBook, year, canonicalReqType);
@@ -2857,10 +3005,23 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
 
     broadcastSSE('document_issued', { document: newDocument });
     broadcastSSE('number_requests_updated', { bookId: targetBook.id, request: reqItem });
-    await syncToGoogleSheets(newDocument, 'create');
+    issuedDocForSync = newDocument;
     res.json({ document: newDocument, request: reqItem, success: true });
   } finally {
     releaseLock();
+  }
+
+  if (issuedDocForSync) {
+    const syncDoc = issuedDocForSync;
+    void syncToGoogleSheets(syncDoc, 'create')
+      .then((syncRes) => {
+        if (syncRes.attempted) {
+          broadcastSSE('document_updated', { document: syncDoc });
+        }
+      })
+      .catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi duyệt xin số:', err);
+      });
   }
 });
 
@@ -2910,79 +3071,101 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     conflictAction,
     customFileName,
     expectedYear,
+    expectedNextSeq,
+    confirmUpdatedSequence,
   } = req.body;
   const currentUser = (req as any).user as User;
-  const targetBook = getBookById(bookId);
-
-  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'issue_number')) {
-    return res.status(403).json({
-      error: `Tài khoản của bạn không có quyền "Cấp số" trong ${targetBook.name}. Vui lòng dùng chức năng "Xin số" hoặc liên hệ Quản trị viên.`,
-    });
-  }
 
   const validDocName = (docName || '').trim();
   if (!typeCode || !validDocName || !signer || !signerRole) {
     return res.status(400).json({ error: 'Vui lòng điền đầy đủ: Loại văn bản, Tên văn bản (bắt buộc), Người ký và Chức vụ' });
   }
 
-  const preCanonicalType = resolveCanonicalTypeCode(String(typeCode || ''), db.documentTypes);
-  if (!isTypeEnabledInBook(targetBook, preCanonicalType)) {
-    return res.status(400).json({
-      error: `Loại văn bản "${preCanonicalType}" chưa được bật sử dụng trong ${targetBook.name}.`,
-    });
-  }
-
   if (!idempotencyKey) {
     return res.status(400).json({ error: 'Thiếu mã chống lặp (idempotency key)' });
   }
 
-  // Nếu có tệp đính kèm, kiểm tra tệp và cấu hình thư mục Drive của sổ trước khi cấp số
-  let attachmentExt: '.doc' | '.docx' | null = null;
-  if (hasAttachment) {
-    attachmentExt = getWordFileExtension(String(attachmentName || ''));
-    if (!attachmentExt) {
-      return res.status(400).json({
-        error: 'Định dạng tệp đính kèm không hợp lệ. Chỉ chấp nhận tệp Word (.doc hoặc .docx).',
-      });
-    }
-    const sizeNum = Number(attachmentSize);
-    if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
-      return res.status(400).json({
-        error: 'Tệp Word đính kèm không hợp lệ hoặc bị rỗng.',
-      });
-    }
-    if (sizeNum > getMaxWordFileSizeBytes()) {
-      return res.status(400).json({
-        error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB.`,
-      });
-    }
-    const driveCfg = resolveDriveForBook(targetBook);
-    if (!driveCfg.isConfigured) {
-      return res.status(400).json({
-        error: `${driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ cho sổ này.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc liên hệ Quản trị viên.`,
-      });
-    }
-  }
-
   // Khóa giao dịch nguyên tử tại máy chủ - ngăn chặn 100% việc trùng số khi nhiều người cùng bấm
+  let issuedDocForSync: DocumentRecord | null = null;
   const releaseLock = await atomicLock.acquire();
 
   try {
-    // 1. Kiểm tra mã chống lặp
+    reloadDatabaseFromDiskIfNewer();
+
+    const targetBook = getBookById(bookId);
+    const freshUser = db.users.find((u) => u.id === currentUser.id);
+    if (!freshUser || !freshUser.isActive) {
+      return res.status(401).json({ error: 'Tài khoản không còn hiệu lực' });
+    }
+    const latestActor = toSafeUser(freshUser);
+
+    if (!isSystemAdmin(latestActor) && !hasBookPermission(latestActor, targetBook.id, 'issue_number')) {
+      return res.status(403).json({
+        error: `Tài khoản của bạn không có quyền "Cấp số" trong ${targetBook.name}. Vui lòng dùng chức năng "Xin số" hoặc liên hệ Quản trị viên.`,
+      });
+    }
+
+    const preCanonicalType = resolveCanonicalTypeCode(String(typeCode || ''), db.documentTypes);
+    if (!isTypeEnabledInBook(targetBook, preCanonicalType)) {
+      return res.status(400).json({
+        error: `Loại văn bản "${preCanonicalType}" chưa được bật sử dụng trong ${targetBook.name}.`,
+      });
+    }
+
+    // 1. Kiểm tra mã chống lặp trước mọi kiểm tra số để retry mạng luôn trả về đúng bản ghi đã tạo
     if (db.idempotencyKeys[idempotencyKey]) {
       const existingDocId = db.idempotencyKeys[idempotencyKey];
       const existingDoc = db.documents.find((d) => d.id === existingDocId);
       if (existingDoc) {
+        const vnNow = getRequestVietnamTimeInfo(req);
+        const existingBook = getBookById(getDocBookId(existingDoc));
+        const existingCanonType = resolveCanonicalTypeCode(existingDoc.typeCode, db.documentTypes);
+        const nextPreview = buildPreviewResponseForSeries(
+          existingBook,
+          existingDoc.year || vnNow.year,
+          existingCanonType,
+          vnNow
+        );
         return res.json({
           document: existingDoc,
+          nextPreview,
           duplicatePrevented: true,
           message: 'Yêu cầu đã được xử lý trước đó (đã chống gửi lặp)',
         });
       }
     }
 
+    // Kiểm tra tệp và cấu hình Drive nếu có đính kèm
+    let attachmentExt: '.doc' | '.docx' | null = null;
+    if (hasAttachment) {
+      attachmentExt = getWordFileExtension(String(attachmentName || ''));
+      if (!attachmentExt) {
+        return res.status(400).json({
+          error: 'Định dạng tệp đính kèm không hợp lệ. Chỉ chấp nhận tệp Word (.doc hoặc .docx).',
+        });
+      }
+      const sizeNum = Number(attachmentSize);
+      if (!Number.isFinite(sizeNum) || sizeNum <= 0) {
+        return res.status(400).json({
+          error: 'Tệp Word đính kèm không hợp lệ hoặc bị rỗng.',
+        });
+      }
+      if (sizeNum > getMaxWordFileSizeBytes()) {
+        return res.status(400).json({
+          error: `Dung lượng tệp vượt quá giới hạn tối đa ${getMaxWordFileSizeMB()} MB.`,
+        });
+      }
+      const driveCfg = resolveDriveForBook(targetBook);
+      if (!driveCfg.isConfigured) {
+        return res.status(400).json({
+          error: `${driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ cho sổ này.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc liên hệ Quản trị viên.`,
+        });
+      }
+    }
+
     // 2. Tính toán năm và ngày theo giờ Việt Nam (Asia/Ho_Chi_Minh)
-    const { year, formattedDate } = getRequestVietnamTimeInfo(req);
+    const vietnamNow = getRequestVietnamTimeInfo(req);
+    const { year, formattedDate } = vietnamNow;
 
     // 3. Kiểm tra loại văn bản hợp lệ theo mã ổn định từ danh mục
     const canonicalTypeCode = resolveCanonicalTypeCode(typeCode, db.documentTypes);
@@ -3021,12 +3204,33 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       });
     }
 
+    // Nếu số thực tế trên nguồn dữ liệu chính vừa thay đổi so với số dự kiến người dùng đang thấy,
+    // trả về số mới nhất để người dùng xác nhận trước khi cấp (tránh cấp nhầm số ngoài dự kiến).
+    if (
+      !confirmUpdatedSequence &&
+      expectedNextSeq !== undefined &&
+      expectedNextSeq !== null &&
+      expectedNextSeq !== ''
+    ) {
+      const parsedExpectedSeq = Number(expectedNextSeq);
+      if (Number.isFinite(parsedExpectedSeq) && parsedExpectedSeq !== nextSeq) {
+        return res.status(409).json({
+          code: 'SEQUENCE_CHANGED',
+          expectedNextSeq: parsedExpectedSeq,
+          currentNextSeq: nextSeq,
+          sequenceNumber: nextSeq,
+          previewNumber: fullDocNumber,
+          formattedDate,
+          error: `Số dự kiến vừa thay đổi từ ${formatSequenceNumber(parsedExpectedSeq)} sang ${fullDocNumber} (do có văn bản mới được cấp hoặc mốc số vừa cập nhật). Vui lòng xác nhận số mới trước khi cấp.`,
+        });
+      }
+    }
+
     // 4b. Nếu có tệp Word đính kèm, luôn tính lại tên tệp chuẩn theo SỐ CHÍNH THỨC vừa cấp
     let resolvedDriveFileName: string | undefined;
     if (hasAttachment && attachmentExt) {
       let targetFileName = buildStandardDriveFileName(fullDocNumber, validDocName, attachmentExt);
       if (typeof customFileName === 'string' && customFileName.trim()) {
-        // Nếu người dùng không sửa phần tiền tố hoặc số không dịch chuyển do đồng thời, dùng custom; nếu số vừa nhảy vì cấp đồng thời thì ưu tiên số chính thức
         const cleanCustom = sanitizeCustomDriveFileName(customFileName, attachmentExt);
         const prefixOfficial = fullDocNumber.replace(/\//g, '.');
         if (cleanCustom.startsWith(prefixOfficial)) {
@@ -3074,9 +3278,9 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       title: finalTitle,
       signer: signer.trim(),
       signerRole: signerRole.trim(),
-      issuedBy: currentUser.fullName,
-      issuedByUsername: currentUser.username,
-      issuedByUserId: currentUser.id,
+      issuedBy: latestActor.fullName,
+      issuedByUsername: latestActor.username,
+      issuedByUserId: latestActor.id,
       status: 'active',
       notes: notes ? notes.trim() : '',
       auditLogs: [],
@@ -3091,7 +3295,7 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     recordDocumentHistoryEntry({
       doc: newDocument,
       book: targetBook,
-      actor: currentUser,
+      actor: latestActor,
       action: 'create',
       changes: {
         bookCode: { old: null, new: targetBook.code },
@@ -3103,25 +3307,45 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       },
     });
 
-    // Lưu vào database
-    db.documents.unshift(newDocument); // bản ghi mới nhất ở đầu mảng
+    // Lưu vào database (không bao giờ ghi đè customStartSequences)
+    db.documents.unshift(newDocument);
     db.idempotencyKeys[idempotencyKey] = docId;
 
     saveDatabaseSync(db);
 
+    const nextPreview = buildPreviewResponseForSeries(
+      targetBook,
+      year,
+      canonicalTypeCode,
+      vietnamNow
+    );
+
     // Phát sóng sự kiện SSE đến tất cả thiết bị đang mở
-    broadcastSSE('document_issued', { document: newDocument });
+    broadcastSSE('document_issued', { document: newDocument, nextPreview });
+    issuedDocForSync = newDocument;
 
-    // Tự động đồng bộ sang Google Sheets nếu đã cấu hình
-    await syncToGoogleSheets(newDocument, 'create');
-
-    // Trả kết quả
-    res.json({ document: newDocument, success: true });
+    // Trả kết quả ngay sau khi lưu nguồn dữ liệu chính (độ trễ đồng bộ Excel/Sheets không ảnh hưởng số cấp)
+    res.json({ document: newDocument, nextPreview, success: true });
   } catch (err: any) {
     console.error('Lỗi khi cấp số:', err);
-    res.status(500).json({ error: 'Lỗi máy chủ khi cấp số: ' + (err.message || 'Không xác định') });
+    if (!res.headersSent) {
+      res.status(500).json({ error: 'Lỗi máy chủ khi cấp số: ' + (err.message || 'Không xác định') });
+    }
   } finally {
     releaseLock();
+  }
+
+  if (issuedDocForSync) {
+    const syncDoc = issuedDocForSync;
+    void syncToGoogleSheets(syncDoc, 'create')
+      .then((syncRes) => {
+        if (syncRes.attempted) {
+          broadcastSSE('document_updated', { document: syncDoc });
+        }
+      })
+      .catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi cấp số:', err);
+      });
   }
 });
 
@@ -3930,6 +4154,7 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
 
 // 8. Sổ Theo Dõi - Danh sách văn bản theo quyền Xem từng sổ
 app.get('/api/documents', requireAuth, (req, res) => {
+  reloadDatabaseFromDiskIfNewer();
   const currentUser = (req as any).user as User;
   const {
     bookId,

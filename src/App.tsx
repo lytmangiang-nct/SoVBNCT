@@ -685,6 +685,9 @@ export default function App() {
                 activeBook={activeBook}
                 accessibleBooks={accessibleBooks.length > 0 ? accessibleBooks : [activeBook]}
                 onSelectBook={setActiveBookId}
+                booksLoaded={settingsLoaded}
+                appSyncError={syncError}
+                onRetryAppLoad={loadAppData}
                 settings={settings}
                 documentTypes={documentTypes}
                 signers={signers}
@@ -701,12 +704,24 @@ export default function App() {
                   setActiveTab('registry');
                 }}
                 onOpenExistingDocument={handleOpenExistingDocument}
-                onDocumentTypeAdded={(newType) => {
+                onDocumentTypeAdded={(newType, updatedBook) => {
                   setDocumentTypes((prev) => {
-                    if (prev.some((t) => t.code === newType.code)) return prev;
+                    if (prev.some((t) => t.code === newType.code)) {
+                      return prev.map((t) => (t.code === newType.code ? newType : t));
+                    }
                     return [...prev, newType];
                   });
-                  showToast(`Đã thêm loại văn bản mới: ${newType.name} (${newType.code})`, 'success');
+                  if (updatedBook) {
+                    setBooks((prev) =>
+                      prev.map((b) => (b.id === updatedBook.id ? updatedBook : b))
+                    );
+                  }
+                  showToast(
+                    updatedBook && documentTypes.some((t) => t.code === newType.code)
+                      ? `Đã bật loại văn bản ${newType.name} (${newType.code}) cho ${updatedBook.name}`
+                      : `Đã thêm loại văn bản mới: ${newType.name} (${newType.code})`,
+                    'success'
+                  );
                 }}
               />
             )}

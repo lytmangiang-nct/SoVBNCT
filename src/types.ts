@@ -378,6 +378,10 @@ export interface StatisticsData {
 
 export interface PreviewNumberResponse {
   bookId?: string;
+  bookCode?: string;
+  typeCode?: string;
+  seriesKey?: string;
+  storageKey?: string;
   previewNumber: string;
   sequenceNumber: number;
   year: number;
@@ -386,6 +390,8 @@ export interface PreviewNumberResponse {
   mode: NumberMode;
   customStartSequence?: number | null;
   maxIssuedSequence?: number;
+  configVersion?: number;
+  serverTimeMs?: number;
 }
 
 export interface StartSequenceSeriesConfig {

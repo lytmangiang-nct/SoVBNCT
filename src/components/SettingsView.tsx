@@ -1026,23 +1026,51 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  // 4. Create Document Type (Admin)
+  // 4. Create Document Type (Admin / manage_book)
   const handleCreateDocType = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!isAdmin || isConfigBlocked) return;
+    if (!canManageSelectedBook || isConfigBlocked) return;
+    const normalizedName = newTypeName.trim().replace(/\s+/g, ' ');
+    const normalizedCode = newTypeCode.trim().replace(/\s+/g, '').toUpperCase();
+    if (!normalizedName || !normalizedCode) {
+      setTypeError('Vui lòng nhập đầy đủ tên loại văn bản và ký hiệu viết tắt.');
+      return;
+    }
     setTypeSaving(true);
     setTypeError(null);
     try {
       await api.createDocumentType({
-        name: newTypeName.trim(),
-        code: newTypeCode.trim().toUpperCase(),
+        name: normalizedName,
+        code: normalizedCode,
         color: newTypeColor,
+        bookId: selectedBook.id,
       });
       setNewTypeName('');
       setNewTypeCode('');
       setNewTypeColor('blue');
+      onBooksUpdated?.();
       onRefreshData();
     } catch (err: any) {
+      if (err?.code === 'TYPE_EXISTS_IN_CATALOG_NOT_ENABLED') {
+        try {
+          await api.createDocumentType({
+            name: normalizedName,
+            code: normalizedCode,
+            color: newTypeColor,
+            bookId: selectedBook.id,
+            enableExistingForBook: true,
+          });
+          setNewTypeName('');
+          setNewTypeCode('');
+          setNewTypeColor('blue');
+          onBooksUpdated?.();
+          onRefreshData();
+          return;
+        } catch (enableErr: any) {
+          setTypeError(enableErr.message || 'Lỗi khi bật loại văn bản cho sổ');
+          return;
+        }
+      }
       setTypeError(err.message || 'Lỗi khi tạo loại văn bản');
     } finally {
       setTypeSaving(false);
@@ -2656,7 +2684,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           </div>
 
-          {isAdmin && (
+          {canManageSelectedBook && (
             <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
               <h3 className="text-sm font-bold text-slate-900 mb-3 flex items-center gap-2">
                 <Plus className="w-4 h-4 text-sky-700" />

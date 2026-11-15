@@ -85,6 +85,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
   try {
     res = await fetch(targetUrl, {
       ...options,
+      cache: options.cache || 'no-store',
       headers,
       credentials: 'include',
     });
@@ -146,6 +147,11 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     if (errorData.formattedDate) err.formattedDate = errorData.formattedDate;
     if (errorData.previewNumber) err.previewNumber = errorData.previewNumber;
     if (errorData.sequenceNumber !== undefined) err.sequenceNumber = errorData.sequenceNumber;
+    if (errorData.expectedNextSeq !== undefined) err.expectedNextSeq = errorData.expectedNextSeq;
+    if (errorData.currentNextSeq !== undefined) err.currentNextSeq = errorData.currentNextSeq;
+    if (errorData.documentType) err.documentType = errorData.documentType;
+    if (errorData.bookId) err.bookId = errorData.bookId;
+    if (errorData.bookName) err.bookName = errorData.bookName;
     throw err;
   }
 
@@ -434,11 +440,20 @@ export const api = {
   },
 
   // Document Types
-  createDocumentType: async (payload: { name: string; code: string; color?: string }): Promise<{ documentType: DocumentTypeConfig }> => {
-    return request<{ documentType: DocumentTypeConfig }>('/api/document-types', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
+  createDocumentType: async (payload: {
+    name: string;
+    code: string;
+    color?: string;
+    bookId?: string;
+    enableExistingForBook?: boolean;
+  }): Promise<{ documentType: DocumentTypeConfig; book?: RegistryBook; enabledExisting?: boolean }> => {
+    return request<{ documentType: DocumentTypeConfig; book?: RegistryBook; enabledExisting?: boolean }>(
+      '/api/document-types',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
   },
 
   updateDocumentType: async (id: string, payload: Partial<DocumentTypeConfig>): Promise<{ documentType: DocumentTypeConfig }> => {
@@ -476,11 +491,19 @@ export const api = {
   },
 
   // Number Preview
-  previewNumber: async (typeCode: string, bookId?: string, year?: number): Promise<PreviewNumberResponse> => {
+  previewNumber: async (
+    typeCode: string,
+    bookId?: string,
+    year?: number,
+    signal?: AbortSignal
+  ): Promise<PreviewNumberResponse> => {
     const q = new URLSearchParams({ typeCode });
     if (bookId) q.append('bookId', bookId);
     if (year) q.append('year', String(year));
-    return request<PreviewNumberResponse>(`/api/documents/preview?${q.toString()}`);
+    return request<PreviewNumberResponse>(`/api/documents/preview?${q.toString()}`, {
+      signal,
+      cache: 'no-store',
+    });
   },
 
   // Check Drive filename conflict
@@ -534,11 +557,16 @@ export const api = {
     conflictAction?: 'suffix' | 'overwrite';
     customFileName?: string;
     expectedYear?: number;
-  }): Promise<{ document: DocumentRecord; duplicatePrevented?: boolean }> => {
-    return request<{ document: DocumentRecord; duplicatePrevented?: boolean }>('/api/documents/issue', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-    });
+    expectedNextSeq?: number;
+    confirmUpdatedSequence?: boolean;
+  }): Promise<{ document: DocumentRecord; nextPreview?: PreviewNumberResponse; duplicatePrevented?: boolean }> => {
+    return request<{ document: DocumentRecord; nextPreview?: PreviewNumberResponse; duplicatePrevented?: boolean }>(
+      '/api/documents/issue',
+      {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      }
+    );
   },
 
   // Upload, Retry or Replace Word Attachment on Google Drive

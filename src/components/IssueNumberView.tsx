@@ -49,6 +49,9 @@ interface IssueNumberViewProps {
   activeBook: RegistryBook;
   accessibleBooks: RegistryBook[];
   onSelectBook: (bookId: string) => void;
+  booksLoaded?: boolean;
+  appSyncError?: string | null;
+  onRetryAppLoad?: () => void;
   settings: SystemSettings;
   documentTypes: DocumentTypeConfig[];
   signers: SignerConfig[];
@@ -62,7 +65,7 @@ interface IssueNumberViewProps {
   onDocumentUpdated?: (doc: DocumentRecord) => void;
   onNavigateToRegistry: () => void;
   onOpenExistingDocument?: (docId: string) => void;
-  onDocumentTypeAdded?: (newType: DocumentTypeConfig) => void;
+  onDocumentTypeAdded?: (newType: DocumentTypeConfig, updatedBook?: RegistryBook) => void;
 }
 
 export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
@@ -70,6 +73,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   activeBook,
   accessibleBooks,
   onSelectBook,
+  booksLoaded = true,
+  appSyncError = null,
+  onRetryAppLoad,
   settings,
   documentTypes,
   signers: globalSigners,
@@ -88,17 +94,46 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   const canIssue = hasBookPermission(currentUser, activeBook.id, 'issue_number');
   const canRequest = hasBookPermission(currentUser, activeBook.id, 'request_number');
   const canView = hasBookPermission(currentUser, activeBook.id, 'view');
+  const canManageDocTypes =
+    isSystemAdmin(currentUser) || hasBookPermission(currentUser, activeBook.id, 'manage_book');
 
   const effectiveSigners = useMemo(
     () => (activeBook.signers && activeBook.signers.length > 0 ? activeBook.signers : globalSigners),
     [activeBook.signers, globalSigners]
   );
 
+  // Local optimistic buffer for newly added/enabled types per book so typeCode never flickers back to KH before parent props sync
+  const [recentlyAddedTypesByBook, setRecentlyAddedTypesByBook] = useState<
+    Record<string, DocumentTypeConfig[]>
+  >({});
+
+  const mergedDocumentTypes = useMemo(() => {
+    const extras = recentlyAddedTypesByBook[activeBook.id] || [];
+    if (extras.length === 0) return documentTypes;
+    const map = new Map<string, DocumentTypeConfig>();
+    for (const t of documentTypes) {
+      map.set(t.code.trim().toUpperCase(), t);
+    }
+    for (const extra of extras) {
+      const key = extra.code.trim().toUpperCase();
+      if (!map.has(key)) {
+        map.set(key, extra);
+      }
+    }
+    return Array.from(map.values());
+  }, [documentTypes, recentlyAddedTypesByBook, activeBook.id]);
+
   // Form State (scoped to document types enabled in activeBook)
-  const activeTypes = useMemo(
-    () => getBookEnabledTypes(activeBook, documentTypes),
-    [activeBook, documentTypes]
-  );
+  const activeTypes = useMemo(() => {
+    const base = getBookEnabledTypes(activeBook, mergedDocumentTypes);
+    const extras = recentlyAddedTypesByBook[activeBook.id] || [];
+    if (extras.length === 0) return base;
+    const existingCodes = new Set(base.map((t) => t.code.trim().toUpperCase()));
+    const missingExtras = extras.filter(
+      (t) => t.isActive && !existingCodes.has(t.code.trim().toUpperCase())
+    );
+    return missingExtras.length > 0 ? [...base, ...missingExtras] : base;
+  }, [activeBook, mergedDocumentTypes, recentlyAddedTypesByBook]);
   const defaultTypeCode = activeTypes.length > 0 ? activeTypes[0].code : 'KH';
 
   const [typeCode, setTypeCode] = useState<string>(defaultTypeCode);
@@ -109,21 +144,36 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   const [isCustomSigner, setIsCustomSigner] = useState<boolean>(false);
   const [notes, setNotes] = useState<string>('');
 
-  // Quick Add Type Modal State (Admin only)
+  // Quick Add Type Modal State (Admin / manage_book)
   const [showAddTypeModal, setShowAddTypeModal] = useState<boolean>(false);
   const [newTypeName, setNewTypeName] = useState<string>('');
   const [newTypeCode, setNewTypeCode] = useState<string>('');
   const [newTypeColor, setNewTypeColor] = useState<string>('blue');
   const [addTypeSaving, setAddTypeSaving] = useState<boolean>(false);
   const [addTypeError, setAddTypeError] = useState<string | null>(null);
+  const [existingCatalogType, setExistingCatalogType] = useState<DocumentTypeConfig | null>(null);
 
   // Idempotency Key
   const generateKey = () => `req-${Date.now()}-${Math.random().toString(36).slice(2, 9)}`;
   const [idempotencyKey, setIdempotencyKey] = useState<string>(generateKey);
 
-  // Next Document Number Preview
-  const [nextNumber, setNextNumber] = useState<string>('...');
-  const [loadingNextNumber, setLoadingNextNumber] = useState<boolean>(false);
+  // Next Document Number Preview (strictly scoped by book + year + series + request sequence)
+  const [previewStatus, setPreviewStatus] = useState<'loading' | 'ready' | 'error'>('loading');
+  const [nextNumber, setNextNumber] = useState<string | null>(null);
+  const [nextSequenceNumber, setNextSequenceNumber] = useState<number | null>(null);
+  const [previewSeriesKey, setPreviewSeriesKey] = useState<string | null>(null);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [sequenceConflict, setSequenceConflict] = useState<{
+    expectedNextSeq: number;
+    currentNextSeq: number;
+    previewNumber: string;
+    message: string;
+  } | null>(null);
+
+  const previewAbortRef = useRef<AbortController | null>(null);
+  const previewReqSeqRef = useRef<number>(0);
+  const activeSeriesKeyRef = useRef<string>('');
+  const lastServerPreviewDocIdRef = useRef<string | null>(null);
 
   // Submission State
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
@@ -231,75 +281,227 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   }, [activeTypes, activeBook.id, typeCode]);
 
-  // Fetch preview number scoped to activeBook
-  useEffect(() => {
-    let active = true;
-    const fetchNextNumber = async () => {
-      if (!typeCode || (!canIssue && !canRequest && !canView)) {
-        setNextNumber('---');
+  const effectiveSeriesTypeCode = activeBook.numberMode === 'shared' ? 'SHARED' : typeCode;
+  const currentSeriesKey = `${activeBook.id}::${effectiveSeriesTypeCode}::${activeBook.numberMode}`;
+  activeSeriesKeyRef.current = currentSeriesKey;
+
+  const isTypeValidInActiveBook = useMemo(
+    () => activeTypes.some((t) => t.code === typeCode),
+    [activeTypes, typeCode]
+  );
+
+  const fetchNextNumber = React.useCallback(
+    async (options?: { silent?: boolean }) => {
+      const silent = Boolean(options?.silent);
+      if (!booksLoaded) {
+        if (!silent) {
+          setPreviewStatus(appSyncError ? 'error' : 'loading');
+          setNextNumber(null);
+          setNextSequenceNumber(null);
+          setPreviewSeriesKey(null);
+          setPreviewError(appSyncError || null);
+        }
         return;
       }
-      setLoadingNextNumber(true);
+
+      if (!typeCode || (!canIssue && !canRequest && !canView)) {
+        setPreviewStatus('error');
+        setNextNumber(null);
+        setNextSequenceNumber(null);
+        setPreviewSeriesKey(null);
+        setPreviewError('Tài khoản chưa có quyền đọc số trên sổ này.');
+        return;
+      }
+
+      if (!isTypeValidInActiveBook && activeTypes.length > 0) {
+        setPreviewStatus('loading');
+        setNextNumber(null);
+        setNextSequenceNumber(null);
+        setPreviewSeriesKey(null);
+        return;
+      }
+
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
+      }
+      const controller = new AbortController();
+      previewAbortRef.current = controller;
+
+      const reqId = ++previewReqSeqRef.current;
+      const targetBookId = activeBook.id;
+      const targetTypeCode = typeCode;
+      const targetMode = activeBook.numberMode;
+      const targetSeriesKey = `${targetBookId}::${
+        targetMode === 'shared' ? 'SHARED' : targetTypeCode
+      }::${targetMode}`;
+
+      if (!silent) {
+        setPreviewStatus('loading');
+        setNextNumber(null);
+        setNextSequenceNumber(null);
+        setPreviewSeriesKey(null);
+        setPreviewError(null);
+        setSequenceConflict(null);
+      }
+
       try {
-        const res = await api.previewNumber(typeCode, activeBook.id);
-        if (active) {
-          setNextNumber(res.previewNumber);
-          if (res.formattedDate) {
-            setTodayVietnam(res.formattedDate);
-          }
-          const latestSrvYear = res.serverYear || res.year;
-          if (latestSrvYear) {
-            onServerTimeUpdate?.(latestSrvYear, res.formattedDate);
-            if (latestSrvYear !== formYear) {
-              if (docName.trim() || title.trim() || notes.trim() || selectedFile) {
-                setYearRolloverNotice({
-                  fromYear: formYear,
-                  toYear: latestSrvYear,
-                  newPreviewNumber: res.previewNumber,
-                  confirmed: false,
-                });
-              } else {
-                setFormYear(latestSrvYear);
-                setYearRolloverNotice(null);
-              }
+        const res = await api.previewNumber(
+          targetTypeCode,
+          targetBookId,
+          undefined,
+          controller.signal
+        );
+        if (
+          reqId !== previewReqSeqRef.current ||
+          activeSeriesKeyRef.current !== targetSeriesKey
+        ) {
+          return;
+        }
+
+        setNextNumber(res.previewNumber);
+        setNextSequenceNumber(
+          typeof res.sequenceNumber === 'number' ? res.sequenceNumber : null
+        );
+        setPreviewSeriesKey(targetSeriesKey);
+        setPreviewStatus('ready');
+        setPreviewError(null);
+
+        if (res.formattedDate) {
+          setTodayVietnam(res.formattedDate);
+        }
+        const latestSrvYear = res.serverYear || res.year;
+        if (latestSrvYear) {
+          onServerTimeUpdate?.(latestSrvYear, res.formattedDate);
+          if (latestSrvYear !== formYear) {
+            if (docName.trim() || title.trim() || notes.trim() || selectedFile) {
+              setYearRolloverNotice({
+                fromYear: formYear,
+                toYear: latestSrvYear,
+                newPreviewNumber: res.previewNumber,
+                confirmed: false,
+              });
+            } else {
+              setFormYear(latestSrvYear);
+              setYearRolloverNotice(null);
             }
           }
         }
-      } catch {
-        if (active) {
-          setNextNumber('---');
+      } catch (err: any) {
+        if (err?.name === 'AbortError') return;
+        if (
+          reqId !== previewReqSeqRef.current ||
+          activeSeriesKeyRef.current !== targetSeriesKey
+        ) {
+          return;
         }
-      } finally {
-        if (active) setLoadingNextNumber(false);
+        if (!silent || previewSeriesKey !== targetSeriesKey) {
+          setNextNumber(null);
+          setNextSequenceNumber(null);
+          setPreviewSeriesKey(null);
+          setPreviewStatus('error');
+          setPreviewError(err?.message || 'Chưa lấy được số mới nhất từ máy chủ.');
+        }
+      }
+    },
+    [
+      booksLoaded,
+      appSyncError,
+      typeCode,
+      activeBook.id,
+      activeBook.numberMode,
+      canIssue,
+      canRequest,
+      canView,
+      isTypeValidInActiveBook,
+      activeTypes.length,
+      formYear,
+      docName,
+      title,
+      notes,
+      selectedFile,
+      onServerTimeUpdate,
+      previewSeriesKey,
+    ]
+  );
+
+  // Immediately clear stale preview & fetch fresh number when switching book, mode, or typeCode
+  useEffect(() => {
+    if (!booksLoaded) {
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
+      }
+      previewReqSeqRef.current += 1;
+      setPreviewStatus(appSyncError ? 'error' : 'loading');
+      setNextNumber(null);
+      setNextSequenceNumber(null);
+      setPreviewSeriesKey(null);
+      setPreviewError(appSyncError || null);
+      setSequenceConflict(null);
+      return;
+    }
+
+    fetchNextNumber({ silent: false });
+
+    return () => {
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
       }
     };
+  }, [
+    booksLoaded,
+    appSyncError,
+    activeBook.id,
+    activeBook.numberMode,
+    typeCode,
+    isTypeValidInActiveBook,
+    canIssue,
+    canRequest,
+    canView,
+  ]);
 
-    fetchNextNumber();
+  // Background recheck when configVersion changes, documents update from other tabs/devices, or tab regains focus
+  useEffect(() => {
+    if (!booksLoaded) return;
 
     const handleRecheck = () => {
       if (document.visibilityState === 'visible') {
-        fetchNextNumber();
+        fetchNextNumber({ silent: previewStatus === 'ready' && previewSeriesKey === currentSeriesKey });
       }
     };
     window.addEventListener('focus', handleRecheck);
     document.addEventListener('visibilitychange', handleRecheck);
 
     return () => {
-      active = false;
       window.removeEventListener('focus', handleRecheck);
       document.removeEventListener('visibilitychange', handleRecheck);
     };
+  }, [booksLoaded, fetchNextNumber, previewStatus, previewSeriesKey, currentSeriesKey]);
+
+  const lastDocSignatureRef = useRef<string>('');
+  useEffect(() => {
+    if (!booksLoaded) return;
+    const topDocId = documents[0]?.id || '';
+    const sig = `${activeBook.configVersion || 1}::${activeBook.numberFormat}::${documents.length}::${topDocId}`;
+    if (!lastDocSignatureRef.current) {
+      lastDocSignatureRef.current = sig;
+      return;
+    }
+    if (lastDocSignatureRef.current === sig) return;
+    lastDocSignatureRef.current = sig;
+
+    // If this document change came from our own just-completed issueDocument() call, we already have exact nextPreview
+    if (topDocId && lastServerPreviewDocIdRef.current === topDocId) {
+      lastServerPreviewDocIdRef.current = null;
+      return;
+    }
+
+    fetchNextNumber({ silent: previewStatus === 'ready' && previewSeriesKey === currentSeriesKey });
   }, [
-    typeCode,
-    activeBook.id,
-    activeBook.numberMode,
+    booksLoaded,
     activeBook.configVersion,
-    serverYear,
+    activeBook.numberFormat,
     documents.length,
     documents[0]?.id,
-    canIssue,
-    canRequest,
-    canView,
   ]);
 
   const handleSignerSelect = (e: React.ChangeEvent<HTMLSelectElement>) => {
@@ -357,7 +559,10 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
-  const performIssueSubmit = async (conflictAction?: 'suffix' | 'overwrite') => {
+  const performIssueSubmit = async (
+    conflictAction?: 'suffix' | 'overwrite',
+    confirmUpdatedSequence = false
+  ) => {
     if (isSubmitting) return;
     setSubmitError(null);
     setFilenameConflict(null);
@@ -410,6 +615,17 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       return;
     }
 
+    // Chặn cấp số nếu chưa có dữ liệu số tiếp theo hợp lệ từ máy chủ cho đúng dãy đang chọn
+    if (
+      !booksLoaded ||
+      previewStatus !== 'ready' ||
+      previewSeriesKey !== currentSeriesKey ||
+      nextSequenceNumber === null
+    ) {
+      setSubmitError('Đang kiểm tra số tiếp theo từ máy chủ hoặc chưa lấy được số mới nhất. Vui lòng thử lại.');
+      return;
+    }
+
     // Luồng 2: Người dùng có quyền "Cấp số" (issue_number) -> cấp số nguyên tử + tùy chọn tải Word lên Drive
     if (selectedFile) {
       const validationErr = validateWordFile(selectedFile);
@@ -436,14 +652,18 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     setIsSubmitting(true);
     setUploadStep(selectedFile ? 'issuing' : 'idle');
     setRetryError(null);
+    setSequenceConflict(null);
 
     let issuedDoc: DocumentRecord | null = null;
     const fileToUpload = selectedFile;
+    const submittingSeriesKey = currentSeriesKey;
+    const submittingTypeCode = typeCode.trim().toUpperCase();
+    const submittingBookId = activeBook.id;
 
     try {
       const res = await api.issueDocument({
-        bookId: activeBook.id,
-        typeCode: typeCode.trim().toUpperCase(),
+        bookId: submittingBookId,
+        typeCode: submittingTypeCode,
         docName: docName.trim(),
         title: title.trim(),
         signer: signer.trim(),
@@ -455,19 +675,40 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         attachmentSize: fileToUpload?.size,
         conflictAction,
         expectedYear: yearRolloverNotice?.confirmed ? yearRolloverNotice.toYear : formYear,
+        expectedNextSeq: nextSequenceNumber,
+        confirmUpdatedSequence,
       });
 
       issuedDoc = res.document;
+      lastServerPreviewDocIdRef.current = issuedDoc.id;
+
+      // Hủy mọi preview cũ đang chạy dở để không bao giờ ghi đè số tiếp theo mới nhất từ giao dịch vừa cấp
+      if (previewAbortRef.current) {
+        previewAbortRef.current.abort();
+      }
+      previewReqSeqRef.current += 1;
+
       setYearRolloverNotice(null);
+      setSequenceConflict(null);
       setFormYear(issuedDoc.year);
       setIssuedSuccessDoc(issuedDoc);
-      onDocumentIssued(issuedDoc);
+      setIdempotencyKey(generateKey());
 
-      api.previewNumber(typeCode.trim().toUpperCase(), activeBook.id).then((preview) => {
-        setNextNumber(preview.previewNumber);
-        if (preview.formattedDate) setTodayVietnam(preview.formattedDate);
-        if (preview.serverYear) onServerTimeUpdate?.(preview.serverYear, preview.formattedDate);
-      }).catch(() => {});
+      if (res.nextPreview && activeSeriesKeyRef.current === submittingSeriesKey) {
+        setNextNumber(res.nextPreview.previewNumber);
+        setNextSequenceNumber(res.nextPreview.sequenceNumber);
+        setPreviewSeriesKey(submittingSeriesKey);
+        setPreviewStatus('ready');
+        setPreviewError(null);
+        if (res.nextPreview.formattedDate) setTodayVietnam(res.nextPreview.formattedDate);
+        if (res.nextPreview.serverYear) {
+          onServerTimeUpdate?.(res.nextPreview.serverYear, res.nextPreview.formattedDate);
+        }
+      } else {
+        fetchNextNumber({ silent: false });
+      }
+
+      onDocumentIssued(issuedDoc);
 
       if (fileToUpload) {
         setUploadStep('uploading');
@@ -503,8 +744,28 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       }
     } catch (err: any) {
       setUploadStep('idle');
-      if (err.code === 'YEAR_CHANGED' && err.currentYear) {
+      if (err.code === 'SEQUENCE_CHANGED' && typeof err.currentNextSeq === 'number' && err.previewNumber) {
+        if (previewAbortRef.current) {
+          previewAbortRef.current.abort();
+        }
+        previewReqSeqRef.current += 1;
+        setNextNumber(err.previewNumber);
+        setNextSequenceNumber(err.currentNextSeq);
+        setPreviewSeriesKey(submittingSeriesKey);
+        setPreviewStatus('ready');
+        setPreviewError(null);
+        setSequenceConflict({
+          expectedNextSeq: err.expectedNextSeq ?? nextSequenceNumber,
+          currentNextSeq: err.currentNextSeq,
+          previewNumber: err.previewNumber,
+          message:
+            err.message ||
+            `Số dự kiến đã thay đổi thành ${err.previewNumber}. Vui lòng xác nhận để cấp theo số mới nhất.`,
+        });
+        setSubmitError(null);
+      } else if (err.code === 'YEAR_CHANGED' && err.currentYear) {
         if (err.previewNumber) setNextNumber(err.previewNumber);
+        if (typeof err.sequenceNumber === 'number') setNextSequenceNumber(err.sequenceNumber);
         if (err.formattedDate) setTodayVietnam(err.formattedDate);
         onServerTimeUpdate?.(err.currentYear, err.formattedDate);
         setYearRolloverNotice({
@@ -617,6 +878,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     setTitle('');
     setNotes('');
     setSubmitError(null);
+    setSequenceConflict(null);
     setCopied(false);
     setSelectedFile(null);
     setFileError(null);
@@ -629,14 +891,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     setIdempotencyKey(generateKey());
 
     if (typeCode) {
-      api.previewNumber(typeCode, activeBook.id).then((preview) => {
-        setNextNumber(preview.previewNumber);
-        if (preview.formattedDate) setTodayVietnam(preview.formattedDate);
-        if (preview.serverYear) {
-          setFormYear(preview.serverYear);
-          onServerTimeUpdate?.(preview.serverYear, preview.formattedDate);
-        }
-      }).catch(() => {});
+      fetchNextNumber({ silent: previewStatus === 'ready' && previewSeriesKey === currentSeriesKey });
     }
   };
 
@@ -687,30 +942,84 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   };
 
+  const openAddTypeDialog = () => {
+    setNewTypeName('');
+    setNewTypeCode('');
+    setNewTypeColor('blue');
+    setAddTypeError(null);
+    setExistingCatalogType(null);
+    setShowAddTypeModal(true);
+  };
+
+  const applyAddedOrEnabledDocType = (docType: DocumentTypeConfig, updatedBook?: RegistryBook) => {
+    const targetBookId = updatedBook?.id || activeBook.id;
+    setRecentlyAddedTypesByBook((prev) => {
+      const current = prev[targetBookId] || [];
+      if (current.some((t) => t.code.toUpperCase() === docType.code.toUpperCase())) {
+        return prev;
+      }
+      return {
+        ...prev,
+        [targetBookId]: [...current, docType],
+      };
+    });
+    if (onDocumentTypeAdded) {
+      onDocumentTypeAdded(docType, updatedBook);
+    }
+    setTypeCode(docType.code);
+    setShowAddTypeModal(false);
+    setNewTypeName('');
+    setNewTypeCode('');
+    setNewTypeColor('blue');
+    setAddTypeError(null);
+    setExistingCatalogType(null);
+  };
+
   const handleQuickAddType = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!newTypeName.trim() || !newTypeCode.trim()) {
-      setAddTypeError('Vui lòng nhập đầy đủ tên loại văn bản và ký hiệu viết tắt');
+    const normalizedName = newTypeName.trim().replace(/\s+/g, ' ');
+    const normalizedCode = newTypeCode.trim().replace(/\s+/g, '').toUpperCase();
+    if (!normalizedName || !normalizedCode) {
+      setAddTypeError('Vui lòng nhập đầy đủ tên loại văn bản và ký hiệu viết tắt.');
       return;
     }
+
+    setAddTypeSaving(true);
+    setAddTypeError(null);
+    setExistingCatalogType(null);
+    try {
+      const res = await api.createDocumentType({
+        name: normalizedName,
+        code: normalizedCode,
+        color: newTypeColor,
+        bookId: activeBook.id,
+      });
+      applyAddedOrEnabledDocType(res.documentType, res.book);
+    } catch (err: any) {
+      if (err?.code === 'TYPE_EXISTS_IN_CATALOG_NOT_ENABLED' && err.documentType) {
+        setExistingCatalogType(err.documentType);
+      }
+      setAddTypeError(err.message || 'Lỗi khi tạo loại văn bản mới');
+    } finally {
+      setAddTypeSaving(false);
+    }
+  };
+
+  const handleEnableExistingCatalogType = async () => {
+    if (!existingCatalogType || addTypeSaving) return;
     setAddTypeSaving(true);
     setAddTypeError(null);
     try {
       const res = await api.createDocumentType({
-        name: newTypeName.trim(),
-        code: newTypeCode.trim().toUpperCase(),
-        color: newTypeColor,
+        name: existingCatalogType.name,
+        code: existingCatalogType.code,
+        color: existingCatalogType.color,
+        bookId: activeBook.id,
+        enableExistingForBook: true,
       });
-      if (onDocumentTypeAdded) {
-        onDocumentTypeAdded(res.documentType);
-      }
-      setTypeCode(res.documentType.code);
-      setShowAddTypeModal(false);
-      setNewTypeName('');
-      setNewTypeCode('');
-      setNewTypeColor('blue');
+      applyAddedOrEnabledDocType(res.documentType, res.book);
     } catch (err: any) {
-      setAddTypeError(err.message || 'Lỗi khi tạo loại văn bản mới');
+      setAddTypeError(err.message || 'Không thể bật loại văn bản này cho sổ hiện tại.');
     } finally {
       setAddTypeSaving(false);
     }
@@ -1157,6 +1466,21 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
             {(() => {
               const selectedDocType = activeTypes.find((t) => t.code === typeCode);
               const currentStyle = getTypeColorStyle(typeCode, selectedDocType?.color);
+              const isPreviewReady =
+                booksLoaded &&
+                previewStatus === 'ready' &&
+                previewSeriesKey === currentSeriesKey &&
+                nextSequenceNumber !== null &&
+                Boolean(nextNumber);
+              const effectivePreviewStatus: 'loading' | 'ready' | 'error' = !booksLoaded
+                ? appSyncError
+                  ? 'error'
+                  : 'loading'
+                : isPreviewReady
+                ? 'ready'
+                : previewStatus === 'error'
+                ? 'error'
+                : 'loading';
 
               return (
                 <div className="grid grid-cols-1 md:grid-cols-12 gap-4 sm:gap-6 items-start">
@@ -1165,16 +1489,10 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       <label htmlFor="doc-type" className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
                         Loại văn bản <span className="text-rose-600">*</span>
                       </label>
-                      {isSystemAdmin(currentUser) && (
+                      {canManageDocTypes && (
                         <button
                           type="button"
-                          onClick={() => {
-                            setNewTypeName('');
-                            setNewTypeCode('');
-                            setNewTypeColor('blue');
-                            setAddTypeError(null);
-                            setShowAddTypeModal(true);
-                          }}
+                          onClick={openAddTypeDialog}
                           className="text-xs font-semibold text-sky-700 hover:text-sky-900 transition-colors flex items-center gap-1 min-h-[32px]"
                         >
                           <Plus className="w-3.5 h-3.5" />
@@ -1186,7 +1504,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     <select
                       id="doc-type"
                       value={typeCode}
-                      onChange={(e) => setTypeCode(e.target.value)}
+                      onChange={(e) => {
+                        const val = e.target.value;
+                        if (val === '__add_new_type__') {
+                          openAddTypeDialog();
+                          return;
+                        }
+                        setTypeCode(val);
+                      }}
                       className="w-full min-h-[44px] h-11 px-3 py-2 bg-white border border-slate-300 rounded-lg text-base sm:text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 focus:border-sky-600 transition-colors"
                       disabled={isSubmitting}
                     >
@@ -1195,6 +1520,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                           {type.name} ({type.code})
                         </option>
                       ))}
+                      {canManageDocTypes && (
+                        <option value="__add_new_type__">+ Thêm loại văn bản...</option>
+                      )}
                     </select>
                     <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
                       <span className="text-xs text-slate-500 break-words">
@@ -1212,6 +1540,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                               setIssuedSuccessDoc(null);
                               setRequestSuccess(null);
                               setSubmitError(null);
+                              setSequenceConflict(null);
                             }}
                             disabled={isSubmitting}
                             className="flex-1 sm:flex-initial min-w-0 font-bold text-base sm:text-xs text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
@@ -1238,13 +1567,40 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         {selectedDocType?.name || typeCode}
                       </span>
                     </div>
-                    <div className={`text-2xl sm:text-3xl font-black font-mono ${currentStyle.previewText} tracking-tight flex items-center gap-2 py-1 break-all`}>
-                      {loadingNextNumber ? (
-                        <span className="text-xs font-normal text-slate-500">Đang cập nhật...</span>
+                    <div className={`text-2xl sm:text-3xl font-black font-mono ${currentStyle.previewText} tracking-tight flex items-center gap-2 py-1 break-all min-h-[44px]`}>
+                      {effectivePreviewStatus === 'loading' ? (
+                        <span className="text-xs font-sans font-semibold text-slate-600 inline-flex items-center gap-2">
+                          <RefreshCw className="w-4 h-4 animate-spin text-sky-700 shrink-0" />
+                          <span>Đang kiểm tra số tiếp theo…</span>
+                        </span>
+                      ) : effectivePreviewStatus === 'error' ? (
+                        <div className="flex flex-wrap items-center justify-between gap-2 w-full">
+                          <span className="text-xs font-sans font-bold text-rose-700 inline-flex items-center gap-1.5">
+                            <AlertCircle className="w-4 h-4 shrink-0" />
+                            <span>Chưa lấy được số mới nhất</span>
+                          </span>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (!booksLoaded && onRetryAppLoad) {
+                                onRetryAppLoad();
+                              } else {
+                                fetchNextNumber({ silent: false });
+                              }
+                            }}
+                            className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-sans font-semibold bg-white hover:bg-rose-50 text-rose-800 border border-rose-300 rounded-md shadow-2xs transition-colors"
+                          >
+                            <RefreshCw className="w-3.5 h-3.5" />
+                            <span>Thử lại</span>
+                          </button>
+                        </div>
                       ) : (
                         <span>{nextNumber}</span>
                       )}
                     </div>
+                    {effectivePreviewStatus === 'error' && previewError && (
+                      <p className="text-[11px] text-rose-700 mb-1 break-words">{previewError}</p>
+                    )}
                     <div className="flex items-center justify-between mt-1 text-[11px] text-slate-600 gap-1.5 flex-wrap">
                       <span className="font-semibold text-slate-700">
                         {activeBook.name} · {activeBook.numberMode === 'shared' ? 'Dãy số chung' : `Dãy riêng ${typeCode}`} · Năm {yearRolloverNotice ? yearRolloverNotice.toYear : formYear}
@@ -1281,7 +1637,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
               {/* Gợi ý tên file chuẩn */}
               {(() => {
-                const previewDocNumber = nextNumber && nextNumber !== '...' && nextNumber !== '---' ? nextNumber : '';
+                const previewDocNumber =
+                  booksLoaded &&
+                  previewStatus === 'ready' &&
+                  previewSeriesKey === currentSeriesKey &&
+                  nextNumber
+                    ? nextNumber
+                    : '';
                 const suggestedFileName = generateSuggestedFileName(previewDocNumber, docName);
 
                 return (
@@ -1464,7 +1826,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
             {/* Word File Attachment (Optional — available for issue_number users) */}
             {canIssue && (() => {
-              const previewDocNumber = nextNumber && nextNumber !== '...' && nextNumber !== '---' ? nextNumber : '';
+              const previewDocNumber =
+                booksLoaded &&
+                previewStatus === 'ready' &&
+                previewSeriesKey === currentSeriesKey &&
+                nextNumber
+                  ? nextNumber
+                  : '';
               const expectedDriveName = selectedFile
                 ? buildStandardDriveFileName(previewDocNumber, docName, selectedFile.name)
                 : '';
@@ -1622,6 +1990,41 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
               </div>
             )}
 
+            {/* Sequence Changed Conflict Banner */}
+            {sequenceConflict && (
+              <div className="p-4 bg-amber-50 border-2 border-amber-400 rounded-xl space-y-2.5 text-xs text-amber-950 shadow-xs">
+                <div className="flex items-start gap-2.5">
+                  <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="space-y-1">
+                    <strong className="font-bold text-sm block text-amber-950">
+                      Số dự kiến vừa được cập nhật thành {sequenceConflict.previewNumber}
+                    </strong>
+                    <p className="text-amber-900">
+                      {sequenceConflict.message} Toàn bộ nội dung văn bản và tệp Word bạn đang chọn vẫn được giữ nguyên.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-wrap items-center gap-2 pt-1">
+                  <button
+                    type="button"
+                    disabled={isSubmitting}
+                    onClick={() => performIssueSubmit(undefined, true)}
+                    className="px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg shadow-2xs transition-colors disabled:opacity-50"
+                  >
+                    Xác nhận cấp theo số mới ({sequenceConflict.previewNumber})
+                  </button>
+                  <button
+                    type="button"
+                    disabled={isSubmitting}
+                    onClick={() => setSequenceConflict(null)}
+                    className="px-3.5 py-2 bg-white hover:bg-slate-50 border border-amber-300 text-amber-900 font-semibold rounded-lg"
+                  >
+                    Để tôi kiểm tra lại
+                  </button>
+                </div>
+              </div>
+            )}
+
             {/* Year Rollover Confirmation Banner (00:00 01/01 Asia/Ho_Chi_Minh) */}
             {yearRolloverNotice && (
               <div className="p-4 bg-amber-50 border-2 border-amber-400 rounded-xl space-y-3 text-xs text-amber-950 shadow-xs">
@@ -1633,7 +2036,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     </strong>
                     <p className="text-amber-900">
                       Biểu mẫu này được mở từ năm <strong>{yearRolloverNotice.fromYear}</strong>. Toàn bộ nội dung bạn đang nhập và tệp Word đã chọn vẫn được giữ nguyên. Số văn bản dự kiến theo dãy năm <strong>{yearRolloverNotice.toYear}</strong> đã được cập nhật thành{' '}
-                      <strong className="font-mono text-sky-900">{yearRolloverNotice.newPreviewNumber || nextNumber}</strong>.
+                      <strong className="font-mono text-sky-900">{yearRolloverNotice.newPreviewNumber || nextNumber || '---'}</strong>.
                     </p>
                   </div>
                 </div>
@@ -1694,6 +2097,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         setIssuedSuccessDoc(null);
                         setRequestSuccess(null);
                         setSubmitError(null);
+                        setSequenceConflict(null);
                       }}
                       disabled={isSubmitting}
                       className="flex-1 sm:flex-initial min-w-0 font-bold text-base sm:text-xs text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
@@ -1716,7 +2120,12 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   type="submit"
                   disabled={
                     isSubmitting ||
-                    Boolean(canIssue && selectedFile && !driveConfigured) ||
+                    !booksLoaded ||
+                    (canIssue &&
+                      (previewStatus !== 'ready' ||
+                        previewSeriesKey !== currentSeriesKey ||
+                        nextSequenceNumber === null ||
+                        Boolean(selectedFile && !driveConfigured))) ||
                     Boolean(yearRolloverNotice && !yearRolloverNotice.confirmed)
                   }
                   className="w-full sm:w-auto sm:min-w-[210px] min-h-[48px] h-12 px-6 bg-sky-700 hover:bg-sky-800 active:bg-sky-900 text-white font-semibold text-base sm:text-sm rounded-lg shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
@@ -1800,15 +2209,20 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         </div>
       )}
 
-      {/* Modal: Quick Add Type (Admin Only) */}
+      {/* Modal: Quick Add Type (Admin / manage_book) */}
       {showAddTypeModal && (
         <div className="fixed inset-0 z-50 bg-slate-900/40 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
           <div className="bg-white rounded-xl max-w-md w-full p-4 sm:p-6 shadow-xl space-y-4 animate-scaleUp max-h-[90dvh] overflow-y-auto">
             <div className="flex items-center justify-between border-b border-slate-100 pb-3">
-              <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                <Plus className="w-5 h-5 text-sky-700 shrink-0" />
-                <span>Thêm loại văn bản mới</span>
-              </h3>
+              <div>
+                <h3 className="text-base font-bold text-slate-900 flex items-center gap-2">
+                  <Plus className="w-5 h-5 text-sky-700 shrink-0" />
+                  <span>Thêm loại văn bản mới</span>
+                </h3>
+                <p className="text-[11px] text-slate-500 mt-0.5">
+                  Áp dụng ngay cho sổ: <strong className="text-slate-700">{activeBook.name}</strong>
+                </p>
+              </div>
               <button
                 type="button"
                 onClick={() => setShowAddTypeModal(false)}
@@ -1824,25 +2238,33 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 <input
                   type="text"
                   value={newTypeName}
-                  onChange={(e) => setNewTypeName(e.target.value)}
-                  placeholder="Ví dụ: Quyết định, Hướng dẫn, Tờ trình..."
+                  onChange={(e) => {
+                    setNewTypeName(e.target.value);
+                    if (addTypeError) setAddTypeError(null);
+                    if (existingCatalogType) setExistingCatalogType(null);
+                  }}
+                  placeholder="Ví dụ: Giấy mời, Quyết định, Hướng dẫn..."
                   required
                   className="w-full min-h-[44px] h-11 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                 />
               </div>
 
               <div className="space-y-1">
-                <label className="font-bold text-slate-700">Ký hiệu viết tắt *</label>
+                <label className="font-bold text-slate-700">Ký hiệu *</label>
                 <input
                   type="text"
                   value={newTypeCode}
-                  onChange={(e) => setNewTypeCode(e.target.value)}
-                  placeholder="Ví dụ: QĐ, HD, TTr"
+                  onChange={(e) => {
+                    setNewTypeCode(e.target.value);
+                    if (addTypeError) setAddTypeError(null);
+                    if (existingCatalogType) setExistingCatalogType(null);
+                  }}
+                  placeholder="Ví dụ: GM, QĐ, HD"
                   required
                   className="w-full min-h-[44px] h-11 px-3 bg-white border border-slate-300 rounded-lg uppercase font-mono text-base sm:text-xs font-bold"
                 />
                 <span className="text-[11px] text-slate-500 block">
-                  Số văn bản sẽ hiển thị theo mẫu: 01-<strong>{newTypeCode || 'KÍ_HIỆU'}</strong>/{activeBook.unitCode}
+                  Số văn bản sẽ hiển thị theo mẫu: 01-<strong>{newTypeCode.trim().replace(/\s+/g, '').toUpperCase() || 'KÝ_HIỆU'}</strong>/{activeBook.unitCode}
                 </span>
               </div>
 
@@ -1868,8 +2290,21 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
               </div>
 
               {addTypeError && (
-                <div className="p-2.5 bg-rose-50 text-rose-700 rounded-lg text-xs">
-                  {addTypeError}
+                <div className="p-3 bg-rose-50 border border-rose-200 text-rose-800 rounded-lg text-xs space-y-2">
+                  <p className="font-medium">{addTypeError}</p>
+                  {existingCatalogType && (
+                    <button
+                      type="button"
+                      disabled={addTypeSaving}
+                      onClick={handleEnableExistingCatalogType}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-md transition-colors disabled:opacity-50"
+                    >
+                      <Check className="w-3.5 h-3.5" />
+                      <span>
+                        Bật {existingCatalogType.code} ({existingCatalogType.name}) cho sổ {activeBook.name}
+                      </span>
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -1884,9 +2319,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                 <button
                   type="submit"
                   disabled={addTypeSaving}
-                  className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs"
+                  className="min-h-[40px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs disabled:opacity-50"
                 >
-                  {addTypeSaving ? 'Đang tạo...' : 'Lưu và áp dụng'}
+                  {addTypeSaving ? 'Đang lưu...' : 'Lưu và áp dụng'}
                 </button>
               </div>
             </form>
