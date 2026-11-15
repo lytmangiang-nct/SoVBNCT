@@ -22,6 +22,10 @@ import {
   Upload,
   BookOpen,
   Sliders,
+  ChevronDown,
+  ChevronRight,
+  Menu,
+  X,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
@@ -44,9 +48,24 @@ import {
   getBookEnabledTypes,
   hasBookPermission,
   isSystemAdmin,
-  normalizeBookCode,
   normalizeBookPermissionList,
 } from '../utils/permissions';
+import {
+  GOOGLE_APPS_SCRIPT_TEMPLATE,
+  GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE,
+  PERMISSION_PRESETS,
+  SETTINGS_NAV_GROUPS,
+  getBookIdentityStyle,
+  type SettingsSubTab,
+} from './settings/settingsConstants';
+import { BooksListSection } from './settings/BooksListSection';
+import { CreateBookDrawer, type CreateBookFormValues } from './settings/CreateBookDrawer';
+import {
+  ConfirmDeleteModal,
+  PendingBookSwitchModal,
+  ResetPasswordModal,
+  ToggleBookLockModal,
+} from './settings/SettingsModals';
 
 interface SettingsViewProps {
   currentUser: User;
@@ -63,310 +82,6 @@ interface SettingsViewProps {
   onBooksUpdated?: () => void;
   onRefreshData: () => void;
 }
-
-const GOOGLE_APPS_SCRIPT_TEMPLATE = `function getOrCreateSheetWithHeaders(ss, name, headers, headerBg) {
-  var sheet = ss.getSheetByName(name);
-  if (!sheet) {
-    sheet = ss.insertSheet(name);
-  }
-  if (sheet.getLastRow() === 0) {
-    sheet.appendRow(headers);
-    var headerRange = sheet.getRange(1, 1, 1, headers.length);
-    headerRange.setBackground(headerBg || "#005BAA");
-    headerRange.setFontColor("#FFFFFF");
-    headerRange.setFontWeight("bold");
-  }
-  return sheet;
-}
-
-function findRowBySystemId(sheet, docId, fallbackIdx) {
-  var rows = sheet.getDataRange().getValues();
-  if (!rows || rows.length <= 1) return -1;
-  var headerRow = rows[0] || [];
-  var idColIdx = headerRow.indexOf("Mã hệ thống");
-  if (idColIdx === -1) idColIdx = fallbackIdx;
-  for (var i = 1; i < rows.length; i++) {
-    if (String(rows[i][idColIdx]) === String(docId)) {
-      return i + 1;
-    }
-  }
-  return -1;
-}
-
-function doPost(e) {
-  try {
-    var data = JSON.parse(e.postData.contents);
-    var ss = SpreadsheetApp.getActiveSpreadsheet();
-    var sheetName = (data.bookCode || "DOAN_TRUONG").toString().trim();
-    var deletedSheetName = (data.deletedSheetName || "VB đã xóa").toString().trim();
-
-    var MAIN_HEADERS = [
-      "STT", "Năm", "Ngày ban hành", "Ngày ký", "Nhóm VB", "Loại văn bản",
-      "Số thứ tự", "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
-      "Người ký", "Chức vụ", "Người thao tác", "Trạng thái hồ sơ",
-      "Trạng thái tệp Drive", "Tên tệp Drive", "ID tệp Drive", "Liên kết Drive",
-      "Ghi chú", "Mã hệ thống", "Mã sổ", "Sổ", "Thời điểm cập nhật"
-    ];
-
-    var DELETED_HEADERS = [
-      "STT", "Năm", "Ngày ban hành", "Ngày ký", "Nhóm VB", "Loại văn bản",
-      "Số thứ tự", "Số/Ký hiệu", "Tên văn bản", "Trích yếu/Nội dung",
-      "Người ký", "Chức vụ", "Người thao tác", "Trạng thái hồ sơ",
-      "Trạng thái tệp Drive", "Tên tệp Drive", "ID tệp Drive", "Liên kết Drive",
-      "Ghi chú", "Mã hệ thống", "Mã sổ", "Sổ",
-      "Người xóa", "Thời điểm xóa", "Lý do xóa", "Thời điểm đồng bộ"
-    ];
-
-    var docNameVal = data.docName || data.title || "";
-    var titleVal = data.title || "";
-    var bookNameVal = data.bookName || sheetName;
-    var nowStr = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh" });
-    var action = (data.action || "update").toString().trim();
-
-    // Bước 1 xóa: Tạo/lấy sheet "VB đã xóa" và ghi dòng theo Mã hệ thống (không trùng lặp), giữ liên kết Drive
-    if (action === "delete_append_to_deleted" || action === "delete") {
-      var delSheet = getOrCreateSheetWithHeaders(ss, deletedSheetName, DELETED_HEADERS, "#991B1B");
-      var delRowValues = [
-        data.stt, data.year, data.issueDate || "", data.signDate || "",
-        data.docCategory || "Văn bản đi", data.typeName || "", data.sequenceNumber,
-        data.fullDocNumber || "", docNameVal, titleVal,
-        data.signer || "", data.signerRole || "", data.issuedBy || "",
-        "Đã xóa", data.driveStatus || "Không đính kèm",
-        data.driveFileName || "", data.driveFileId || "", data.driveFileUrl || "",
-        data.notes || "", data.id, sheetName, bookNameVal,
-        data.deletedBy || "", data.deletedAtVietnam || nowStr, data.deleteReason || "", nowStr
-      ];
-      var existingDelRow = findRowBySystemId(delSheet, data.id, 19);
-      if (existingDelRow > 0) {
-        delSheet.getRange(existingDelRow, 1, 1, delRowValues.length).setValues([delRowValues]);
-      } else {
-        delSheet.appendRow(delRowValues);
-      }
-      var confirmedDelRow = findRowBySystemId(delSheet, data.id, 19);
-      if (confirmedDelRow <= 0) {
-        throw new Error("Không xác nhận được dòng đã ghi trong sheet " + deletedSheetName);
-      }
-      if (action === "delete_append_to_deleted") {
-        return ContentService.createTextOutput(JSON.stringify({
-          result: "success", action: action, confirmed: true, deletedSheet: deletedSheetName
-        })).setMimeType(ContentService.MimeType.JSON);
-      }
-    }
-
-    // Bước 2 xóa: Chỉ xóa dòng khỏi sheet chính sau khi đã xác nhận có trong sheet "VB đã xóa"
-    if (action === "delete_remove_main" || action === "delete") {
-      var verifyDelSheet = ss.getSheetByName(deletedSheetName);
-      var verifiedRow = verifyDelSheet ? findRowBySystemId(verifyDelSheet, data.id, 19) : -1;
-      if (verifiedRow <= 0) {
-        return ContentService.createTextOutput(JSON.stringify({
-          result: "error", error: "Chưa tìm thấy hồ sơ trong " + deletedSheetName + ", không xóa khỏi sheet chính."
-        })).setMimeType(ContentService.MimeType.JSON);
-      }
-      var mainSheetForDelete = ss.getSheetByName(sheetName);
-      if (mainSheetForDelete) {
-        var rowToRemove = findRowBySystemId(mainSheetForDelete, data.id, 19);
-        if (rowToRemove > 0) {
-          mainSheetForDelete.deleteRow(rowToRemove);
-        }
-      }
-      return ContentService.createTextOutput(JSON.stringify({
-        result: "success", action: action, removedFromMain: true, tab: sheetName
-      })).setMimeType(ContentService.MimeType.JSON);
-    }
-
-    var sheet = getOrCreateSheetWithHeaders(ss, sheetName, MAIN_HEADERS, "#005BAA");
-
-    // Thao tác kiểm tra kết nối theo đúng tab của sổ
-    if (action === "test") {
-      sheet.appendRow([
-        0, data.year, data.issueDate, data.signDate || "", data.docCategory || "Văn bản đi",
-        data.typeName, 0, data.fullDocNumber, docNameVal, titleVal,
-        data.signer, data.signerRole, data.issuedBy, data.status,
-        data.driveStatus || "Không đính kèm", data.driveFileName || "", data.driveFileId || "",
-        data.driveFileUrl || "", data.notes || "", data.id, sheetName, bookNameVal, nowStr
-      ]);
-      return ContentService.createTextOutput(JSON.stringify({result: "success", action: "test", tab: sheetName}))
-        .setMimeType(ContentService.MimeType.JSON);
-    }
-
-    var foundRowIndex = findRowBySystemId(sheet, data.id, 19);
-    var rowValues = [
-      data.stt, data.year, data.issueDate, data.signDate || "",
-      data.docCategory || "Văn bản đi", data.typeName, data.sequenceNumber,
-      data.fullDocNumber, docNameVal, titleVal, data.signer, data.signerRole,
-      data.issuedBy, data.status, data.driveStatus || "Không đính kèm",
-      data.driveFileName || "", data.driveFileId || "", data.driveFileUrl || "",
-      data.notes || "", data.id, sheetName, bookNameVal, nowStr
-    ];
-
-    if (foundRowIndex > 0) {
-      sheet.getRange(foundRowIndex, 1, 1, rowValues.length).setValues([rowValues]);
-    } else {
-      sheet.appendRow(rowValues);
-    }
-
-    return ContentService.createTextOutput(JSON.stringify({result: "success", tab: sheetName}))
-      .setMimeType(ContentService.MimeType.JSON);
-  } catch (err) {
-    return ContentService.createTextOutput(JSON.stringify({result: "error", error: err.toString()}))
-      .setMimeType(ContentService.MimeType.JSON);
-  }
-}`;
-
-const GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE = `function getOrCreateSubFolder(parent, name) {
-  var trimmed = (name || "").toString().trim();
-  if (!trimmed) return parent;
-  var folders = parent.getFoldersByName(trimmed);
-  if (folders.hasNext()) return folders.next();
-  return parent.createFolder(trimmed);
-}
-
-function resolveHierarchyFolder(rootFolder, data) {
-  var target = rootFolder;
-  var bookName = (data.bookName || "").toString().trim();
-  if (bookName && rootFolder.getName().toLowerCase() !== bookName.toLowerCase()) {
-    target = getOrCreateSubFolder(target, bookName);
-  }
-  if (data.year) {
-    target = getOrCreateSubFolder(target, String(data.year));
-  }
-  if (data.categoryFolder) {
-    target = getOrCreateSubFolder(target, String(data.categoryFolder));
-  }
-  return target;
-}
-
-function doPost(e) {
-  try {
-    var data = JSON.parse(e.postData.contents);
-    var folderId = (data.folderId || "").trim();
-    if (!folderId) {
-      return jsonOut({ result: "error", error: "Thiếu folderId thư mục Google Drive." });
-    }
-
-    var rootFolder = DriveApp.getFolderById(folderId);
-    var folderName = rootFolder.getName();
-
-    // 1. Kiểm tra kết nối & quyền ghi thực tế vào thư mục
-    if (data.action === "test") {
-      var probe = rootFolder.createFile(".nct_check_write_" + Date.now() + ".txt", "OK");
-      probe.setTrashed(true);
-      var accountEmail = "";
-      try { accountEmail = Session.getEffectiveUser().getEmail(); } catch (err) {}
-      return jsonOut({
-        result: "success",
-        folderId: folderId,
-        folderName: folderName,
-        accountEmail: accountEmail
-      });
-    }
-
-    var targetFolder = resolveHierarchyFolder(rootFolder, data);
-    var docId = (data.docId || "").trim();
-    var marker = docId ? "[NCT_DOC_ID:" + docId + "]" : "";
-
-    function findInFolder(dir) {
-      if (!marker) return null;
-      var files = dir.getFiles();
-      while (files.hasNext()) {
-        var f = files.next();
-        if (!f.isTrashed() && (f.getDescription() || "").indexOf(marker) !== -1) {
-          return f;
-        }
-      }
-      return null;
-    }
-
-    function findExisting() {
-      return findInFolder(targetFolder) || (targetFolder.getId() !== rootFolder.getId() ? findInFolder(rootFolder) : null);
-    }
-
-    // 2. Đối soát trước khi tải lên
-    if (data.action === "find") {
-      var existing = findExisting();
-      if (existing) {
-        if (data.expectedFileName && existing.getName() !== data.expectedFileName) {
-          existing.setName(data.expectedFileName);
-        }
-        return jsonOut({
-          result: "success",
-          found: true,
-          fileId: existing.getId(),
-          fileName: existing.getName(),
-          webViewLink: existing.getUrl(),
-          targetFolderId: targetFolder.getId()
-        });
-      }
-      return jsonOut({ result: "success", found: false });
-    }
-
-    // 3. Tải tệp vào đúng cây thư mục Tên sổ -> Năm -> Văn bản đi / Văn bản đến
-    if (data.action === "upload") {
-      var dup = findExisting();
-      if (dup && !data.replaceMode) {
-        if (data.fileName && dup.getName() !== data.fileName) {
-          dup.setName(data.fileName);
-        }
-        return jsonOut({
-          result: "success",
-          deduplicated: true,
-          fileId: dup.getId(),
-          fileName: dup.getName(),
-          webViewLink: dup.getUrl(),
-          targetFolderId: targetFolder.getId()
-        });
-      }
-
-      if (data.replaceMode) {
-        if (data.previousFileId) {
-          try { DriveApp.getFileById(data.previousFileId).setTrashed(true); } catch (ePrev) {}
-        }
-        if (dup) {
-          try { dup.setTrashed(true); } catch (eDup) {}
-        }
-      }
-
-      var bytes = Utilities.base64Decode(data.fileBase64);
-      var mimeType = data.mimeType || "application/vnd.openxmlformats-officedocument.wordprocessingml.document";
-      var blob = Utilities.newBlob(bytes, mimeType, data.fileName);
-      var created = targetFolder.createFile(blob);
-      created.setDescription(
-        "Số văn bản: " + (data.fullDocNumber || "") +
-        " | Tên văn bản: " + (data.docName || "") +
-        (marker ? " | " + marker : "")
-      );
-
-      return jsonOut({
-        result: "success",
-        fileId: created.getId(),
-        fileName: created.getName(),
-        webViewLink: created.getUrl(),
-        targetFolderId: targetFolder.getId()
-      });
-    }
-
-    return jsonOut({ result: "error", error: "Thao tác không hợp lệ: " + data.action });
-  } catch (err) {
-    return jsonOut({ result: "error", error: err.toString() });
-  }
-}
-
-function jsonOut(obj) {
-  return ContentService.createTextOutput(JSON.stringify(obj))
-    .setMimeType(ContentService.MimeType.JSON);
-}`;
-
-const PERMISSION_PRESETS: Array<{ label: string; perms: BookPermission[] }> = [
-  { label: 'Chỉ xem', perms: ['view'] },
-  { label: 'Chỉ xin số', perms: ['view', 'request_number'] },
-  { label: 'Lấy số & Xem sổ', perms: ['view', 'issue_number'] },
-  {
-    label: 'Cán bộ cấp số',
-    perms: ['view', 'request_number', 'issue_number', 'import_incoming', 'edit', 'replace_file', 'export'],
-  },
-  { label: 'Toàn quyền sổ', perms: [...ALL_BOOK_PERMISSIONS] },
-  { label: 'Bỏ hết', perms: [] },
-];
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
   currentUser,
@@ -435,24 +150,37 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const canManageSelectedBook = isAdmin || hasBookPermission(currentUser, selectedBook.id, 'manage_book');
 
   // Sub-tab inside Settings
-  const [activeSubTab, setActiveSubTab] = useState<
-    'books' | 'general' | 'numbering' | 'docTypes' | 'signers' | 'googledrive' | 'googlesheets' | 'msgraph' | 'users'
-  >('books');
+  const [activeSubTab, setActiveSubTab] = useState<SettingsSubTab>('books');
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
 
-  // Book Management State (Multi-book)
-  const [newBookName, setNewBookName] = useState('');
-  const [newBookCode, setNewBookCode] = useState('');
-  const [newBookCodeEdited, setNewBookCodeEdited] = useState(false);
-  const [newBookUnitName, setNewBookUnitName] = useState('');
-  const [newBookUnitCode, setNewBookUnitCode] = useState('');
-  const [newBookIsShared, setNewBookIsShared] = useState<boolean>(false);
-  const [newBookMode, setNewBookMode] = useState<'separate' | 'shared'>('separate');
-  const [newBookFormat, setNewBookFormat] = useState('{so}-{loai}/{don_vi}');
-  const [newBookEnabledTypes, setNewBookEnabledTypes] = useState<string[]>(() =>
-    documentTypes.filter((t) => t.isActive).map((t) => t.code)
-  );
+  // Book Management State (Multi-book drawer & lock modal)
+  const [createBookDrawerOpen, setCreateBookDrawerOpen] = useState(false);
   const [bookSaving, setBookSaving] = useState(false);
   const [bookMessage, setBookMessage] = useState<{ success: boolean; text: string } | null>(null);
+  const [createBookServerError, setCreateBookServerError] = useState<string | null>(null);
+  const [toggleLockConfirmBook, setToggleLockConfirmBook] = useState<RegistryBook | null>(null);
+  const [toggleLockSaving, setToggleLockSaving] = useState(false);
+
+  // Generic confirm & reset password modals (no browser alert/confirm/prompt)
+  const [confirmDeleteRequest, setConfirmDeleteRequest] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    onConfirm: () => Promise<void>;
+  } | null>(null);
+  const [confirmDeleteBusy, setConfirmDeleteBusy] = useState(false);
+  const [resetPassUser, setResetPassUser] = useState<User | null>(null);
+  const [resetPassSaving, setResetPassSaving] = useState(false);
+
+  // Unsaved-changes book switch guard
+  const [pendingBookSwitch, setPendingBookSwitch] = useState<{
+    targetBookId: string;
+    targetBookName: string;
+    currentBookName: string;
+    nextTab?: SettingsSubTab;
+  } | null>(null);
+  const [switchingBookSaving, setSwitchingBookSaving] = useState(false);
+  const [switchBookError, setSwitchBookError] = useState<string | null>(null);
 
   // General Settings Form (per selected book)
   const [bookTitleInput, setBookTitleInput] = useState(selectedBook.name);
@@ -464,6 +192,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   );
   const [generalSaving, setGeneralSaving] = useState(false);
   const [generalSuccess, setGeneralSuccess] = useState(false);
+  const [generalError, setGeneralError] = useState<string | null>(null);
 
   // Numbering Mode (per selected book)
   const [targetMode, setTargetMode] = useState<'separate' | 'shared'>(selectedBook.numberMode);
@@ -865,75 +594,239 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     return false;
   };
 
-  // Create new Registry Book (Admin only)
-  const handleCreateBook = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isAdmin || isConfigBlocked) return;
-    if (newBookEnabledTypes.length === 0) {
-      setBookMessage({
-        success: false,
-        text: 'Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ mới.',
-      });
-      return;
-    }
+  // Create new Registry Book (Admin only, via Drawer)
+  const handleCreateBookSubmit = async (values: CreateBookFormValues): Promise<boolean> => {
+    if (!isAdmin || isConfigBlocked) return false;
     setBookSaving(true);
+    setCreateBookServerError(null);
     setBookMessage(null);
     try {
-      const resolvedCode = normalizeBookCode(newBookCode || newBookName);
       const res = await api.createBook({
-        code: resolvedCode || undefined,
-        name: newBookName.trim(),
-        unitName: newBookUnitName.trim(),
-        unitCode: newBookUnitCode.trim().toUpperCase(),
-        isShared: newBookIsShared,
-        numberMode: newBookMode,
-        numberFormat: newBookFormat.trim() || '{so}-{loai}/{don_vi}',
-        enabledTypeCodes: newBookEnabledTypes,
+        code: values.code || undefined,
+        name: values.name,
+        unitName: values.unitName,
+        unitCode: values.unitCode,
+        isShared: values.isShared,
+        numberMode: values.numberMode,
+        numberFormat: values.numberFormat || '{so}-{loai}/{don_vi}',
+        enabledTypeCodes: values.enabledTypeCodes,
       });
-      setNewBookName('');
-      setNewBookCode('');
-      setNewBookCodeEdited(false);
-      setNewBookUnitName('');
-      setNewBookUnitCode('');
-      setNewBookIsShared(false);
-      setNewBookMode('separate');
-      setNewBookFormat('{so}-{loai}/{don_vi}');
-      setNewBookEnabledTypes(documentTypes.filter((t) => t.isActive).map((t) => t.code));
+      setCreateBookDrawerOpen(false);
       setSelectedBookId(res.book.id);
       onSelectBookId(res.book.id);
       setBookMessage({
         success: true,
-        text: `Đã tạo sổ "${res.book.name}" (Mã sổ: ${res.book.code} · Ký hiệu: ${res.book.unitCode}). Hãy phân quyền ở tab Tài khoản & Phân quyền sổ và cấu hình Drive riêng cho sổ này nếu cần.`,
+        text: `Đã tạo sổ "${res.book.name}" (Mã sổ: ${res.book.code} · Ký hiệu: ${res.book.unitCode}). Bạn có thể cấu hình Drive riêng và phân quyền tài khoản cho sổ mới.`,
       });
       onBooksUpdated?.();
       onRefreshData();
+      return true;
     } catch (err: any) {
-      setBookMessage({
-        success: false,
-        text: err.message || 'Lỗi khi tạo sổ văn bản mới',
-      });
+      setCreateBookServerError(err.message || 'Lỗi khi tạo sổ văn bản mới');
+      return false;
     } finally {
       setBookSaving(false);
     }
   };
 
-  const handleToggleBookActive = async (book: RegistryBook) => {
-    if (!isAdmin || isConfigBlocked || book.id === DEFAULT_BOOK_ID) return;
+  const handleConfirmToggleBookLock = async () => {
+    const book = toggleLockConfirmBook;
+    if (!book || !isAdmin || isConfigBlocked || book.id === DEFAULT_BOOK_ID) return;
+    setToggleLockSaving(true);
     try {
       await api.updateBook(book.id, {
         isActive: !book.isActive,
         expectedVersion: book.configVersion,
       });
+      setToggleLockConfirmBook(null);
+      setBookMessage({
+        success: true,
+        text: book.isActive
+          ? `Đã tạm khóa sổ "${book.name}".`
+          : `Đã mở khóa sổ "${book.name}".`,
+      });
       onBooksUpdated?.();
       onRefreshData();
     } catch (err: any) {
-      if (!handleConflictError(err, async () => {
-        await api.updateBook(book.id, { isActive: !book.isActive, forceOverwrite: true });
-        onBooksUpdated?.();
-        onRefreshData();
-      })) {
+      setToggleLockConfirmBook(null);
+      if (
+        !handleConflictError(err, async () => {
+          await api.updateBook(book.id, { isActive: !book.isActive, forceOverwrite: true });
+          onBooksUpdated?.();
+          onRefreshData();
+        })
+      ) {
         setBookMessage({ success: false, text: err.message || 'Lỗi khi cập nhật trạng thái sổ' });
       }
+    } finally {
+      setToggleLockSaving(false);
+    }
+  };
+
+  const hasUnsavedChangesForSelectedBook =
+    generalDirty ||
+    driveDirty ||
+    bookGsDirty ||
+    targetMode !== selectedBook.numberMode ||
+    isSeriesDirty;
+
+  const commitBookSwitch = (targetBookId: string, nextTab?: SettingsSubTab) => {
+    setSelectedBookId(targetBookId);
+    onSelectBookId(targetBookId);
+    if (nextTab) {
+      if (nextTab === 'users') {
+        handleOpenUsersTab();
+      } else {
+        setActiveSubTab(nextTab);
+      }
+    }
+    setPendingBookSwitch(null);
+    setSwitchBookError(null);
+  };
+
+  const requestSelectBook = (targetBookId: string, nextTab?: SettingsSubTab) => {
+    if (targetBookId === selectedBook.id) {
+      if (nextTab) {
+        if (nextTab === 'users') handleOpenUsersTab();
+        else setActiveSubTab(nextTab);
+      }
+      return;
+    }
+    if (hasUnsavedChangesForSelectedBook) {
+      const target = books.find((b) => b.id === targetBookId);
+      setSwitchBookError(null);
+      setPendingBookSwitch({
+        targetBookId,
+        targetBookName: target?.name || 'Sổ mới',
+        currentBookName: selectedBook.name,
+        nextTab,
+      });
+      return;
+    }
+    commitBookSwitch(targetBookId, nextTab);
+  };
+
+  const handleDiscardAndSwitchBook = () => {
+    if (!pendingBookSwitch) return;
+    setDraftStartInputBySeries((prev) => {
+      const next = { ...prev };
+      for (const k of Object.keys(next)) {
+        if (k.startsWith(`${selectedBook.id}::`)) {
+          delete next[k];
+        }
+      }
+      return next;
+    });
+    setGeneralDirty(false);
+    setDriveDirty(false);
+    setBookGsDirty(false);
+    setTargetMode(selectedBook.numberMode);
+    setGeneralError(null);
+    commitBookSwitch(pendingBookSwitch.targetBookId, pendingBookSwitch.nextTab);
+  };
+
+  const handleSaveAndSwitchBook = async () => {
+    if (!pendingBookSwitch || switchingBookSaving) return;
+    setSwitchingBookSaving(true);
+    setSwitchBookError(null);
+    try {
+      let currentVersion =
+        loadedBookSnapshotRef.current?.version ?? selectedBook.configVersion;
+
+      if (generalDirty) {
+        if (bookEnabledTypes.length === 0) {
+          throw new Error('Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ này.');
+        }
+        const res = await api.updateBook(selectedBook.id, {
+          name: bookTitleInput.trim() || selectedBook.name,
+          unitName: unitName.trim(),
+          unitCode: unitCode.trim().toUpperCase(),
+          numberFormat: numberFormat.trim(),
+          enabledTypeCodes: bookEnabledTypes,
+          expectedVersion: currentVersion,
+        });
+        currentVersion = res.book.configVersion || (currentVersion || 1) + 1;
+        setGeneralDirty(false);
+      }
+
+      if (targetMode !== selectedBook.numberMode) {
+        const res = await api.updateNumberMode(
+          targetMode,
+          modeConfirmText.trim(),
+          selectedBook.id,
+          currentVersion
+        );
+        currentVersion = (currentVersion || 1) + 1;
+        onSettingsUpdated(res.settings);
+        setModeConfirmText('');
+      }
+
+      if (isSeriesDirty) {
+        const trimmed = currentStartInputValue.trim();
+        const nextNum = Number(trimmed);
+        if (!trimmed || !Number.isInteger(nextNum) || nextNum < 1) {
+          throw new Error('Số bắt đầu phải là số nguyên dương từ 1 trở lên.');
+        }
+        if (activeSavedConfig && nextNum < activeSavedConfig.minAllowedStartSequence) {
+          throw new Error(
+            `Số bắt đầu (${nextNum}) phải >= ${activeSavedConfig.minAllowedStartSequence}.`
+          );
+        }
+        const seqRes = await api.setStartSequence(
+          seqYear,
+          effectiveSeqTypeCode,
+          nextNum,
+          selectedBook.id
+        );
+        if (seqRes.book?.configVersion) {
+          currentVersion = seqRes.book.configVersion;
+        }
+        setDraftStartInputBySeries((prev) => {
+          const next = { ...prev };
+          delete next[activeSeriesId];
+          return next;
+        });
+      }
+
+      if (driveDirty) {
+        const gdRes = await api.saveGoogleDriveConfig({
+          bookId: selectedBook.id,
+          enabled: gdEnabled,
+          authMode: gdAuthMode,
+          folderUrl: gdFolderUrl.trim(),
+          appsScriptUrl: gdAppsScriptUrl.trim() || undefined,
+          serviceAccountJson: gdServiceAccountJson.trim() || undefined,
+          scopeUnitCode: selectedBook.unitCode,
+          expectedVersion: currentVersion,
+        });
+        currentVersion = (currentVersion || 1) + 1;
+        if (selectedBook.id === DEFAULT_BOOK_ID) {
+          onSettingsUpdated({ ...settings, googleDriveConfig: gdRes.googleDriveConfig });
+        }
+        setDriveDirty(false);
+      }
+
+      if (bookGsDirty && isAdmin) {
+        const gsRes = await api.saveBookGoogleSheetsConfig(selectedBook.id, {
+          enabled: bookGsEnabled,
+          webhookUrl: bookGsWebhookUrl.trim(),
+          expectedVersion: currentVersion,
+        });
+        currentVersion = gsRes.book?.configVersion || (currentVersion || 1) + 1;
+        setBookGsDirty(false);
+      }
+
+      loadedBookSnapshotRef.current = {
+        bookId: selectedBook.id,
+        version: currentVersion || 1,
+      };
+      onBooksUpdated?.();
+      onRefreshData();
+      commitBookSwitch(pendingBookSwitch.targetBookId, pendingBookSwitch.nextTab);
+    } catch (err: any) {
+      setSwitchBookError(err?.message || 'Không thể lưu thay đổi hiện tại.');
+    } finally {
+      setSwitchingBookSaving(false);
     }
   };
 
@@ -942,14 +835,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     if (!canManageSelectedBook || isConfigBlocked) return;
     if (bookEnabledTypes.length === 0) {
       setSettingsConflict(null);
-      setBookMessage({
-        success: false,
-        text: 'Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ này.',
-      });
+      setGeneralError('Vui lòng chọn ít nhất 1 loại văn bản được sử dụng trong sổ này.');
       return;
     }
     setGeneralSaving(true);
     setGeneralSuccess(false);
+    setGeneralError(null);
     try {
       const res = await api.updateBook(selectedBook.id, {
         name: bookTitleInput.trim() || selectedBook.name,
@@ -972,7 +863,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setTimeout(() => setGeneralSuccess(false), 3000);
     } catch (err: any) {
       if (!handleConflictError(err, () => saveGeneralRequest(true))) {
-        setModeError(err.message || 'Lỗi khi lưu cài đặt sổ');
+        setGeneralError(err.message || 'Lỗi khi lưu cài đặt sổ');
       }
     } finally {
       setGeneralSaving(false);
@@ -1168,14 +1059,26 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const handleDeleteDocType = async (id: string, code: string) => {
-    if (!isAdmin || isConfigBlocked || !confirm(`Xác nhận xóa loại văn bản "${code}"?`)) return;
-    try {
-      await api.deleteDocumentType(id);
-      onRefreshData();
-    } catch (err: any) {
-      setTypeError(err.message || 'Lỗi khi xóa loại văn bản');
-    }
+  const handleDeleteDocType = (id: string, code: string) => {
+    if (!isAdmin || isConfigBlocked) return;
+    setConfirmDeleteRequest({
+      title: `Xóa loại văn bản "${code}"?`,
+      description: 'Loại văn bản này sẽ bị xóa khỏi danh mục hệ thống (các văn bản đã cấp số trước đó vẫn được bảo toàn).',
+      confirmLabel: 'Xác nhận xóa',
+      onConfirm: async () => {
+        setConfirmDeleteBusy(true);
+        try {
+          await api.deleteDocumentType(id);
+          setConfirmDeleteRequest(null);
+          onRefreshData();
+        } catch (err: any) {
+          setTypeError(err.message || 'Lỗi khi xóa loại văn bản');
+          setConfirmDeleteRequest(null);
+        } finally {
+          setConfirmDeleteBusy(false);
+        }
+      },
+    });
   };
 
   // 5. Book Signers management (Admin or manage_book)
@@ -1231,13 +1134,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const handleDeleteBookSigner = async (signerId: string) => {
-    if (!canManageSelectedBook || isConfigBlocked || !confirm('Xác nhận xóa người ký này khỏi sổ?')) return;
-    const updatedList = displayedBookSigners.filter((s) => s.id !== signerId);
-    await saveBookSignerRequest(updatedList, false, false);
-    if (isAdmin && selectedBook.id === DEFAULT_BOOK_ID) {
-      await api.deleteSigner(signerId).catch(() => {});
-    }
+  const handleDeleteBookSigner = (signerId: string) => {
+    if (!canManageSelectedBook || isConfigBlocked) return;
+    const target = displayedBookSigners.find((s) => s.id === signerId);
+    setConfirmDeleteRequest({
+      title: `Xóa người ký "${target?.name || ''}"?`,
+      description: `Người ký này sẽ bị gỡ khỏi danh sách gợi ý của sổ "${selectedBook.name}".`,
+      confirmLabel: 'Xóa người ký',
+      onConfirm: async () => {
+        setConfirmDeleteBusy(true);
+        try {
+          const updatedList = displayedBookSigners.filter((s) => s.id !== signerId);
+          await saveBookSignerRequest(updatedList, false, false);
+          if (isAdmin && selectedBook.id === DEFAULT_BOOK_ID) {
+            await api.deleteSigner(signerId).catch(() => {});
+          }
+          setConfirmDeleteRequest(null);
+        } finally {
+          setConfirmDeleteBusy(false);
+        }
+      },
+    });
   };
 
   // 6. Google Sheets Config & Sync Handlers
@@ -1453,11 +1370,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
+  const [msSaveMessage, setMsSaveMessage] = useState<{ success: boolean; message: string } | null>(null);
+  const [userFeedback, setUserFeedback] = useState<{ success: boolean; message: string } | null>(null);
+
   // 7. Save Microsoft Graph Config
   const handleSaveMsGraph = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!isAdmin) return;
     setMsSaving(true);
+    setMsSaveMessage(null);
     try {
       const res = await api.saveSyncConfig({
         enabled: msEnabled,
@@ -1469,9 +1390,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         tableName: msTableName,
       });
       onSettingsUpdated({ ...settings, msGraphConfig: res.msGraphConfig });
-      alert('Đã lưu cấu hình Microsoft Graph!');
+      setMsSaveMessage({ success: true, message: 'Đã lưu cấu hình OneDrive / SharePoint!' });
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi lưu cấu hình');
+      setMsSaveMessage({ success: false, message: err.message || 'Lỗi khi lưu cấu hình' });
     } finally {
       setMsSaving(false);
     }
@@ -1514,6 +1435,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
     setUserSaving(true);
     setUserError(null);
+    setUserFeedback(null);
     try {
       await api.createUser({
         username: newUsername.trim(),
@@ -1522,10 +1444,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         role: 'issuer',
         bookPermissions: newBookPermissions,
       });
+      const createdUsername = newUsername.trim();
       setNewUsername('');
       setNewFullName('');
       setNewUserPass('');
       setNewBookPermissions({ [DEFAULT_BOOK_ID]: ['view', 'request_number'] });
+      setUserFeedback({
+        success: true,
+        message: `Đã tạo tài khoản @${createdUsername} và áp dụng phân quyền theo sổ.`,
+      });
       handleOpenUsersTab();
     } catch (err: any) {
       setUserError(err.message || 'Lỗi khi tạo tài khoản');
@@ -1546,12 +1473,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const handleSaveUserPermissions = async (u: User) => {
     if (!isAdmin) return;
     setSavingPermUserId(u.id);
+    setUserFeedback(null);
     try {
       await api.updateUser(u.id, { bookPermissions: editingBookPermissions });
       setEditingPermUserId(null);
+      setUserFeedback({
+        success: true,
+        message: `Đã cập nhật phân quyền theo sổ cho tài khoản @${u.username}.`,
+      });
       await handleOpenUsersTab();
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi lưu phân quyền tài khoản');
+      setUserFeedback({
+        success: false,
+        message: err.message || 'Lỗi khi lưu phân quyền tài khoản',
+      });
     } finally {
       setSavingPermUserId(null);
     }
@@ -1559,45 +1494,88 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
   const handleToggleUserStatus = async (u: User) => {
     if (u.username === 'admin') {
-      alert('Không thể khóa tài khoản Quản trị viên cố định');
+      setUserFeedback({
+        success: false,
+        message: 'Không thể khóa tài khoản Quản trị viên cố định',
+      });
       return;
     }
+    setUserFeedback(null);
     try {
       await api.updateUser(u.id, { isActive: !u.isActive });
+      setUserFeedback({
+        success: true,
+        message: u.isActive
+          ? `Đã tạm khóa tài khoản @${u.username}.`
+          : `Đã mở khóa tài khoản @${u.username}.`,
+      });
       handleOpenUsersTab();
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi cập nhật trạng thái tài khoản');
+      setUserFeedback({
+        success: false,
+        message: err.message || 'Lỗi khi cập nhật trạng thái tài khoản',
+      });
     }
   };
 
-  const handleDeleteUser = async (u: User) => {
+  const handleDeleteUser = (u: User) => {
     if (u.username === 'admin') {
-      alert('Không thể xóa tài khoản Quản trị viên cố định');
+      setUserFeedback({
+        success: false,
+        message: 'Không thể xóa tài khoản Quản trị viên cố định',
+      });
       return;
     }
-    if (!confirm(`Xác nhận xóa tài khoản "${u.username}" (${u.fullName}) khỏi hệ thống?`)) {
-      return;
-    }
-    try {
-      await api.deleteUser(u.id);
-      handleOpenUsersTab();
-    } catch (err: any) {
-      alert(err.message || 'Lỗi khi xóa tài khoản');
-    }
+    setConfirmDeleteRequest({
+      title: `Xóa tài khoản @${u.username}?`,
+      description: `Tài khoản "${u.fullName}" sẽ bị xóa khỏi hệ thống. Lịch sử văn bản đã tạo vẫn được giữ nguyên.`,
+      confirmLabel: 'Xác nhận xóa tài khoản',
+      onConfirm: async () => {
+        setConfirmDeleteBusy(true);
+        try {
+          await api.deleteUser(u.id);
+          setConfirmDeleteRequest(null);
+          setUserFeedback({
+            success: true,
+            message: `Đã xóa tài khoản @${u.username}.`,
+          });
+          await handleOpenUsersTab();
+        } catch (err: any) {
+          setConfirmDeleteRequest(null);
+          setUserFeedback({
+            success: false,
+            message: err.message || 'Lỗi khi xóa tài khoản',
+          });
+        } finally {
+          setConfirmDeleteBusy(false);
+        }
+      },
+    });
   };
 
-  const handleResetUserPass = async (u: User) => {
-    const newPass = prompt(`Nhập mật khẩu mới cho tài khoản "${u.username}" (tối thiểu 6 ký tự):`);
-    if (!newPass) return;
-    if (newPass.trim().length < 6) {
-      alert('Mật khẩu phải có tối thiểu 6 ký tự');
-      return;
-    }
+  const handleResetUserPass = (u: User) => {
+    setResetPassUser(u);
+  };
+
+  const handleConfirmResetPassword = async (newPassword: string) => {
+    if (!resetPassUser) return;
+    setResetPassSaving(true);
+    setUserFeedback(null);
     try {
-      await api.updateUser(u.id, { password: newPass.trim() });
-      alert(`Đã đặt lại mật khẩu cho tài khoản ${u.username} thành công!`);
+      await api.updateUser(resetPassUser.id, { password: newPassword });
+      const uname = resetPassUser.username;
+      setResetPassUser(null);
+      setUserFeedback({
+        success: true,
+        message: `Đã đặt lại mật khẩu cho tài khoản @${uname} thành công.`,
+      });
     } catch (err: any) {
-      alert(err.message || 'Lỗi khi đổi mật khẩu');
+      setUserFeedback({
+        success: false,
+        message: err.message || 'Lỗi khi đổi mật khẩu',
+      });
+    } finally {
+      setResetPassSaving(false);
     }
   };
 
@@ -1696,487 +1674,378 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     );
   };
 
-  return (
-    <div className="max-w-7xl mx-auto py-5 sm:py-8 px-3 sm:px-6 lg:px-8 space-y-5 sm:space-y-6">
-      {/* Header + Book Scope Selector */}
-      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
-        <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
-            Cài Đặt Hệ Thống &amp; Quản Trị Sổ
-          </h1>
-          <p className="text-xs sm:text-sm text-slate-600 mt-1">
-            Quản lý nhiều sổ văn bản, quy tắc cấp số, người ký, phân quyền theo từng sổ và kết nối Google Drive.
-          </p>
-        </div>
+  const visibleNavGroups = useMemo(() => {
+    return SETTINGS_NAV_GROUPS.filter((group) => !group.adminOnly || isAdmin).map((group) => ({
+      ...group,
+      items: group.items.filter((item) => !item.adminOnly || isAdmin),
+    }));
+  }, [isAdmin]);
 
-        {managedBooks.length > 0 && (
-          <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-3 py-1.5 min-h-[44px] shadow-2xs text-xs w-full sm:w-auto min-w-0">
-            <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />
-            <span className="font-semibold text-slate-700 whitespace-nowrap shrink-0">Sổ đang cấu hình:</span>
-            <select
-              value={selectedBook.id}
-              onChange={(e) => {
-                setSelectedBookId(e.target.value);
-                onSelectBookId(e.target.value);
-              }}
-              className="font-bold text-sky-900 bg-transparent border-0 focus:outline-hidden cursor-pointer flex-1 sm:flex-initial min-w-0 sm:max-w-[240px] text-base sm:text-xs"
-            >
-              {managedBooks.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.name} ({b.unitCode})
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+  const activeNavMeta = useMemo(() => {
+    for (const group of visibleNavGroups) {
+      const item = group.items.find((i) => i.id === activeSubTab);
+      if (item) {
+        return { groupTitle: group.title, itemLabel: item.label };
+      }
+    }
+    return { groupTitle: 'Quản lý sổ', itemLabel: 'Danh sách sổ' };
+  }, [visibleNavGroups, activeSubTab]);
+
+  const handleSelectNavItem = (tabId: SettingsSubTab) => {
+    setMobileNavOpen(false);
+    if (tabId === 'users') {
+      handleOpenUsersTab();
+    } else {
+      setActiveSubTab(tabId);
+    }
+  };
+
+  const getNavItemBadge = (tabId: SettingsSubTab): number | null => {
+    if (tabId === 'books') return books.length;
+    if (tabId === 'signers') return displayedBookSigners.length;
+    if (tabId === 'docTypes') return documentTypes.length;
+    return null;
+  };
+
+  const selectedBookIdentity = getBookIdentityStyle(selectedBook);
+
+  return (
+    <div className="w-full max-w-7xl mx-auto py-4 sm:py-6 px-3 sm:px-6 lg:px-8 space-y-4 sm:space-y-5 overflow-x-hidden">
+      {/* Page Header */}
+      <div className="min-w-0">
+        <h1 className="text-lg sm:text-2xl font-bold tracking-tight text-slate-900">
+          Cài Đặt Hệ Thống &amp; Quản Trị Sổ
+        </h1>
+        <p className="text-xs sm:text-sm text-slate-600 mt-1">
+          Quản lý sổ văn bản, quy tắc cấp số, danh mục, lưu trữ đồng bộ và phân quyền theo từng sổ.
+        </p>
       </div>
 
-      {isConfigBlocked && (
-        <div className="p-4 bg-rose-50 border border-rose-300 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs text-rose-950">
-          <div className="flex items-start gap-2.5">
-            <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
-            <div>
-              <strong className="block font-bold">
-                Chưa cập nhật được dữ liệu cấu hình từ máy chủ
-              </strong>
-              <span>
-                {syncError || 'Đang tải cấu hình mới nhất. Các nút lưu cài đặt tạm khóa để tránh ghi đè nhầm cấu hình cũ.'}
+      {/* Mobile: "Chọn mục cài đặt" button (replaces horizontal scrolling tabs) */}
+      <div className="lg:hidden">
+        <button
+          type="button"
+          onClick={() => setMobileNavOpen(true)}
+          aria-expanded={mobileNavOpen}
+          className="w-full min-h-[46px] px-3.5 py-2.5 bg-white hover:bg-slate-50 border border-slate-300 rounded-xl shadow-2xs flex items-center justify-between gap-3 text-left transition-colors"
+        >
+          <div className="flex items-center gap-2.5 min-w-0">
+            <div className="w-8 h-8 rounded-lg bg-sky-50 text-sky-700 border border-sky-200 flex items-center justify-center shrink-0">
+              <Menu className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <span className="text-[11px] font-semibold text-slate-500 block leading-tight">
+                Chọn mục cài đặt · {activeNavMeta.groupTitle}
+              </span>
+              <span className="text-xs font-bold text-sky-900 block truncate mt-0.5">
+                {activeNavMeta.itemLabel}
               </span>
             </div>
           </div>
-          <button
-            type="button"
-            onClick={onRefreshData}
-            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-lg transition-colors"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-            <span>Thử lại</span>
-          </button>
-        </div>
-      )}
-
-      {settingsConflict && (
-        <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl space-y-2.5 text-xs text-amber-950">
-          <div className="flex items-start gap-2.5">
-            <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
-            <div className="space-y-1">
-              <strong className="block font-bold">
-                Cài đặt đã thay đổi trên thiết bị khác
-              </strong>
-              <span>{settingsConflict.message}</span>
-            </div>
-          </div>
-          <div className="flex flex-wrap items-center gap-2 pl-7">
-            <button
-              type="button"
-              onClick={() => {
-                const targetBook = settingsConflict.serverBook || selectedBook;
-                applySelectedBookToForms(targetBook, true);
-                onRefreshData();
-              }}
-              className="px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg transition-colors"
-            >
-              Tải lại cài đặt mới từ máy chủ
-            </button>
-            <button
-              type="button"
-              onClick={async () => {
-                if (settingsConflict.retryAction) {
-                  await settingsConflict.retryAction();
-                } else {
-                  if (settingsConflict.serverVersion) {
-                    loadedBookSnapshotRef.current = {
-                      bookId: selectedBook.id,
-                      version: settingsConflict.serverVersion,
-                    };
-                  }
-                  setSettingsConflict(null);
-                }
-              }}
-              className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 font-semibold rounded-lg transition-colors"
-            >
-              Giữ nội dung đang sửa & ghi đè lên máy chủ
-            </button>
-          </div>
-        </div>
-      )}
-
-      {!isAdmin && (
-        <div className="p-3 bg-sky-50 border border-sky-200 rounded-lg text-xs text-sky-900 flex items-center gap-2">
-          <Sliders className="w-4 h-4 text-sky-700 shrink-0" />
-          <span>
-            Bạn đang cấu hình với quyền <strong>Quản trị sổ</strong> cho sổ <strong>{selectedBook.name}</strong>. Các thiết lập toàn hệ thống và phân quyền tài khoản do Quản trị viên quản lý.
-          </span>
-        </div>
-      )}
-
-      {/* Sub Tabs */}
-      <div className="flex border-b border-slate-200 max-w-full overflow-x-auto gap-1 sm:gap-2">
-        <button
-          onClick={() => setActiveSubTab('books')}
-          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-            activeSubTab === 'books'
-              ? 'border-sky-700 text-sky-800'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          Sổ văn bản ({books.length})
+          <ChevronDown className="w-4 h-4 text-slate-500 shrink-0" />
         </button>
-
-        <button
-          onClick={() => setActiveSubTab('general')}
-          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-            activeSubTab === 'general'
-              ? 'border-sky-700 text-sky-800'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          Thông tin sổ & Mẫu số
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('numbering')}
-          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-            activeSubTab === 'numbering'
-              ? 'border-sky-700 text-sky-800'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          Quy tắc dãy số & Số bắt đầu
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('signers')}
-          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-            activeSubTab === 'signers'
-              ? 'border-sky-700 text-sky-800'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          Người ký theo sổ ({displayedBookSigners.length})
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('googledrive')}
-          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-            activeSubTab === 'googledrive'
-              ? 'border-sky-700 text-sky-800'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          Lưu trữ Google Drive
-        </button>
-
-        <button
-          onClick={() => setActiveSubTab('docTypes')}
-          className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-            activeSubTab === 'docTypes'
-              ? 'border-sky-700 text-sky-800'
-              : 'border-transparent text-slate-500 hover:text-slate-800'
-          }`}
-        >
-          Loại văn bản ({documentTypes.length})
-        </button>
-
-        {isAdmin && (
-          <>
-            <button
-              onClick={() => setActiveSubTab('googlesheets')}
-              className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-                activeSubTab === 'googlesheets'
-                  ? 'border-emerald-700 text-emerald-800'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              Google Trang tính
-            </button>
-
-            <button
-              onClick={() => setActiveSubTab('msgraph')}
-              className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-                activeSubTab === 'msgraph'
-                  ? 'border-sky-700 text-sky-800'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              OneDrive / SharePoint
-            </button>
-
-            <button
-              onClick={handleOpenUsersTab}
-              className={`min-h-[42px] pb-2.5 pt-1.5 px-3 text-xs font-bold border-b-2 whitespace-nowrap shrink-0 transition-colors ${
-                activeSubTab === 'users'
-                  ? 'border-sky-700 text-sky-800'
-                  : 'border-transparent text-slate-500 hover:text-slate-800'
-              }`}
-            >
-              Tài khoản & Phân quyền sổ
-            </button>
-          </>
-        )}
       </div>
 
-      {/* SUB-TAB: QUẢN LÝ NHIỀU SỔ VĂN BẢN */}
-      {activeSubTab === 'books' && (
-        <div className="space-y-6 max-w-4xl">
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xs">
-            <div className="p-4 border-b border-slate-100 flex items-center justify-between">
-              <div>
-                <h2 className="text-base font-bold text-slate-900">
-                  Danh Sách Sổ Văn Bản Trong Hệ Thống
-                </h2>
-                <p className="text-xs text-slate-500 mt-0.5">
-                  Hỗ trợ sổ dùng chung toàn trường và sổ riêng theo từng bộ phận / đơn vị với dãy số độc lập.
-                </p>
-              </div>
+      {/* Mobile Grouped Settings Picker Drawer/Modal */}
+      {mobileNavOpen && (
+        <div
+          className="fixed inset-0 z-50 lg:hidden flex flex-col justify-end sm:justify-center sm:items-center bg-slate-900/50 backdrop-blur-[1px] sm:p-4"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Chọn mục cài đặt"
+        >
+          <button
+            type="button"
+            aria-label="Đóng danh sách mục cài đặt"
+            onClick={() => setMobileNavOpen(false)}
+            className="flex-1 w-full cursor-default sm:hidden"
+          />
+          <div className="w-full sm:max-w-md bg-white rounded-t-2xl sm:rounded-2xl border-t sm:border border-slate-200 shadow-2xl max-h-[85vh] flex flex-col overflow-hidden">
+            <div className="px-4 py-3.5 border-b border-slate-200 flex items-center justify-between gap-2 shrink-0">
+              <span className="text-sm font-bold text-slate-900">Chọn mục cài đặt</span>
+              <button
+                type="button"
+                onClick={() => setMobileNavOpen(false)}
+                className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center rounded-lg text-slate-500 hover:bg-slate-100"
+              >
+                <X className="w-4 h-4" />
+              </button>
             </div>
-
-            <div className="divide-y divide-slate-100 text-xs">
-              {books.map((book) => {
-                const isSelected = book.id === selectedBook.id;
-                return (
-                  <div
-                    key={book.id}
-                    className={`p-4 flex flex-col sm:flex-row sm:items-center justify-between gap-3 ${
-                      isSelected ? 'bg-sky-50/40' : ''
-                    }`}
-                  >
-                    <div className="space-y-1">
-                      <div className="flex items-center gap-2 flex-wrap">
-                        <strong className="text-sm font-bold text-slate-900">{book.name}</strong>
-                        <span className="font-mono font-bold px-2 py-0.5 rounded bg-sky-100 text-sky-900 text-[11px]">
-                          {book.unitCode}
-                        </span>
-                        <span
-                          className="font-mono px-2 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 text-[10px]"
-                          title="Mã sổ nội bộ cố định (tên tab Google Sheets)"
-                        >
-                          Mã sổ: {book.code}
-                        </span>
-                        <span
-                          className={`px-2 py-0.5 rounded text-[10px] font-semibold ${
-                            book.googleDriveConfig?.isConfigured
-                              ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                              : 'bg-amber-50 text-amber-800 border border-amber-200'
-                          }`}
-                        >
-                          {book.googleDriveConfig?.isConfigured ? 'Đã sẵn sàng Drive' : 'Chưa cấu hình Drive'}
-                        </span>
-                        {!book.isActive && (
-                          <span className="px-2 py-0.5 rounded text-[10px] font-semibold bg-rose-50 text-rose-700 border border-rose-200">
-                            Đang tạm khóa
-                          </span>
-                        )}
-                      </div>
-                      <div className="text-[11px] text-slate-500 flex flex-wrap items-center gap-2">
-                        <span>{book.unitName}</span>
-                        <span>·</span>
-                        <span>Mẫu số: <code className="font-mono text-slate-700">{book.numberFormat}</code></span>
-                        <span>·</span>
-                        <span>{book.numberMode === 'shared' ? 'Dãy số chung' : 'Dãy số riêng theo loại'}</span>
-                        <span>·</span>
-                        <span>Loại dùng: <strong className="text-slate-700">{getBookEnabledTypes(book, documentTypes).map((t) => t.code).join(', ')}</strong></span>
-                      </div>
-                    </div>
-
-                    <div className="flex flex-wrap items-center gap-2 shrink-0">
-                      {(isAdmin || hasBookPermission(currentUser, book.id, 'manage_book')) && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setSelectedBookId(book.id);
-                            onSelectBookId(book.id);
-                            setActiveSubTab('general');
-                          }}
-                          className="px-3 py-2 min-h-[38px] bg-sky-50 hover:bg-sky-100 text-sky-800 border border-sky-200 rounded-md font-semibold transition-colors"
-                        >
-                          Cấu hình sổ này
-                        </button>
-                      )}
-                      {isAdmin && book.id !== DEFAULT_BOOK_ID && (
-                        <button
-                          type="button"
-                          disabled={isConfigBlocked}
-                          onClick={() => handleToggleBookActive(book)}
-                          className={`px-3 py-2 min-h-[38px] rounded-md font-semibold border transition-colors disabled:opacity-50 ${
-                            book.isActive
-                              ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border-amber-200'
-                              : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border-emerald-200'
-                          }`}
-                        >
-                          {book.isActive ? 'Tạm khóa' : 'Kích hoạt'}
-                        </button>
-                      )}
-                    </div>
+            <div className="overflow-y-auto p-3 space-y-4">
+              {visibleNavGroups.map((group) => (
+                <div key={group.key} className="space-y-1">
+                  <div className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                    {group.title}
                   </div>
-                );
-              })}
-            </div>
-          </div>
-
-          {isAdmin && (
-            <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
-              <h3 className="text-sm font-bold text-slate-900 flex items-center gap-2">
-                <Plus className="w-4 h-4 text-sky-700 shrink-0" />
-                <span>Tạo Sổ Văn Bản Mới (Phòng ban / Tổ chuyên môn / Sổ dùng chung)</span>
-              </h3>
-
-              <form onSubmit={handleCreateBook} className="grid grid-cols-1 sm:grid-cols-2 gap-4 text-xs">
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Tên sổ văn bản *</label>
-                  <input
-                    type="text"
-                    value={newBookName}
-                    onChange={(e) => {
-                      const val = e.target.value;
-                      setNewBookName(val);
-                      if (!newBookCodeEdited) {
-                        setNewBookCode(normalizeBookCode(val));
-                      }
-                    }}
-                    placeholder="Ví dụ: Tổ Ngữ văn / Công đoàn / Văn thư"
-                    required
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm"
-                  />
-                </div>
-
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">
-                    Mã sổ nội bộ cố định (Tên tab Google Sheets) *
-                  </label>
-                  <input
-                    type="text"
-                    value={newBookCode}
-                    onChange={(e) => {
-                      setNewBookCodeEdited(true);
-                      setNewBookCode(normalizeBookCode(e.target.value));
-                    }}
-                    placeholder="Ví dụ: TO_NGU_VAN"
-                    required
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono uppercase text-base sm:text-sm"
-                  />
-                  <span className="text-[11px] text-slate-500">Không thể đổi sau khi tạo, dùng để định tuyến tab Sheets.</span>
-                </div>
-
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Tên đơn vị / bộ phận *</label>
-                  <input
-                    type="text"
-                    value={newBookUnitName}
-                    onChange={(e) => setNewBookUnitName(e.target.value)}
-                    placeholder="Ví dụ: Tổ Ngữ văn - Trường THPT Nguyễn Chí Thanh"
-                    required
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm"
-                  />
-                </div>
-
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Ký hiệu đơn vị chính thức *</label>
-                  <input
-                    type="text"
-                    value={newBookUnitCode}
-                    onChange={(e) => setNewBookUnitCode(e.target.value)}
-                    placeholder="Ví dụ: TNV, CB, THPTNCT..."
-                    required
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono uppercase text-base sm:text-sm"
-                  />
-                </div>
-
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Mẫu định dạng số</label>
-                  <input
-                    type="text"
-                    value={newBookFormat}
-                    onChange={(e) => setNewBookFormat(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm"
-                  />
-                </div>
-
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Phạm vi & Chế độ dãy số</label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                    <select
-                      value={newBookIsShared ? 'shared' : 'unit'}
-                      onChange={(e) => setNewBookIsShared(e.target.value === 'shared')}
-                      className="w-full min-h-[44px] h-11 sm:h-10 px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
-                    >
-                      <option value="unit">Sổ riêng đơn vị</option>
-                      <option value="shared">Dùng chung trường</option>
-                    </select>
-                    <select
-                      value={newBookMode}
-                      onChange={(e) => setNewBookMode(e.target.value === 'shared' ? 'shared' : 'separate')}
-                      className="w-full min-h-[44px] h-11 sm:h-10 px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
-                    >
-                      <option value="separate">Dãy riêng theo loại</option>
-                      <option value="shared">Dãy chung liên tục</option>
-                    </select>
-                  </div>
-                </div>
-
-                <div className="sm:col-span-2 space-y-2">
-                  <label className="font-bold text-slate-700 block">
-                    Loại văn bản được sử dụng trong sổ mới *
-                  </label>
-                  <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2">
-                    {documentTypes.filter((t) => t.isActive).map((t) => {
-                      const checked = newBookEnabledTypes.includes(t.code);
+                  <div className="space-y-1">
+                    {group.items.map((item) => {
+                      const active = activeSubTab === item.id;
+                      const badge = getNavItemBadge(item.id);
                       return (
-                        <label
-                          key={t.code}
-                          className={`flex items-center gap-2.5 p-2.5 min-h-[42px] rounded-lg border cursor-pointer ${
-                            checked ? 'bg-sky-50 border-sky-300 text-sky-950 font-semibold' : 'bg-white border-slate-200 text-slate-600'
+                        <button
+                          key={item.id}
+                          type="button"
+                          onClick={() => handleSelectNavItem(item.id)}
+                          className={`w-full min-h-[42px] px-3 py-2 rounded-lg text-left text-xs font-semibold flex items-center justify-between gap-2 border transition-colors ${
+                            active
+                              ? 'bg-sky-50 text-sky-900 border-sky-200'
+                              : 'bg-white text-slate-700 border-transparent hover:bg-slate-50'
                           }`}
                         >
-                          <input
-                            type="checkbox"
-                            checked={checked}
-                            onChange={() =>
-                              setNewBookEnabledTypes((prev) =>
-                                prev.includes(t.code) ? prev.filter((c) => c !== t.code) : [...prev, t.code]
-                              )
-                            }
-                            className="rounded text-sky-700"
-                          />
-                          <span>{t.name} ({t.code})</span>
-                        </label>
+                          <span className="break-words">{item.label}</span>
+                          <div className="flex items-center gap-1.5 shrink-0">
+                            {badge !== null && (
+                              <span
+                                className={`px-1.5 py-0.5 rounded text-[10px] font-bold ${
+                                  active ? 'bg-sky-100 text-sky-800' : 'bg-slate-100 text-slate-600'
+                                }`}
+                              >
+                                {badge}
+                              </span>
+                            )}
+                            <ChevronRight className="w-3.5 h-3.5 text-slate-400" />
+                          </div>
+                        </button>
                       );
                     })}
-                  </div>
-                </div>
-
-                {bookMessage && (
-                  <div
-                    className={`sm:col-span-2 p-3 rounded-lg flex items-center gap-2 ${
-                      bookMessage.success
-                        ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                        : 'bg-rose-50 text-rose-700 border border-rose-200'
-                    }`}
-                  >
-                    {bookMessage.success ? (
-                      <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
-                    ) : (
-                      <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                    {group.key === 'books_management' && isAdmin && (
+                      <button
+                        type="button"
+                        disabled={isConfigBlocked}
+                        onClick={() => {
+                          setMobileNavOpen(false);
+                          setCreateBookServerError(null);
+                          setCreateBookDrawerOpen(true);
+                        }}
+                        className="w-full min-h-[42px] px-3 py-2 rounded-lg text-left text-xs font-semibold flex items-center gap-2 text-sky-700 hover:bg-sky-50 border border-dashed border-sky-200 disabled:opacity-50"
+                      >
+                        <Plus className="w-3.5 h-3.5 shrink-0" />
+                        <span>Tạo sổ mới</span>
+                      </button>
                     )}
-                    <span>{bookMessage.text}</span>
                   </div>
-                )}
-
-                <div className="sm:col-span-2 flex justify-end">
-                  <button
-                    type="submit"
-                    disabled={bookSaving || isConfigBlocked}
-                    className="w-full sm:w-auto min-h-[44px] px-5 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors flex items-center justify-center gap-2"
-                  >
-                    <Plus className="w-4 h-4" />
-                    <span>{bookSaving ? 'Đang tạo sổ...' : 'Tạo sổ văn bản mới'}</span>
-                  </button>
                 </div>
-              </form>
+              ))}
             </div>
-          )}
+          </div>
         </div>
       )}
+
+      {/* Main 2-column layout: Left Vertical Grouped Sidebar (lg+) + Right Content Area */}
+      <div className="lg:flex lg:items-start lg:gap-6 min-w-0">
+        {/* Desktop Left Navigation */}
+        <aside
+          aria-label="Nhóm mục cài đặt"
+          className="hidden lg:block w-64 shrink-0 sticky top-20"
+        >
+          <nav className="bg-white border border-slate-200 rounded-xl p-3 shadow-xs space-y-4">
+            {visibleNavGroups.map((group) => (
+              <div key={group.key} className="space-y-1">
+                <h2 className="px-2.5 py-1 text-[11px] font-bold uppercase tracking-wider text-slate-400">
+                  {group.title}
+                </h2>
+                <div className="space-y-1">
+                  {group.items.map((item) => {
+                    const active = activeSubTab === item.id;
+                    const badge = getNavItemBadge(item.id);
+                    return (
+                      <button
+                        key={item.id}
+                        type="button"
+                        onClick={() => handleSelectNavItem(item.id)}
+                        className={`w-full min-h-[38px] px-3 py-2 rounded-lg text-left text-xs font-semibold flex items-center justify-between gap-2 border transition-colors ${
+                          active
+                            ? 'bg-sky-50 text-sky-900 border-sky-200'
+                            : 'bg-transparent text-slate-600 border-transparent hover:text-slate-900 hover:bg-slate-50'
+                        }`}
+                      >
+                        <span className="leading-snug">{item.label}</span>
+                        {badge !== null && (
+                          <span
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                              active ? 'bg-sky-100 text-sky-800' : 'bg-slate-100 text-slate-600'
+                            }`}
+                          >
+                            {badge}
+                          </span>
+                        )}
+                      </button>
+                    );
+                  })}
+
+                  {group.key === 'books_management' && isAdmin && (
+                    <button
+                      type="button"
+                      disabled={isConfigBlocked}
+                      onClick={() => {
+                        setCreateBookServerError(null);
+                        setCreateBookDrawerOpen(true);
+                      }}
+                      className="w-full min-h-[38px] px-3 py-2 rounded-lg text-left text-xs font-semibold flex items-center gap-2 text-sky-700 hover:bg-sky-50 border border-dashed border-sky-200 transition-colors disabled:opacity-50"
+                    >
+                      <Plus className="w-3.5 h-3.5 shrink-0" />
+                      <span>Tạo sổ mới</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+          </nav>
+        </aside>
+
+        {/* Right Content Area */}
+        <div className="flex-1 min-w-0 space-y-5">
+          {/* Pinned Top Bar: Sổ đang cấu hình */}
+          {managedBooks.length > 0 && (
+            <div className="bg-white border border-slate-200 rounded-xl p-3 sm:px-4 sm:py-3 shadow-xs flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
+              <div className="flex items-center gap-2.5 min-w-0 flex-1">
+                <div
+                  className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 border ${selectedBookIdentity.iconBg} ${selectedBookIdentity.iconText} ${selectedBookIdentity.badgeBorder}`}
+                >
+                  <BookOpen className="w-4 h-4" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <div className="flex flex-wrap items-center gap-2">
+                    <label
+                      htmlFor="settings-active-book-select"
+                      className="text-[11px] font-semibold text-slate-500 whitespace-nowrap"
+                    >
+                      Sổ đang cấu hình
+                    </label>
+                    {hasUnsavedChangesForSelectedBook && (
+                      <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-bold">
+                        Có thay đổi chưa lưu
+                      </span>
+                    )}
+                  </div>
+                  <select
+                    id="settings-active-book-select"
+                    value={selectedBook.id}
+                    onChange={(e) => requestSelectBook(e.target.value)}
+                    className="w-full min-w-0 max-w-full mt-0.5 font-bold text-slate-900 bg-transparent border-0 p-0 focus:outline-hidden cursor-pointer text-base sm:text-sm truncate"
+                  >
+                    {managedBooks.map((b) => (
+                      <option key={b.id} value={b.id}>
+                        {b.name} ({b.unitCode}){!b.isActive ? ' — Tạm khóa' : ''}
+                      </option>
+                    ))}
+                  </select>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 shrink-0 sm:pl-2">
+                <span
+                  className={`font-mono font-bold px-2.5 py-1 rounded-md border text-[11px] ${selectedBookIdentity.badgeBg} ${selectedBookIdentity.badgeText} ${selectedBookIdentity.badgeBorder}`}
+                >
+                  {selectedBook.unitCode}
+                </span>
+                <span className="font-mono px-2 py-1 rounded-md bg-slate-100 text-slate-600 border border-slate-200 text-[11px]">
+                  {selectedBook.code}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {isConfigBlocked && (
+            <div className="p-4 bg-rose-50 border border-rose-300 rounded-xl flex flex-wrap items-center justify-between gap-3 text-xs text-rose-950">
+              <div className="flex items-start gap-2.5 min-w-0">
+                <AlertTriangle className="w-5 h-5 text-rose-600 shrink-0 mt-0.5" />
+                <div className="min-w-0">
+                  <strong className="block font-bold">
+                    Chưa cập nhật được dữ liệu cấu hình từ máy chủ
+                  </strong>
+                  <span className="break-words">
+                    {syncError ||
+                      'Đang tải cấu hình mới nhất. Các nút lưu cài đặt tạm khóa để tránh ghi đè nhầm cấu hình cũ.'}
+                  </span>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={onRefreshData}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-lg transition-colors shrink-0"
+              >
+                <RefreshCw className="w-3.5 h-3.5" />
+                <span>Thử lại</span>
+              </button>
+            </div>
+          )}
+
+          {settingsConflict && (
+            <div className="p-4 bg-amber-50 border border-amber-300 rounded-xl space-y-2.5 text-xs text-amber-950">
+              <div className="flex items-start gap-2.5">
+                <AlertTriangle className="w-5 h-5 text-amber-600 shrink-0 mt-0.5" />
+                <div className="space-y-1 min-w-0">
+                  <strong className="block font-bold">
+                    Cài đặt đã thay đổi trên thiết bị khác
+                  </strong>
+                  <span className="break-words">{settingsConflict.message}</span>
+                </div>
+              </div>
+              <div className="flex flex-wrap items-center gap-2 sm:pl-7">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetBook = settingsConflict.serverBook || selectedBook;
+                    applySelectedBookToForms(targetBook, true);
+                    onRefreshData();
+                  }}
+                  className="px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg transition-colors"
+                >
+                  Tải lại cài đặt mới từ máy chủ
+                </button>
+                <button
+                  type="button"
+                  onClick={async () => {
+                    if (settingsConflict.retryAction) {
+                      await settingsConflict.retryAction();
+                    } else {
+                      if (settingsConflict.serverVersion) {
+                        loadedBookSnapshotRef.current = {
+                          bookId: selectedBook.id,
+                          version: settingsConflict.serverVersion,
+                        };
+                      }
+                      setSettingsConflict(null);
+                    }
+                  }}
+                  className="px-3 py-1.5 bg-amber-100 hover:bg-amber-200 text-amber-950 border border-amber-300 font-semibold rounded-lg transition-colors"
+                >
+                  Giữ nội dung đang sửa &amp; ghi đè lên máy chủ
+                </button>
+              </div>
+            </div>
+          )}
+
+          {!isAdmin && (
+            <div className="p-3 bg-sky-50 border border-sky-200 rounded-xl text-xs text-sky-900 flex items-center gap-2">
+              <Sliders className="w-4 h-4 text-sky-700 shrink-0" />
+              <span className="break-words">
+                Bạn đang cấu hình với quyền <strong>Quản trị sổ</strong> cho sổ{' '}
+                <strong>{selectedBook.name}</strong>. Các thiết lập toàn hệ thống và phân quyền tài khoản do Quản trị viên quản lý.
+              </span>
+            </div>
+          )}
+
+          {/* SUB-TAB: DANH SÁCH SỔ */}
+          {activeSubTab === 'books' && (
+            <BooksListSection
+              books={books}
+              selectedBookId={selectedBook.id}
+              currentUser={currentUser}
+              isAdmin={isAdmin}
+              isConfigBlocked={isConfigBlocked}
+              documentTypes={documentTypes}
+              bookFeedback={bookMessage}
+              onDismissFeedback={() => setBookMessage(null)}
+              onConfigureBook={(bookId) => requestSelectBook(bookId, 'general')}
+              onOpenCreateDrawer={() => {
+                setCreateBookServerError(null);
+                setCreateBookDrawerOpen(true);
+              }}
+              onRequestToggleLockBook={(book) => setToggleLockConfirmBook(book)}
+            />
+          )}
 
       {/* SUB-TAB 1: THÔNG TIN SỔ & MẪU SỐ */}
       {activeSubTab === 'general' && (
@@ -2301,6 +2170,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 })}
               </div>
             </div>
+
+            {generalError && (
+              <div className="p-3 bg-rose-50 text-rose-700 border border-rose-200 rounded-lg flex items-center gap-2">
+                <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
+                <span>{generalError}</span>
+              </div>
+            )}
 
             {generalSuccess && (
               <div className="p-3 bg-emerald-50 text-emerald-800 rounded-lg flex items-center gap-2">
@@ -2431,9 +2307,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 <h2 className="text-base font-bold text-slate-900">
                   Thiết Lập Số Bắt Đầu — {selectedBook.name}
                 </h2>
-                <p className="text-xs text-slate-600 mt-1">
+                <p className="text-xs text-slate-600 mt-1 break-words">
                   Mỗi loại văn bản có mốc bắt đầu và dãy số riêng theo từng sổ, từng năm. Khóa dãy đang chọn:{' '}
-                  <code className="font-mono font-bold text-sky-800 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200">
+                  <code className="font-mono font-bold text-sky-800 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200 break-all">
                     {activeSeriesKeyDisplay}
                   </code>
                 </p>
@@ -2741,9 +2617,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                       </div>
                     </div>
 
-                    <div className="flex items-center gap-3">
+                    <div className="flex flex-wrap items-center gap-2 sm:gap-3">
                       {isAdmin && (
-                        <div className="flex items-center gap-1 bg-slate-50 p-1 rounded-md border border-slate-200">
+                        <div className="flex flex-wrap items-center gap-1 bg-slate-50 p-1 rounded-md border border-slate-200">
                           <span className="text-[10px] text-slate-500 font-medium px-1">Màu:</span>
                           {Object.values(DOCUMENT_COLOR_PALETTE).map((colorOpt) => (
                             <button
@@ -3619,6 +3495,23 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </div>
 
+              {msSaveMessage && (
+                <div
+                  className={`p-3 rounded-lg text-xs flex items-start gap-2 ${
+                    msSaveMessage.success
+                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                      : 'bg-rose-50 text-rose-800 border border-rose-200'
+                  }`}
+                >
+                  {msSaveMessage.success ? (
+                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                  ) : (
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  )}
+                  <span>{msSaveMessage.message}</span>
+                </div>
+              )}
+
               {msTestResult && (
                 <div
                   className={`p-3 rounded-lg text-xs ${
@@ -3669,6 +3562,32 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       {/* SUB-TAB: QUẢN LÝ TÀI KHOẢN & PHÂN QUYỀN THEO TỪNG SỔ (ADMIN ONLY) */}
       {activeSubTab === 'users' && isAdmin && (
         <div className="space-y-6 max-w-4xl">
+          {userFeedback && (
+            <div
+              className={`p-3.5 rounded-xl border text-xs flex items-start justify-between gap-2 ${
+                userFeedback.success
+                  ? 'bg-emerald-50 text-emerald-900 border-emerald-200'
+                  : 'bg-rose-50 text-rose-800 border-rose-200'
+              }`}
+            >
+              <div className="flex items-start gap-2 min-w-0">
+                {userFeedback.success ? (
+                  <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
+                ) : (
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                )}
+                <span className="break-words">{userFeedback.message}</span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setUserFeedback(null)}
+                className="text-[11px] font-semibold opacity-75 hover:opacity-100 shrink-0"
+              >
+                Đóng
+              </button>
+            </div>
+          )}
+
           <div className="bg-sky-50 border border-sky-200 rounded-xl p-4 text-xs text-sky-900 space-y-2">
             <div className="flex items-center gap-2 font-bold text-sky-950 text-sm">
               <ShieldCheck className="w-4 h-4 text-sky-700" />
@@ -3977,6 +3896,60 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
         </div>
       )}
+        </div>
+      </div>
+
+      {/* Slide-over drawer for + Tạo sổ mới */}
+      <CreateBookDrawer
+        open={createBookDrawerOpen}
+        onClose={() => !bookSaving && setCreateBookDrawerOpen(false)}
+        existingBooks={books}
+        documentTypes={documentTypes}
+        saving={bookSaving}
+        isConfigBlocked={isConfigBlocked}
+        serverError={createBookServerError}
+        onClearServerError={() => setCreateBookServerError(null)}
+        onSubmitBook={handleCreateBookSubmit}
+      />
+
+      {/* Unsaved-changes guard when switching Sổ đang cấu hình */}
+      <PendingBookSwitchModal
+        pendingSwitch={pendingBookSwitch}
+        saving={switchingBookSaving}
+        errorMessage={switchBookError}
+        onSaveAndSwitch={handleSaveAndSwitchBook}
+        onDiscardAndSwitch={handleDiscardAndSwitchBook}
+        onCancel={() => {
+          if (!switchingBookSaving) {
+            setPendingBookSwitch(null);
+            setSwitchBookError(null);
+          }
+        }}
+      />
+
+      {/* Explicit confirmation for Tạm khóa / Mở khóa sổ */}
+      <ToggleBookLockModal
+        book={toggleLockConfirmBook}
+        saving={toggleLockSaving}
+        onConfirm={handleConfirmToggleBookLock}
+        onCancel={() => !toggleLockSaving && setToggleLockConfirmBook(null)}
+      />
+
+      {/* Generic confirmation modal (delete doc type / signer / user) */}
+      <ConfirmDeleteModal
+        request={confirmDeleteRequest}
+        busy={confirmDeleteBusy}
+        onClose={() => !confirmDeleteBusy && setConfirmDeleteRequest(null)}
+      />
+
+      {/* Password reset modal */}
+      <ResetPasswordModal
+        user={resetPassUser}
+        saving={resetPassSaving}
+        onSubmit={handleConfirmResetPassword}
+        onClose={() => !resetPassSaving && setResetPassUser(null)}
+      />
     </div>
   );
 };
+
