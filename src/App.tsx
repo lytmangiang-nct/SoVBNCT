@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo } from 'react';
-import { Navbar, type AppTab } from './components/Navbar';
+import { Navbar, type AppTab, type RegistrySection } from './components/Navbar';
 import { IssueNumberView } from './components/IssueNumberView';
 import { ImportPdfView } from './components/ImportPdfView';
 import { DocumentRegistryView } from './components/DocumentRegistryView';
@@ -19,13 +19,12 @@ import type {
 import {
   DEFAULT_BOOK_ID,
   getAccessibleBooks,
-  getBookEnabledTypes,
   getDocBookId,
   hasAnyBookPermission,
   hasBookPermission,
   isSystemAdmin,
 } from './utils/permissions';
-import { AlertTriangle, Bell, BookOpen, Clock, FileText, RefreshCw } from 'lucide-react';
+import { AlertTriangle, Bell, BookOpen, RefreshCw } from 'lucide-react';
 
 function getClientVietnamTimeFallback() {
   try {
@@ -53,6 +52,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<AppTab>('issue');
+  const [registrySection, setRegistrySection] = useState<RegistrySection>('active');
   const [pendingOpenDocId, setPendingOpenDocId] = useState<string | null>(null);
 
   const initialVnTime = useMemo(() => getClientVietnamTimeFallback(), []);
@@ -393,34 +393,13 @@ export default function App() {
     [currentUser, books]
   );
 
-  // Sync activeBookId to a book authorized for the current activeTab
+  // Ensure activeBookId points to an accessible book
   useEffect(() => {
     if (accessibleBooks.length === 0 || !currentUser) return;
-    const bookSupportsTab = (b: RegistryBook): boolean => {
-      if (isSystemAdmin(currentUser)) return true;
-      if (activeTab === 'issue') {
-        return hasBookPermission(currentUser, b.id, 'issue_number') || hasBookPermission(currentUser, b.id, 'request_number');
-      }
-      if (activeTab === 'import_pdf') {
-        return hasBookPermission(currentUser, b.id, 'import_incoming');
-      }
-      if (activeTab === 'registry' || activeTab === 'statistics') {
-        return hasBookPermission(currentUser, b.id, 'view');
-      }
-      if (activeTab === 'settings') {
-        return hasBookPermission(currentUser, b.id, 'manage_book');
-      }
-      return true;
-    };
-
-    const currentBook = accessibleBooks.find((b) => b.id === activeBookId);
-    if (!currentBook || !bookSupportsTab(currentBook)) {
-      const preferred = accessibleBooks.find(bookSupportsTab) || accessibleBooks[0];
-      if (preferred && preferred.id !== activeBookId) {
-        setActiveBookId(preferred.id);
-      }
+    if (!accessibleBooks.some((b) => b.id === activeBookId)) {
+      setActiveBookId(accessibleBooks[0].id);
     }
-  }, [accessibleBooks, activeBookId, activeTab, currentUser]);
+  }, [accessibleBooks, activeBookId, currentUser]);
 
   const activeBook: RegistryBook = useMemo(() => {
     const found =
@@ -446,33 +425,49 @@ export default function App() {
     };
   }, [accessibleBooks, books, activeBookId, settings, signers]);
 
-  // Enforce permission-based tab fallback (chỉ mở các tab người dùng có quyền)
+  // Enforce permission-based tab fallback strictly for activeBook & currentUser
   useEffect(() => {
     if (!currentUser || loadingData) return;
     const isAdmin = isSystemAdmin(currentUser);
+    const hasPerm = (perm: 'issue_number' | 'request_number' | 'import_incoming' | 'view' | 'delete' | 'manage_book') => {
+      if (isAdmin) return true;
+      if (activeBook?.id && books.some((b) => b.id === activeBook.id)) {
+        return hasBookPermission(currentUser, activeBook.id, perm);
+      }
+      return hasAnyBookPermission(currentUser, perm, books);
+    };
+
     const allowedTabs: AppTab[] = [];
-    if (
-      isAdmin ||
-      hasAnyBookPermission(currentUser, 'issue_number', books) ||
-      hasAnyBookPermission(currentUser, 'request_number', books)
-    ) {
+    if (hasPerm('issue_number') || hasPerm('request_number')) {
       allowedTabs.push('issue');
     }
-    if (isAdmin || hasAnyBookPermission(currentUser, 'import_incoming', books)) {
+    if (hasPerm('import_incoming')) {
       allowedTabs.push('import_pdf');
     }
-    if (isAdmin || hasAnyBookPermission(currentUser, 'view', books)) {
+    if (hasPerm('view') || hasPerm('delete')) {
       allowedTabs.push('registry');
+    }
+    if (hasPerm('view')) {
       allowedTabs.push('statistics');
     }
-    if (isAdmin || hasAnyBookPermission(currentUser, 'manage_book', books)) {
+    if (hasPerm('manage_book')) {
       allowedTabs.push('settings');
     }
 
     if (allowedTabs.length > 0 && !allowedTabs.includes(activeTab)) {
+      if (allowedTabs.includes('registry')) {
+        setRegistrySection(hasPerm('view') ? 'active' : 'deleted');
+      }
       setActiveTab(allowedTabs[0]);
+    } else if (
+      activeTab === 'registry' &&
+      !hasPerm('view') &&
+      hasPerm('delete') &&
+      registrySection !== 'deleted'
+    ) {
+      setRegistrySection('deleted');
     }
-  }, [currentUser, books, activeTab, loadingData]);
+  }, [currentUser, books, activeBook?.id, activeTab, registrySection, loadingData]);
 
   // Handlers
   const handleLogout = async () => {
@@ -515,6 +510,7 @@ export default function App() {
 
   const handleOpenExistingDocument = (docId: string) => {
     setPendingOpenDocId(docId);
+    setRegistrySection('active');
     setActiveTab('registry');
   };
 
@@ -539,7 +535,10 @@ export default function App() {
     (d) => d.year === currentYear && getDocBookId(d) === activeBook.id
   );
   const totalCount = currentYearDocs.length;
-  const incomingCount = currentYearDocs.filter((d) => d.docCategory === 'incoming').length;
+  const activeBookDeletedDocs = deletedDocuments.filter((d) => getDocBookId(d) === activeBook.id);
+  const pendingExcelSyncCount = activeBookDeletedDocs.filter(
+    (d) => d.excelDeleteSyncStatus === 'failed' || d.excelDeleteSyncStatus === 'pending'
+  ).length;
   const noBookPermission = settingsLoaded && accessibleBooks.length === 0;
 
   return (
@@ -548,68 +547,34 @@ export default function App() {
       <Navbar
         activeTab={activeTab}
         setActiveTab={setActiveTab}
+        registrySection={registrySection}
+        onSelectRegistrySection={setRegistrySection}
+        deletedCount={activeBookDeletedDocs.length}
+        pendingExcelSyncCount={pendingExcelSyncCount}
         currentUser={currentUser}
         books={books}
-        accessibleBooks={accessibleBooks}
         activeBook={activeBook}
-        onSelectBook={setActiveBookId}
         onLogout={handleLogout}
-        lastSyncAt={lastSyncAt}
-        syncingData={loadingData}
-        onRefreshData={loadAppData}
       />
 
-      {/* Global Dashboard Summary Banner */}
-      <section className="bg-sky-900 text-white border-b border-sky-950 py-3 px-3 sm:px-6 lg:px-8">
-        <div className="max-w-7xl mx-auto flex flex-col lg:flex-row items-stretch lg:items-center justify-between gap-3">
-          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2.5 min-w-0">
-            <div className="flex items-start sm:items-center gap-2.5 min-w-0">
-              <div className="w-8 h-8 sm:w-9 sm:h-9 rounded-lg bg-sky-800/80 flex items-center justify-center shrink-0 border border-sky-700/60 mt-0.5 sm:mt-0">
-                <FileText className="w-4 h-4 sm:w-5 sm:h-5 text-sky-200" />
-              </div>
-              <div className="min-w-0 space-y-0.5">
-                <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap">
-                  <span className="text-xs uppercase font-bold tracking-wider text-sky-200">
-                    Năm {currentYear}
-                  </span>
-                  <span className="text-[11px] text-sky-300">·</span>
-                  <span className="text-xs text-sky-200">
-                    Tổng: <strong className="font-mono text-white font-bold">{totalCount}</strong> văn bản
-                  </span>
-                </div>
-                <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] text-sky-300">
-                  <span className="truncate max-w-full">
-                    {activeBook.unitName} ({activeBook.unitCode})
-                  </span>
-                  {lastSyncAt && (
-                    <>
-                      <span className="hidden sm:inline">·</span>
-                      <span className="inline-flex items-center gap-1 text-sky-200 font-mono">
-                        <Clock className="w-3 h-3 shrink-0" />
-                        Cập nhật lần cuối:{' '}
-                        {lastSyncAt.toLocaleTimeString('vi-VN', {
-                          hour: '2-digit',
-                          minute: '2-digit',
-                          second: '2-digit',
-                        })}
-                      </span>
-                    </>
-                  )}
-                </div>
-              </div>
-            </div>
-
-            {/* Always-visible Book Selector on all screens */}
+      {/* Thanh thông tin sổ: Bộ chọn sổ, năm, tổng số văn bản và nút Làm mới dạng biểu tượng */}
+      <section
+        aria-label="Thông tin sổ văn bản"
+        className="bg-sky-900 text-white border-b border-sky-950 py-2.5 px-3 sm:px-6 lg:px-8"
+      >
+        <div className="max-w-7xl mx-auto flex items-center justify-between gap-2.5 sm:gap-4">
+          <div className="flex flex-wrap items-center gap-x-3 sm:gap-x-4 gap-y-2 min-w-0 flex-1">
+            {/* Bộ chọn sổ */}
             {accessibleBooks.length > 0 && (
-              <div className="flex items-center gap-2 bg-sky-800/90 border border-sky-600/80 rounded-lg px-2.5 py-1.5 min-h-[40px] sm:min-h-[36px] shrink-0 w-full sm:w-auto min-w-0">
-                <BookOpen className="w-3.5 h-3.5 text-sky-200 shrink-0" />
-                <span className="text-[11px] text-sky-200 font-medium whitespace-nowrap">Sổ:</span>
+              <div className="flex items-center gap-2 bg-sky-800/90 border border-sky-600/80 rounded-lg px-2.5 h-9 shrink-0 max-w-full min-w-0">
+                <BookOpen className="w-4 h-4 text-sky-200 shrink-0" />
+                <span className="text-xs text-sky-200 font-medium whitespace-nowrap">Sổ:</span>
                 {accessibleBooks.length > 1 ? (
                   <select
                     aria-label="Sổ đang chọn"
                     value={activeBook.id}
                     onChange={(e) => setActiveBookId(e.target.value)}
-                    className="flex-1 sm:flex-initial min-w-0 bg-transparent text-white text-xs sm:text-sm font-bold focus:outline-hidden cursor-pointer [&>option]:text-slate-900"
+                    className="min-w-0 max-w-[200px] sm:max-w-[260px] bg-transparent text-white text-xs sm:text-sm font-bold focus:outline-hidden cursor-pointer truncate [&>option]:text-slate-900"
                   >
                     {accessibleBooks.map((b) => (
                       <option key={b.id} value={b.id}>
@@ -618,35 +583,44 @@ export default function App() {
                     ))}
                   </select>
                 ) : (
-                  <span className="text-xs font-bold text-white truncate">
+                  <span className="text-xs sm:text-sm font-bold text-white truncate max-w-[220px]">
                     {activeBook.name} ({activeBook.unitCode})
                   </span>
                 )}
               </div>
             )}
-          </div>
 
-          {/* Quick counts for book-enabled types + Văn bản đến */}
-          <div className="flex items-center gap-1.5 sm:gap-2 flex-wrap text-[11px] sm:text-xs">
-            {getBookEnabledTypes(activeBook, documentTypes).map((t) => {
-              const count = currentYearDocs.filter(
-                (d) => d.docCategory !== 'incoming' && d.typeCode === t.code
-              ).length;
-              return (
-                <div
-                  key={t.code}
-                  className="bg-sky-800/80 border border-sky-700/60 px-2 sm:px-2.5 py-1 rounded-md flex items-center gap-1.5"
-                >
-                  <span className="text-sky-200 font-medium">{t.name}:</span>
-                  <span className="font-mono font-bold text-white">{count}</span>
-                </div>
-              );
-            })}
-            <div className="bg-indigo-800/80 border border-indigo-600/70 px-2 sm:px-2.5 py-1 rounded-md flex items-center gap-1.5">
-              <span className="text-indigo-200 font-medium">Văn bản đến:</span>
-              <span className="font-mono font-bold text-white">{incomingCount}</span>
+            {/* Năm & Tổng số văn bản */}
+            <div className="flex items-center gap-2 sm:gap-3 text-xs sm:text-sm text-sky-100 whitespace-nowrap tabular-nums">
+              <span className="font-bold uppercase tracking-wider text-sky-200">
+                Năm {currentYear}
+              </span>
+              <span className="text-sky-400" aria-hidden="true">·</span>
+              <span>
+                Tổng: <strong className="font-mono text-white font-bold">{totalCount}</strong> văn bản
+              </span>
             </div>
           </div>
+
+          {/* Nút Làm mới dạng biểu tượng (kích thước cố định chống nhảy bố cục) */}
+          <button
+            type="button"
+            onClick={loadAppData}
+            disabled={loadingData}
+            aria-label="Làm mới dữ liệu"
+            title={
+              lastSyncAt
+                ? `Làm mới dữ liệu (Cập nhật lúc ${lastSyncAt.toLocaleTimeString('vi-VN', {
+                    hour: '2-digit',
+                    minute: '2-digit',
+                    second: '2-digit',
+                  })})`
+                : 'Làm mới dữ liệu'
+            }
+            className="w-9 h-9 rounded-lg bg-sky-800/90 hover:bg-sky-700 border border-sky-600/80 text-white flex items-center justify-center transition-colors shrink-0 disabled:opacity-60"
+          >
+            <RefreshCw className={`w-4 h-4 ${loadingData ? 'animate-spin' : ''}`} />
+          </button>
         </div>
       </section>
 
@@ -722,7 +696,10 @@ export default function App() {
                 onRefreshRequests={refreshRequests}
                 onDocumentIssued={handleDocumentIssued}
                 onDocumentUpdated={handleDocumentUpdated}
-                onNavigateToRegistry={() => setActiveTab('registry')}
+                onNavigateToRegistry={() => {
+                  setRegistrySection('active');
+                  setActiveTab('registry');
+                }}
                 onOpenExistingDocument={handleOpenExistingDocument}
                 onDocumentTypeAdded={(newType) => {
                   setDocumentTypes((prev) => {
@@ -759,6 +736,8 @@ export default function App() {
                 settings={settings}
                 serverYear={serverYear}
                 currentUser={currentUser}
+                section={registrySection}
+                onSectionChange={setRegistrySection}
                 onRefresh={loadAppData}
                 onDocumentUpdated={handleDocumentUpdated}
                 initialOpenDocId={pendingOpenDocId}

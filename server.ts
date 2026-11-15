@@ -4519,7 +4519,16 @@ app.get('/api/statistics', requireAuth, (req, res) => {
   const cancelledCount = docsOfYear.filter((d) => d.status === 'cancelled').length;
   const pendingSyncCount = docsOfYear.filter((d) => d.syncStatus === 'pending').length;
 
-  const byType = db.documentTypes.map((type) => {
+  const targetStatsBook = bookId && bookId !== 'all' ? getBookById(bookId) : null;
+  const relevantTypes = targetStatsBook
+    ? db.documentTypes.filter(
+        (type) =>
+          isTypeEnabledInBook(targetStatsBook, type.code) ||
+          docsOfYear.some((d) => d.docCategory !== 'incoming' && d.typeCode === type.code)
+      )
+    : db.documentTypes;
+
+  const byType = relevantTypes.map((type) => {
     const typeDocs = docsOfYear.filter((d) => d.docCategory !== 'incoming' && d.typeCode === type.code);
     return {
       typeCode: type.code,
@@ -4529,14 +4538,12 @@ app.get('/api/statistics', requireAuth, (req, res) => {
     };
   });
   const incomingDocs = docsOfYear.filter((d) => d.docCategory === 'incoming');
-  if (incomingDocs.length > 0) {
-    byType.push({
-      typeCode: 'VBD',
-      typeName: 'Văn bản đến (PDF)',
-      count: incomingDocs.length,
-      cancelledCount: incomingDocs.filter((d) => d.status === 'cancelled').length,
-    });
-  }
+  byType.push({
+    typeCode: 'VBD',
+    typeName: 'Văn bản đến',
+    count: incomingDocs.length,
+    cancelledCount: incomingDocs.filter((d) => d.status === 'cancelled').length,
+  });
 
   const byMonth = Array.from({ length: 12 }, (_, i) => {
     const month = i + 1;

@@ -54,7 +54,17 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
 
-  // Sync if activeBookId changes or viewableBooks shrinks
+  const prevActiveBookRef = React.useRef<string>(activeBookId);
+  useEffect(() => {
+    if (prevActiveBookRef.current !== activeBookId) {
+      prevActiveBookRef.current = activeBookId;
+      if (viewableBooks.some((b) => b.id === activeBookId)) {
+        setStatsBookId(activeBookId);
+      }
+    }
+  }, [activeBookId, viewableBooks]);
+
+  // Sync if viewableBooks shrinks
   useEffect(() => {
     if (statsBookId === 'all' && viewableBooks.length === 1) {
       setStatsBookId(viewableBooks[0].id);
@@ -151,11 +161,12 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
           <button
             type="button"
             onClick={() => fetchStats(selectedYear, statsBookId)}
-            className="min-h-[42px] px-3 py-2 text-xs font-semibold text-slate-600 hover:text-sky-700 bg-white border border-slate-200 rounded-lg shadow-2xs transition-colors inline-flex items-center justify-center gap-1.5 shrink-0"
+            disabled={loading}
+            className="w-10 h-10 text-slate-600 hover:text-sky-700 bg-white border border-slate-200 rounded-lg shadow-2xs transition-colors inline-flex items-center justify-center shrink-0 disabled:opacity-60"
             title="Làm mới thống kê"
+            aria-label="Làm mới thống kê"
           >
-            <RefreshCw className="w-4 h-4" />
-            <span className="sm:hidden">Làm mới</span>
+            <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
           </button>
         </div>
       </div>
@@ -250,32 +261,54 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
 
           {/* Section: Breakdown by Document Type */}
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs">
-            <h2 className="text-base font-bold text-slate-900 mb-4">
-              Số Lượng Theo Từng Loại Văn Bản
-            </h2>
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-4">
+              <h2 className="text-base font-bold text-slate-900">
+                Số Lượng Chi Tiết Theo Loại Văn Bản
+              </h2>
+              <span className="text-xs text-slate-500">
+                Bao gồm văn bản đi theo từng loại và văn bản đến
+              </span>
+            </div>
 
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3 sm:gap-4">
-              {stats.byType.map((t) => (
-                <div
-                  key={t.typeCode}
-                  className="p-3.5 sm:p-4 bg-slate-50 border border-slate-200 rounded-lg flex items-center justify-between gap-2 min-w-0"
-                >
-                  <div className="min-w-0">
-                    <span className="text-xs font-bold text-sky-800 bg-sky-100 px-2 py-0.5 rounded font-mono">
-                      {t.typeCode}
-                    </span>
-                    <h3 className="text-sm font-semibold text-slate-900 mt-1.5 break-words">{t.typeName}</h3>
-                    <p className="text-xs text-slate-500 mt-0.5">
-                      Đã hủy: <span className="font-mono text-rose-600">{t.cancelledCount}</span>
-                    </p>
-                  </div>
+              {stats.byType.map((t) => {
+                const isIncoming = t.typeCode === 'VBD';
+                return (
+                  <div
+                    key={t.typeCode}
+                    className={`p-3.5 sm:p-4 border rounded-lg flex items-center justify-between gap-2 min-w-0 ${
+                      isIncoming
+                        ? 'bg-indigo-50/60 border-indigo-200'
+                        : 'bg-slate-50 border-slate-200'
+                    }`}
+                  >
+                    <div className="min-w-0">
+                      <span
+                        className={`text-xs font-bold px-2 py-0.5 rounded font-mono ${
+                          isIncoming
+                            ? 'text-indigo-800 bg-indigo-100'
+                            : 'text-sky-800 bg-sky-100'
+                        }`}
+                      >
+                        {t.typeCode}
+                      </span>
+                      <h3 className="text-sm font-semibold text-slate-900 mt-1.5 break-words">
+                        {t.typeName}
+                      </h3>
+                      <p className="text-xs text-slate-500 mt-0.5">
+                        Đã hủy: <span className="font-mono text-rose-600 tabular-nums">{t.cancelledCount}</span>
+                      </p>
+                    </div>
 
-                  <div className="text-right shrink-0">
-                    <span className="text-2xl font-bold font-mono text-slate-900">{t.count}</span>
-                    <span className="block text-[11px] text-slate-400">văn bản</span>
+                    <div className="text-right shrink-0">
+                      <span className="text-2xl font-bold font-mono text-slate-900 tabular-nums">
+                        {t.count}
+                      </span>
+                      <span className="block text-[11px] text-slate-400">văn bản</span>
+                    </div>
                   </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           </div>
 

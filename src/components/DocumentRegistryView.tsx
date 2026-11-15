@@ -55,6 +55,8 @@ interface DocumentRegistryViewProps {
   currentUser: User;
   settings?: SystemSettings;
   serverYear?: number;
+  section?: 'active' | 'deleted' | 'history';
+  onSectionChange?: (section: 'active' | 'deleted' | 'history') => void;
   onRefresh: () => void;
   onDocumentUpdated: (doc: DocumentRecord) => void;
   initialOpenDocId?: string | null;
@@ -188,12 +190,25 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   currentUser,
   settings,
   serverYear,
+  section,
+  onSectionChange,
   onRefresh,
   onDocumentUpdated,
   initialOpenDocId,
   onClearInitialOpenDocId,
 }) => {
-  const [registrySection, setRegistrySection] = useState<'active' | 'deleted' | 'history'>('active');
+  const [internalSection, setInternalSection] = useState<'active' | 'deleted' | 'history'>(section || 'active');
+  const registrySection = section ?? internalSection;
+  const setRegistrySection = (next: 'active' | 'deleted' | 'history') => {
+    setInternalSection(next);
+    onSectionChange?.(next);
+  };
+
+  useEffect(() => {
+    if (section) {
+      setInternalSection(section);
+    }
+  }, [section]);
   // Search & Filter State
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedCategory, setSelectedCategory] = useState<'all' | 'outgoing' | 'incoming'>('all');

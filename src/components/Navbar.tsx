@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
   FileText,
   FileUp,
@@ -8,150 +8,243 @@ import {
   LogOut,
   ShieldCheck,
   UserCheck,
-  RefreshCw,
-  Menu,
-  X,
+  ChevronDown,
+  History,
+  Trash2,
+  MoreHorizontal,
+  UserCircle2,
 } from 'lucide-react';
-import type { RegistryBook, User } from '../types';
-import { hasAnyBookPermission, isSystemAdmin } from '../utils/permissions';
+import type { BookPermission, RegistryBook, User } from '../types';
+import { hasAnyBookPermission, hasBookPermission, isSystemAdmin } from '../utils/permissions';
 
 export type AppTab = 'issue' | 'import_pdf' | 'registry' | 'statistics' | 'settings';
+export type RegistrySection = 'active' | 'deleted' | 'history';
 
 interface NavbarProps {
   activeTab: AppTab;
   setActiveTab: (tab: AppTab) => void;
+  registrySection: RegistrySection;
+  onSelectRegistrySection: (section: RegistrySection) => void;
+  deletedCount?: number;
+  pendingExcelSyncCount?: number;
   currentUser: User | null;
   books: RegistryBook[];
-  accessibleBooks?: RegistryBook[];
   activeBook?: RegistryBook;
-  onSelectBook?: (bookId: string) => void;
   onLogout: () => void;
-  lastSyncAt?: Date | null;
-  syncingData?: boolean;
-  onRefreshData?: () => void;
 }
 
 export const Navbar: React.FC<NavbarProps> = ({
   activeTab,
   setActiveTab,
+  registrySection,
+  onSelectRegistrySection,
+  deletedCount = 0,
+  pendingExcelSyncCount = 0,
   currentUser,
   books,
-  accessibleBooks = [],
   activeBook,
-  onSelectBook,
   onLogout,
-  lastSyncAt,
-  syncingData = false,
-  onRefreshData,
 }) => {
-  const [mobileMenuOpen, setMobileMenuOpen] = useState(false);
+  const [moreMenuOpen, setMoreMenuOpen] = useState(false);
+  const [accountMenuOpen, setAccountMenuOpen] = useState(false);
+
+  const moreRef = useRef<HTMLDivElement | null>(null);
+  const accountRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    const handleOutsideClick = (event: MouseEvent) => {
+      const target = event.target as Node;
+      if (moreRef.current && !moreRef.current.contains(target)) {
+        setMoreMenuOpen(false);
+      }
+      if (accountRef.current && !accountRef.current.contains(target)) {
+        setAccountMenuOpen(false);
+      }
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setMoreMenuOpen(false);
+        setAccountMenuOpen(false);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, []);
 
   const isAdmin = isSystemAdmin(currentUser);
-  const canIssueDirect = isAdmin || hasAnyBookPermission(currentUser, 'issue_number', books);
-  const canRequestNumber = isAdmin || hasAnyBookPermission(currentUser, 'request_number', books);
-  const canIssueOrRequest = canIssueDirect || canRequestNumber;
-  const canImportPdf = isAdmin || hasAnyBookPermission(currentUser, 'import_incoming', books);
-  const canViewRegistry = isAdmin || hasAnyBookPermission(currentUser, 'view', books);
-  const canViewStats = canViewRegistry;
-  const canManageSettings = isAdmin || hasAnyBookPermission(currentUser, 'manage_book', books);
 
-  const issueDesktopLabel = canIssueDirect ? 'Cấp số văn bản' : 'Xin số văn bản';
-  const issueMobileLabel = canIssueDirect ? 'Cấp số' : 'Xin số';
+  const hasPermForActiveBook = (perm: BookPermission): boolean => {
+    if (isAdmin) return true;
+    if (activeBook?.id) {
+      return hasBookPermission(currentUser, activeBook.id, perm);
+    }
+    return hasAnyBookPermission(currentUser, perm, books);
+  };
+
+  const canIssueDirect = hasPermForActiveBook('issue_number');
+  const canRequestNumber = hasPermForActiveBook('request_number');
+  const canIssueOrRequest = canIssueDirect || canRequestNumber;
+  const canImportPdf = hasPermForActiveBook('import_incoming');
+  const canViewRegistry = hasPermForActiveBook('view');
+  const canViewDeleted = canViewRegistry || hasPermForActiveBook('delete');
+  const canManageSettings = hasPermForActiveBook('manage_book');
+
   const roleLabel = isAdmin
     ? 'Quản trị viên'
     : canIssueDirect
     ? 'Cán bộ cấp số'
     : canRequestNumber
     ? 'Cán bộ xin số'
-    : 'Cán bộ sổ văn bản';
+    : canManageSettings
+    ? 'Quản lý sổ'
+    : 'Cán bộ theo dõi';
 
-  const formattedLastSync = lastSyncAt
-    ? lastSyncAt.toLocaleTimeString('vi-VN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
-    : null;
-
-  const allNavItems: Array<{
-    key: AppTab;
+  type PrimaryNavItem = {
+    key: 'issue' | 'import_pdf' | 'registry';
     label: string;
-    mobileLabel: string;
     visible: boolean;
+    active: boolean;
     icon: React.ReactNode;
-  }> = [
+    onClick: () => void;
+  };
+
+  const allPrimaryItems: PrimaryNavItem[] = [
     {
       key: 'issue',
-      label: issueDesktopLabel,
-      mobileLabel: issueMobileLabel,
+      label: canIssueDirect ? 'Cấp số' : 'Xin số',
       visible: canIssueOrRequest,
-      icon: <FileText className="w-4 h-4 text-sky-700 shrink-0" />,
+      active: activeTab === 'issue',
+      icon: <FileText className="w-4 h-4 shrink-0" />,
+      onClick: () => {
+        setActiveTab('issue');
+        setMoreMenuOpen(false);
+      },
     },
     {
       key: 'import_pdf',
-      label: 'Nhập văn bản PDF',
-      mobileLabel: 'Nhập PDF',
+      label: 'Nhập PDF',
       visible: canImportPdf,
-      icon: <FileUp className="w-4 h-4 text-sky-700 shrink-0" />,
+      active: activeTab === 'import_pdf',
+      icon: <FileUp className="w-4 h-4 shrink-0" />,
+      onClick: () => {
+        setActiveTab('import_pdf');
+        setMoreMenuOpen(false);
+      },
     },
     {
       key: 'registry',
       label: 'Sổ theo dõi',
-      mobileLabel: 'Sổ theo dõi',
       visible: canViewRegistry,
-      icon: <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />,
+      active: activeTab === 'registry' && registrySection === 'active',
+      icon: <BookOpen className="w-4 h-4 shrink-0" />,
+      onClick: () => {
+        onSelectRegistrySection('active');
+        setActiveTab('registry');
+        setMoreMenuOpen(false);
+      },
     },
+  ];
+  const primaryItems = allPrimaryItems.filter((item) => item.visible);
+
+  type MoreNavItem = {
+    key: string;
+    label: string;
+    visible: boolean;
+    active: boolean;
+    badge?: number;
+    alertDot?: boolean;
+    icon: React.ReactNode;
+    onClick: () => void;
+  };
+
+  const allMoreItems: MoreNavItem[] = [
     {
       key: 'statistics',
       label: 'Thống kê',
-      mobileLabel: 'Thống kê',
-      visible: canViewStats,
+      visible: canViewRegistry,
+      active: activeTab === 'statistics',
       icon: <BarChart3 className="w-4 h-4 text-sky-700 shrink-0" />,
+      onClick: () => {
+        setActiveTab('statistics');
+        setMoreMenuOpen(false);
+      },
+    },
+    {
+      key: 'history',
+      label: 'Lịch sử thao tác',
+      visible: canViewRegistry,
+      active: activeTab === 'registry' && registrySection === 'history',
+      icon: <History className="w-4 h-4 text-sky-700 shrink-0" />,
+      onClick: () => {
+        onSelectRegistrySection('history');
+        setActiveTab('registry');
+        setMoreMenuOpen(false);
+      },
+    },
+    {
+      key: 'deleted',
+      label: 'VB đã xóa',
+      visible: canViewDeleted,
+      active: activeTab === 'registry' && registrySection === 'deleted',
+      badge: deletedCount,
+      alertDot: pendingExcelSyncCount > 0,
+      icon: <Trash2 className="w-4 h-4 text-rose-700 shrink-0" />,
+      onClick: () => {
+        onSelectRegistrySection('deleted');
+        setActiveTab('registry');
+        setMoreMenuOpen(false);
+      },
     },
     {
       key: 'settings',
       label: 'Cài đặt',
-      mobileLabel: 'Cài đặt',
       visible: canManageSettings,
-      icon: <Settings className="w-4 h-4 text-sky-700 shrink-0" />,
+      active: activeTab === 'settings',
+      icon: <Settings className="w-4 h-4 text-slate-700 shrink-0" />,
+      onClick: () => {
+        setActiveTab('settings');
+        setMoreMenuOpen(false);
+      },
     },
   ];
-  const navItems = allNavItems.filter((item) => item.visible);
+  const moreItems = allMoreItems.filter((item) => item.visible);
 
-  const activeNavItem = navItems.find((item) => item.key === activeTab) || navItems[0];
-
-  const handleSelectTab = (tab: AppTab) => {
-    setActiveTab(tab);
-    setMobileMenuOpen(false);
-  };
+  const isMoreActive = moreItems.some((item) => item.active);
 
   return (
     <header className="sticky top-0 z-40 bg-white border-b border-slate-200 shadow-xs">
-      <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 h-14 sm:h-16 flex items-center justify-between gap-2 sm:gap-3">
-        {/* Zone 1: Brand Wordmark */}
-        <div className="flex items-center gap-2 sm:gap-3 min-w-0">
-          <div className="w-8 h-8 sm:w-10 sm:h-10 rounded-lg bg-sky-700 flex items-center justify-center text-white font-bold shadow-xs shrink-0">
-            <svg className="w-4 h-4 sm:w-6 sm:h-6 text-white" viewBox="0 0 24 24" fill="currentColor">
+      {/* Row 1: Flexbox layout — Logo + tên ngắn | Menu chính (md+) | Thêm + Tài khoản */}
+      <div className="max-w-7xl mx-auto px-3 sm:px-6 lg:px-8 h-14 sm:h-16 flex items-center justify-between gap-2 sm:gap-4">
+        {/* Brand: Logo + Tên ngắn "Sổ văn bản" */}
+        <div className="flex items-center gap-2.5 min-w-0 flex-1 md:flex-initial">
+          <div className="w-9 h-9 rounded-lg bg-sky-700 flex items-center justify-center text-white font-bold shadow-xs shrink-0">
+            <svg className="w-5 h-5 text-white" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
               <path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" />
             </svg>
           </div>
-          <div className="flex flex-col min-w-0">
-            <span className="text-xs sm:text-sm font-bold tracking-tight text-sky-900 truncate">
-              THPT NGUYỄN CHÍ THANH
-            </span>
-            <span className="text-[10px] sm:text-[11px] text-slate-500 font-medium truncate">
-              Sổ Cấp Số Văn Bản
-            </span>
-          </div>
+          <span className="text-sm sm:text-base font-bold tracking-tight text-sky-950 truncate min-w-0">
+            Sổ văn bản
+          </span>
         </div>
 
-        {/* Zone 2: Navigation tabs on desktop (lg+) / medium tablet (md+) */}
-        <nav className="hidden lg:flex items-center gap-1 min-w-0">
-          {navItems.map((item) => (
+        {/* Center Navigation (Desktop & Tablet >= md): Cấp số, Nhập PDF, Sổ theo dõi */}
+        <nav
+          aria-label="Điều hướng chính"
+          className="hidden md:flex items-center justify-center gap-1.5 min-w-0"
+        >
+          {primaryItems.map((item) => (
             <button
               key={item.key}
               type="button"
-              onClick={() => handleSelectTab(item.key)}
-              className={`flex items-center gap-2 px-3 py-2 text-sm font-semibold rounded-md transition-colors whitespace-nowrap shrink-0 ${
-                activeTab === item.key
-                  ? 'bg-sky-50 text-sky-800'
-                  : 'text-slate-600 hover:text-slate-900 hover:bg-slate-100'
+              onClick={item.onClick}
+              className={`inline-flex items-center justify-center gap-2 h-9 px-3.5 text-sm font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                item.active
+                  ? 'bg-sky-50 text-sky-900 border-sky-200'
+                  : 'bg-transparent text-slate-600 border-transparent hover:text-slate-900 hover:bg-slate-100'
               }`}
             >
               {item.icon}
@@ -160,157 +253,168 @@ export const Navbar: React.FC<NavbarProps> = ({
           ))}
         </nav>
 
-        {/* Zone 3: Sync, User Profile, Logout (desktop) & Compact Menu Trigger (mobile/tablet) */}
-        <div className="flex items-center gap-1.5 sm:gap-2.5 shrink-0">
-          {onRefreshData && (
-            <div className="flex items-center gap-2">
-              {formattedLastSync && (
-                <span
-                  className="hidden xl:inline text-[11px] text-slate-500 font-mono whitespace-nowrap"
-                  title={`Cập nhật lần cuối lúc ${formattedLastSync}`}
-                >
-                  Cập nhật lần cuối: {formattedLastSync}
-                </span>
-              )}
+        {/* Right Controls: Nút Thêm + Biểu tượng Tài khoản */}
+        <div className="flex items-center gap-2 shrink-0">
+          {moreItems.length > 0 && (
+            <div ref={moreRef} className="relative">
               <button
                 type="button"
-                onClick={onRefreshData}
-                disabled={syncingData}
-                aria-label="Làm mới dữ liệu"
-                title={formattedLastSync ? `Cập nhật lần cuối: ${formattedLastSync}` : 'Làm mới dữ liệu từ máy chủ'}
-                className="inline-flex items-center justify-center gap-1.5 min-h-[40px] min-w-[40px] sm:min-h-[36px] px-2.5 py-1.5 text-xs font-semibold text-sky-800 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded-lg transition-colors whitespace-nowrap shrink-0 disabled:opacity-60"
-              >
-                <RefreshCw className={`w-4 h-4 sm:w-3.5 sm:h-3.5 ${syncingData ? 'animate-spin' : ''}`} />
-                <span className="hidden sm:inline">{syncingData ? 'Đang tải...' : 'Làm mới dữ liệu'}</span>
-              </button>
-            </div>
-          )}
-
-          {currentUser && (
-            <div className="hidden sm:flex items-center gap-1.5 text-xs text-slate-700 lg:border-r lg:border-slate-200 lg:pr-2.5">
-              {isAdmin ? (
-                <ShieldCheck className="w-4 h-4 text-amber-600 shrink-0" />
-              ) : (
-                <UserCheck className="w-4 h-4 text-sky-600 shrink-0" />
-              )}
-              <span className="font-semibold text-slate-800 max-w-[120px] truncate">
-                {currentUser.fullName}
-              </span>
-              <span className="text-slate-400 hidden xl:inline">
-                ({roleLabel})
-              </span>
-            </div>
-          )}
-
-          <button
-            type="button"
-            onClick={onLogout}
-            title="Đăng xuất khỏi hệ thống"
-            className="hidden lg:inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 rounded-md transition-colors whitespace-nowrap shrink-0"
-          >
-            <LogOut className="w-3.5 h-3.5" />
-            <span>Đăng xuất</span>
-          </button>
-
-          {/* Collapsible Menu Toggle for Mobile & Tablet (< lg) */}
-          <button
-            type="button"
-            onClick={() => setMobileMenuOpen((prev) => !prev)}
-            aria-expanded={mobileMenuOpen}
-            aria-label={mobileMenuOpen ? 'Đóng menu điều hướng' : 'Mở menu điều hướng'}
-            className="lg:hidden inline-flex items-center gap-1.5 min-h-[40px] px-2.5 py-1.5 text-xs font-bold text-slate-800 bg-slate-100 hover:bg-slate-200 border border-slate-200 rounded-lg transition-colors whitespace-nowrap shrink-0"
-          >
-            {mobileMenuOpen ? <X className="w-4 h-4 text-slate-700" /> : <Menu className="w-4 h-4 text-sky-700" />}
-            <span className="max-w-[96px] truncate">{activeNavItem?.mobileLabel || 'Menu'}</span>
-          </button>
-        </div>
-      </div>
-
-      {/* Collapsible Mobile / Tablet Drawer Menu */}
-      {mobileMenuOpen && (
-        <div className="lg:hidden border-t border-slate-200 bg-white shadow-lg px-3 py-3 space-y-3 max-h-[calc(100dvh-3.5rem)] overflow-y-auto">
-          {accessibleBooks.length > 0 && activeBook && onSelectBook && (
-            <div className="p-2.5 bg-sky-50 border border-sky-200 rounded-xl space-y-1.5">
-              <label
-                htmlFor="mobile-menu-book-select"
-                className="text-[11px] font-bold uppercase tracking-wider text-sky-900 flex items-center gap-1.5"
-              >
-                <BookOpen className="w-3.5 h-3.5 text-sky-700" />
-                <span>Sổ đang chọn</span>
-              </label>
-              {accessibleBooks.length > 1 ? (
-                <select
-                  id="mobile-menu-book-select"
-                  value={activeBook.id}
-                  onChange={(e) => {
-                    onSelectBook(e.target.value);
-                    setMobileMenuOpen(false);
-                  }}
-                  className="w-full min-h-[42px] px-3 py-2 bg-white border border-sky-300 rounded-lg text-sm font-bold text-sky-950 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
-                >
-                  {accessibleBooks.map((b) => (
-                    <option key={b.id} value={b.id}>
-                      {b.name} ({b.unitCode})
-                    </option>
-                  ))}
-                </select>
-              ) : (
-                <div className="px-3 py-2 bg-white border border-sky-200 rounded-lg text-sm font-bold text-sky-950">
-                  {activeBook.name} ({activeBook.unitCode})
-                </div>
-              )}
-            </div>
-          )}
-
-          <nav className="grid grid-cols-1 sm:grid-cols-2 gap-1.5" aria-label="Điều hướng chính">
-            {navItems.map((item) => (
-              <button
-                key={item.key}
-                type="button"
-                onClick={() => handleSelectTab(item.key)}
-                className={`flex items-center gap-2.5 min-h-[44px] px-3.5 py-2.5 text-sm font-semibold rounded-xl border transition-colors text-left ${
-                  activeTab === item.key
-                    ? 'bg-sky-50 text-sky-900 border-sky-300 shadow-2xs'
+                onClick={() => {
+                  setMoreMenuOpen((prev) => !prev);
+                  setAccountMenuOpen(false);
+                }}
+                aria-haspopup="menu"
+                aria-expanded={moreMenuOpen}
+                className={`inline-flex items-center justify-center gap-1.5 h-9 px-3 text-xs sm:text-sm font-semibold rounded-lg border transition-colors whitespace-nowrap shrink-0 ${
+                  isMoreActive || moreMenuOpen
+                    ? 'bg-sky-50 text-sky-900 border-sky-200'
                     : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
                 }`}
               >
-                {item.icon}
-                <span className="truncate">{item.label}</span>
-              </button>
-            ))}
-          </nav>
-
-          <div className="pt-2 border-t border-slate-100 flex flex-wrap items-center justify-between gap-2">
-            {currentUser && (
-              <div className="flex items-center gap-2 text-xs text-slate-700 min-w-0">
-                {isAdmin ? (
-                  <ShieldCheck className="w-4 h-4 text-amber-600 shrink-0" />
-                ) : (
-                  <UserCheck className="w-4 h-4 text-sky-600 shrink-0" />
+                <MoreHorizontal className="w-4 h-4 shrink-0 md:hidden" />
+                <span>Thêm</span>
+                {pendingExcelSyncCount > 0 && (
+                  <span
+                    className="w-2 h-2 rounded-full bg-amber-500 shrink-0"
+                    title="Có văn bản đã xóa chờ đồng bộ Excel"
+                  />
                 )}
-                <div className="min-w-0">
-                  <span className="font-bold text-slate-900 block truncate">{currentUser.fullName}</span>
-                  <span className="text-[11px] text-slate-500 block truncate">
-                    {roleLabel}
-                    {formattedLastSync ? ` · Đồng bộ: ${formattedLastSync}` : ''}
-                  </span>
-                </div>
-              </div>
-            )}
+                <ChevronDown
+                  className={`w-3.5 h-3.5 shrink-0 transition-transform ${
+                    moreMenuOpen ? 'rotate-180' : ''
+                  }`}
+                />
+              </button>
 
-            <button
-              type="button"
-              onClick={() => {
-                setMobileMenuOpen(false);
-                onLogout();
-              }}
-              className="inline-flex items-center justify-center gap-1.5 min-h-[42px] px-4 py-2 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-colors shrink-0"
-            >
-              <LogOut className="w-4 h-4" />
-              <span>Đăng xuất</span>
-            </button>
-          </div>
+              {moreMenuOpen && (
+                <div
+                  role="menu"
+                  aria-label="Menu Thêm"
+                  className="absolute right-0 mt-2 w-60 max-w-[calc(100vw-1.5rem)] bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-50"
+                >
+                  {moreItems.map((item) => (
+                    <button
+                      key={item.key}
+                      type="button"
+                      role="menuitem"
+                      onClick={item.onClick}
+                      className={`w-full flex items-center justify-between gap-2 px-3.5 py-2.5 text-left text-xs sm:text-sm font-semibold transition-colors ${
+                        item.active
+                          ? 'bg-sky-50 text-sky-900'
+                          : 'text-slate-700 hover:bg-slate-50'
+                      }`}
+                    >
+                      <span className="flex items-center gap-2.5 min-w-0">
+                        {item.icon}
+                        <span className="truncate">{item.label}</span>
+                      </span>
+                      {(item.badge !== undefined && item.badge > 0) || item.alertDot ? (
+                        <span className="inline-flex items-center gap-1 shrink-0">
+                          {item.alertDot && <span className="w-2 h-2 rounded-full bg-amber-500" />}
+                          {item.badge !== undefined && item.badge > 0 && (
+                            <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 tabular-nums">
+                              {item.badge}
+                            </span>
+                          )}
+                        </span>
+                      ) : null}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Account Icon Button & Menu */}
+          {currentUser && (
+            <div ref={accountRef} className="relative">
+              <button
+                type="button"
+                onClick={() => {
+                  setAccountMenuOpen((prev) => !prev);
+                  setMoreMenuOpen(false);
+                }}
+                aria-haspopup="menu"
+                aria-expanded={accountMenuOpen}
+                aria-label="Tài khoản"
+                title={`${currentUser.fullName} (${roleLabel})`}
+                className={`w-9 h-9 rounded-full border flex items-center justify-center transition-colors shrink-0 ${
+                  accountMenuOpen
+                    ? 'bg-sky-100 text-sky-900 border-sky-300'
+                    : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200/70'
+                }`}
+              >
+                {isAdmin ? (
+                  <ShieldCheck className="w-4 h-4 text-amber-600" />
+                ) : (
+                  <UserCircle2 className="w-5 h-5 text-sky-700" />
+                )}
+              </button>
+
+              {accountMenuOpen && (
+                <div
+                  role="menu"
+                  aria-label="Menu Tài khoản"
+                  className="absolute right-0 mt-2 w-64 max-w-[calc(100vw-1.5rem)] bg-white border border-slate-200 rounded-xl shadow-xl p-3 space-y-3 z-50"
+                >
+                  <div className="flex items-start gap-2.5 pb-2.5 border-b border-slate-100 min-w-0">
+                    <div className="w-9 h-9 rounded-full bg-sky-50 border border-sky-200 flex items-center justify-center shrink-0">
+                      {isAdmin ? (
+                        <ShieldCheck className="w-4 h-4 text-amber-600" />
+                      ) : (
+                        <UserCheck className="w-4 h-4 text-sky-700" />
+                      )}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <p className="text-sm font-bold text-slate-900 break-words leading-snug">
+                        {currentUser.fullName}
+                      </p>
+                      <p className="text-xs text-slate-500 mt-0.5 truncate">{roleLabel}</p>
+                    </div>
+                  </div>
+
+                  <button
+                    type="button"
+                    role="menuitem"
+                    onClick={() => {
+                      setAccountMenuOpen(false);
+                      onLogout();
+                    }}
+                    className="w-full flex items-center justify-center gap-2 h-9 px-3 text-xs font-semibold text-rose-700 bg-rose-50 hover:bg-rose-100 border border-rose-200 rounded-lg transition-colors"
+                  >
+                    <LogOut className="w-4 h-4 shrink-0" />
+                    <span>Đăng xuất</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          )}
         </div>
+      </div>
+
+      {/* Row 2 on Mobile (< md): Primary 3 tabs cleanly in CSS Grid without overlap */}
+      {primaryItems.length > 0 && (
+        <nav
+          aria-label="Điều hướng chính trên điện thoại"
+          className="md:hidden border-t border-slate-100 bg-slate-50/80 px-3 py-1.5 grid gap-1.5"
+          style={{ gridTemplateColumns: `repeat(${primaryItems.length}, minmax(0, 1fr))` }}
+        >
+          {primaryItems.map((item) => (
+            <button
+              key={item.key}
+              type="button"
+              onClick={item.onClick}
+              className={`flex items-center justify-center gap-1.5 h-9 px-2 text-xs font-semibold rounded-lg border transition-colors min-w-0 ${
+                item.active
+                  ? 'bg-white text-sky-900 border-sky-200 shadow-2xs'
+                  : 'bg-transparent text-slate-600 border-transparent hover:bg-white/60'
+              }`}
+            >
+              {item.icon}
+              <span className="truncate">{item.label}</span>
+            </button>
+          ))}
+        </nav>
       )}
     </header>
   );
