@@ -376,6 +376,23 @@ export interface StatisticsData {
   }>;
 }
 
+export type StorageMode =
+  | 'upstash_kv'
+  | 'vercel_blob'
+  | 'remote_webhook'
+  | 'local_disk'
+  | 'ephemeral_tmp';
+
+export interface PersistenceStatus {
+  durable: boolean;
+  storageMode: StorageMode;
+  storageLabel: string;
+  requiresRemoteEnvOnVercel?: boolean;
+  lastSavedAt?: string;
+  lastVerifiedAt?: string;
+  warning?: string;
+}
+
 export interface PreviewNumberResponse {
   bookId?: string;
   bookCode?: string;
@@ -392,6 +409,7 @@ export interface PreviewNumberResponse {
   maxIssuedSequence?: number;
   configVersion?: number;
   serverTimeMs?: number;
+  persistenceStatus?: PersistenceStatus;
 }
 
 export interface StartSequenceSeriesConfig {
@@ -410,4 +428,8 @@ export interface StartSequenceSeriesConfig {
   configVersion: number;
   serverYear?: number;
   customStartSequences?: Record<string, number>;
+  persistenceStatus?: PersistenceStatus;
+  legacyReconciliationWarnings?: string[];
+  verifiedFromPrimary?: boolean;
 }
+

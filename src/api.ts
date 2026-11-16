@@ -7,6 +7,7 @@ import type {
   GoogleDriveConfig,
   NumberRequest,
   PdfAnalyzeResponse,
+  PersistenceStatus,
   PreviewNumberResponse,
   RegistryBook,
   SignerConfig,
@@ -68,7 +69,9 @@ export function clearAuth() {
   }
 }
 
-async function request<T>(endpoint: string, options: RequestInit = {}): Promise<T> {
+type ApiRequestOptions = RequestInit & { timeoutMs?: number };
+
+async function request<T>(endpoint: string, options: ApiRequestOptions = {}): Promise<T> {
   const token = getStoredToken();
   const headers = new Headers(options.headers || {});
 
@@ -80,16 +83,60 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     headers.set('Authorization', `Bearer ${token}`);
   }
 
+  const { timeoutMs: customTimeoutMs, signal: callerSignal, ...fetchInit } = options;
+  const timeoutMs =
+    typeof customTimeoutMs === 'number' && customTimeoutMs > 0
+      ? customTimeoutMs
+      : fetchInit.body instanceof FormData
+      ? 60000
+      : 15000;
+
+  const controller = new AbortController();
+  let timedOut = false;
+
+  const onCallerAbort = () => {
+    controller.abort(callerSignal?.reason);
+  };
+  if (callerSignal) {
+    if (callerSignal.aborted) {
+      controller.abort(callerSignal.reason);
+    } else {
+      callerSignal.addEventListener('abort', onCallerAbort, { once: true });
+    }
+  }
+
+  const timeoutHandle = window.setTimeout(() => {
+    timedOut = true;
+    controller.abort();
+  }, timeoutMs);
+
   const targetUrl = buildApiUrl(endpoint);
   let res: Response;
   try {
     res = await fetch(targetUrl, {
-      ...options,
-      cache: options.cache || 'no-store',
+      ...fetchInit,
+      cache: fetchInit.cache || 'no-store',
       headers,
       credentials: 'include',
+      signal: controller.signal,
     });
-  } catch {
+  } catch (fetchErr: any) {
+    window.clearTimeout(timeoutHandle);
+    if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
+
+    if (timedOut) {
+      const timeoutErr: any = new Error(
+        'Quá thời gian chờ phản hồi từ máy chủ. Vui lòng thử lại.'
+      );
+      timeoutErr.status = 408;
+      timeoutErr.code = 'API_TIMEOUT';
+      throw timeoutErr;
+    }
+
+    if (callerSignal?.aborted || fetchErr?.name === 'AbortError') {
+      throw fetchErr;
+    }
+
     const networkErr: any = new Error(
       'Không kết nối được máy chủ. Vui lòng kiểm tra kết nối mạng hoặc trạng thái dịch vụ backend.'
     );
@@ -97,6 +144,9 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     networkErr.code = 'NETWORK_ERROR';
     throw networkErr;
   }
+
+  window.clearTimeout(timeoutHandle);
+  if (callerSignal) callerSignal.removeEventListener('abort', onCallerAbort);
 
   const isLoginEndpoint = endpoint.startsWith('/api/auth/login');
 
@@ -135,6 +185,7 @@ async function request<T>(endpoint: string, options: RequestInit = {}): Promise<
     const err: any = new Error(message);
     err.status = res.status;
     if (errorData.code) err.code = errorData.code;
+    if (errorData.persistenceStatus) err.persistenceStatus = errorData.persistenceStatus;
     if (errorData.document) err.document = errorData.document;
     if (errorData.existingDocument) err.existingDocument = errorData.existingDocument;
     if (errorData.conflictingFileName) err.conflictingFileName = errorData.conflictingFileName;
@@ -192,6 +243,7 @@ export const api = {
     status: string;
     app: string;
     timeVietnam: { year: number; month: number; day: number; formattedDate: string };
+    persistenceStatus?: PersistenceStatus;
   }> => {
     return request('/api/health');
   },
@@ -368,12 +420,16 @@ export const api = {
     documentTypes: DocumentTypeConfig[];
     signers: SignerConfig[];
     serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+    persistenceStatus?: PersistenceStatus;
+    legacyReconciliationWarnings?: string[];
   }> => {
     return request<{
       settings: SystemSettings;
       documentTypes: DocumentTypeConfig[];
       signers: SignerConfig[];
       serverTimeVietnam?: { year: number; month: number; day: number; formattedDate: string };
+      persistenceStatus?: PersistenceStatus;
+      legacyReconciliationWarnings?: string[];
     }>('/api/settings');
   },
 
@@ -412,6 +468,7 @@ export const api = {
     });
     return request<StartSequenceSeriesConfig>(`/api/settings/start-sequence?${q.toString()}`, {
       signal,
+      cache: 'no-store',
     });
   },
 
@@ -610,6 +667,7 @@ export const api = {
     return request<PdfAnalyzeResponse>('/api/pdf/analyze', {
       method: 'POST',
       body: JSON.stringify({ url, bookId }),
+      timeoutMs: 45000,
     });
   },
 

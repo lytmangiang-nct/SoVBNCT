@@ -32,6 +32,7 @@ import type {
   BookPermission,
   DocumentTypeConfig,
   GoogleDriveAuthMode,
+  PersistenceStatus,
   RegistryBook,
   SignerConfig,
   StartSequenceSeriesConfig,
@@ -78,6 +79,8 @@ interface SettingsViewProps {
   serverYear?: number;
   configLoaded?: boolean;
   syncError?: string | null;
+  persistenceStatus?: PersistenceStatus | null;
+  legacyReconciliationWarnings?: string[];
   onSettingsUpdated: (newSettings: SystemSettings) => void;
   onBooksUpdated?: () => void;
   onRefreshData: () => void;
@@ -94,6 +97,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   serverYear,
   configLoaded = true,
   syncError = null,
+  persistenceStatus = null,
+  legacyReconciliationWarnings = [],
   onSettingsUpdated,
   onBooksUpdated,
   onRefreshData,
@@ -217,6 +222,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     seriesId: string;
     message: string;
   } | null>(null);
+  const [seriesPersistenceStatus, setSeriesPersistenceStatus] = useState<PersistenceStatus | null>(null);
+  const [seriesReconciliationWarnings, setSeriesReconciliationWarnings] = useState<string[]>([]);
 
   // Doc Type Modal / Form
   const [newTypeName, setNewTypeName] = useState('');
@@ -416,6 +423,19 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const readRequestSeqRef = useRef<number>(0);
   const latestCompletedReadReqBySeriesRef = useRef<Record<string, number>>({});
   const readAbortControllerRef = useRef<AbortController | null>(null);
+  const lastUserIdRef = useRef<string>(currentUser.id);
+
+  useEffect(() => {
+    if (lastUserIdRef.current !== currentUser.id) {
+      lastUserIdRef.current = currentUser.id;
+      setSavedSeriesMap({});
+      setDraftStartInputBySeries({});
+      setSeqSaveErrorBySeries({});
+      setSeqSaveSuccessNotice(null);
+      setSeqConfigLoadError(null);
+      latestCompletedReadReqBySeriesRef.current = {};
+    }
+  }, [currentUser.id]);
 
   const loadStartSequenceSeries = useCallback(
     async (bookId: string, year: number, typeCode: string) => {
@@ -437,6 +457,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
       try {
         const res = await api.getStartSequenceConfig(bookId, year, typeCode, controller.signal);
+        if (
+          res.bookId !== bookId ||
+          Number(res.year) !== year ||
+          String(res.typeCode || '').trim().toUpperCase() !== typeCode.trim().toUpperCase()
+        ) {
+          throw new Error('Dữ liệu máy chủ trả về không khớp sổ, năm hoặc loại văn bản đang chọn.');
+        }
+
+        if (res.persistenceStatus) {
+          setSeriesPersistenceStatus(res.persistenceStatus);
+        }
+        if (Array.isArray(res.legacyReconciliationWarnings)) {
+          setSeriesReconciliationWarnings(res.legacyReconciliationWarnings);
+        }
+
         const prevCompleted = latestCompletedReadReqBySeriesRef.current[targetSeriesId] || 0;
         if (reqId >= prevCompleted) {
           latestCompletedReadReqBySeriesRef.current[targetSeriesId] = reqId;
@@ -452,9 +487,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         }
       } catch (err: any) {
         if (err?.name === 'AbortError') return;
+        if (err?.persistenceStatus) {
+          setSeriesPersistenceStatus(err.persistenceStatus);
+        }
         if (reqId === readRequestSeqRef.current && activeSeriesIdRef.current === targetSeriesId) {
           setSeqConfigLoading(false);
-          setSeqConfigLoadError(err?.message || 'Không thể tải cấu hình dãy số từ máy chủ.');
+          setSeqConfigLoadError(err?.message || 'Chưa tải được cấu hình số từ máy chủ.');
         }
       }
     },
@@ -484,8 +522,27 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   ]);
 
   const activeSavedConfig = savedSeriesMap[activeSeriesId] || null;
+  const hasMatchingSavedConfig = Boolean(
+    activeSavedConfig &&
+      activeSavedConfig.bookId === selectedBook.id &&
+      Number(activeSavedConfig.year) === seqYear &&
+      String(activeSavedConfig.typeCode || '').trim().toUpperCase() ===
+        effectiveSeqTypeCode.trim().toUpperCase()
+  );
+  const effectiveSeriesLoadError = syncError || seqConfigLoadError || null;
+  const isSeriesWaiting =
+    !effectiveSeriesLoadError &&
+    (!configLoaded || seqConfigLoading || !hasMatchingSavedConfig);
+  const effectivePersistenceStatus = seriesPersistenceStatus || persistenceStatus || null;
+  const effectiveReconciliationWarnings =
+    seriesReconciliationWarnings.length > 0
+      ? seriesReconciliationWarnings
+      : legacyReconciliationWarnings;
+
   const savedInputString =
-    activeSavedConfig?.isConfigured && activeSavedConfig.customStartSequence != null
+    hasMatchingSavedConfig &&
+    activeSavedConfig?.isConfigured &&
+    activeSavedConfig.customStartSequence != null
       ? String(activeSavedConfig.customStartSequence)
       : '';
   const hasSeriesDraft = Object.prototype.hasOwnProperty.call(
@@ -496,7 +553,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     ? draftStartInputBySeries[activeSeriesId]
     : savedInputString;
   const isSeriesDirty =
-    hasSeriesDraft && draftStartInputBySeries[activeSeriesId].trim() !== savedInputString;
+    hasMatchingSavedConfig &&
+    hasSeriesDraft &&
+    draftStartInputBySeries[activeSeriesId].trim() !== savedInputString;
   const isActiveSeriesSaving = Boolean(savingSeriesMap[activeSeriesId]);
   const activeSeriesSaveError = seqSaveErrorBySeries[activeSeriesId] || null;
   const parsedStartInputNum = Number(currentStartInputValue.trim());
@@ -919,14 +978,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     await saveModeRequest(false);
   };
 
-  // 3. Set Start Sequence for selected (book, year, typeCode) with out-of-order save isolation
+  // 3. Set Start Sequence for selected (book, year, typeCode) with verify-after-write read-back
   const handleSetStartSequence = async (e: React.FormEvent) => {
     e.preventDefault();
     if (
       !canManageSelectedBook ||
-      isConfigBlocked ||
-      seqConfigLoading ||
-      Boolean(seqConfigLoadError)
+      isSeriesWaiting ||
+      Boolean(effectiveSeriesLoadError) ||
+      !hasMatchingSavedConfig
     ) {
       return;
     }
@@ -962,23 +1021,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
     try {
       const res = await api.setStartSequence(targetYear, targetTypeCode, nextNum, targetBookId);
+      if (res.persistenceStatus) {
+        setSeriesPersistenceStatus(res.persistenceStatus);
+      }
 
-      // Cập nhật riêng cấu hình đã lưu của đúng dãy vừa lưu, không ảnh hưởng dãy đang xem nếu người dùng đã chuyển loại
+      // Đọc lại ngay từ nguồn dữ liệu chính trên máy chủ để xác nhận mốc mới đã bền vững
+      const verified = await api.getStartSequenceConfig(targetBookId, targetYear, targetTypeCode);
+      if (verified.persistenceStatus) {
+        setSeriesPersistenceStatus(verified.persistenceStatus);
+      }
+      if (Array.isArray(verified.legacyReconciliationWarnings)) {
+        setSeriesReconciliationWarnings(verified.legacyReconciliationWarnings);
+      }
+
+      const verifiedMatches =
+        verified.bookId === targetBookId &&
+        Number(verified.year) === targetYear &&
+        String(verified.typeCode || '').trim().toUpperCase() === targetTypeCode.trim().toUpperCase() &&
+        verified.isConfigured === true &&
+        verified.customStartSequence === nextNum;
+
+      if (!verifiedMatches) {
+        throw new Error(
+          'Mốc số mới chưa được xác nhận khi đọc lại từ nguồn dữ liệu chính. Dữ liệu bạn nhập được giữ lại để tránh mất cấu hình.'
+        );
+      }
+
       const updatedConfig: StartSequenceSeriesConfig = {
-        seriesKey: res.seriesKey,
-        storageKey: res.storageKey,
-        bookId: res.bookId,
-        bookCode: res.bookCode,
-        year: res.year,
-        typeCode: res.typeCode,
-        isConfigured: res.isConfigured,
-        customStartSequence: res.customStartSequence,
-        maxIssuedSequence: res.maxIssuedSequence,
-        minAllowedStartSequence: res.minAllowedStartSequence,
-        nextExpectedSeq: res.nextExpectedSeq,
-        previewNumber: res.previewNumber,
-        configVersion: res.configVersion,
-        customStartSequences: res.customStartSequences,
+        ...verified,
+        verifiedFromPrimary: true,
       };
       latestCompletedReadReqBySeriesRef.current[targetSeriesId] = ++readRequestSeqRef.current;
       setSavedSeriesMap((prev) => ({
@@ -986,7 +1057,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         [targetSeriesId]: updatedConfig,
       }));
 
-      // Chỉ xóa bản nháp của dãy vừa lưu nếu người dùng chưa nhập giá trị khác trong lúc chờ phản hồi
+      // Chỉ xóa bản nháp sau khi đọc lại xác nhận thành công và người dùng không sửa thêm trong lúc chờ
       if (draftStartInputBySeriesRef.current[targetSeriesId] === rawDraft) {
         setDraftStartInputBySeries((prev) => {
           const next = { ...prev };
@@ -1006,16 +1077,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       setSeqSaveSuccessNotice({
         seriesId: targetSeriesId,
         message: isStillViewingSameSeries
-          ? `Đã lưu Số bắt đầu đã cài (${String(nextNum).padStart(2, '0')}) cho ${targetBookName} · Năm ${targetYear} · ${targetTypeCode}!`
-          : `Đã lưu xong mốc ${targetBookName} · Năm ${targetYear} · ${targetTypeCode} = ${String(nextNum).padStart(2, '0')} (dãy đang chọn vẫn được giữ nguyên).`,
+          ? `Đã lưu Số bắt đầu đã cài (${String(nextNum).padStart(2, '0')}) cho ${targetBookName} · Năm ${targetYear} · ${targetTypeCode} và đã đọc lại xác nhận từ nguồn dữ liệu chính!`
+          : `Đã lưu và xác nhận mốc ${targetBookName} · Năm ${targetYear} · ${targetTypeCode} = ${String(nextNum).padStart(2, '0')} (dãy đang chọn vẫn được giữ nguyên).`,
       });
 
       onBooksUpdated?.();
       onRefreshData();
     } catch (err: any) {
+      if (err?.persistenceStatus) {
+        setSeriesPersistenceStatus(err.persistenceStatus);
+      }
       setSeqSaveErrorBySeries((prev) => ({
         ...prev,
-        [targetSeriesId]: err.message || 'Lỗi khi lưu số bắt đầu',
+        [targetSeriesId]:
+          err?.message ||
+          'Chưa xác nhận lưu mốc số vào nguồn dữ liệu chính. Dữ liệu bạn nhập vẫn được giữ nguyên.',
       }));
     } finally {
       setSavingSeriesMap((prev) => {
@@ -2344,15 +2420,15 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5 shrink-0">
-                {seqConfigLoading ? (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-50 text-sky-800 border border-sky-200">
-                    <RotateCw className="w-3 h-3 animate-spin" />
-                    <span>Đang tải cấu hình...</span>
-                  </span>
-                ) : seqConfigLoadError ? (
+                {effectiveSeriesLoadError ? (
                   <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-rose-50 text-rose-800 border border-rose-200">
                     <AlertTriangle className="w-3 h-3" />
-                    <span>Lỗi tải cấu hình</span>
+                    <span>Chưa tải được cấu hình số</span>
+                  </span>
+                ) : isSeriesWaiting ? (
+                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-50 text-sky-800 border border-sky-200">
+                    <RotateCw className="w-3 h-3 animate-spin" />
+                    <span>Đang tải mốc số đã cài…</span>
                   </span>
                 ) : isSeriesDirty ? (
                   <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
@@ -2371,21 +2447,65 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               </div>
             </div>
 
-            {seqConfigLoadError && (
+            {effectivePersistenceStatus && !effectivePersistenceStatus.durable && (
+              <div className="p-3 bg-rose-50 border border-rose-300 rounded-lg text-xs text-rose-900 space-y-1">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                  <div className="space-y-1 min-w-0">
+                    <strong className="block font-bold">
+                      Cảnh báo Vercel Production: Chưa cấu hình nguồn lưu trữ bền vững
+                    </strong>
+                    <p className="break-words">
+                      {effectivePersistenceStatus.warning ||
+                        'Máy chủ serverless đang chạy ở chế độ /tmp tạm thời nên cấu hình số bắt đầu sẽ không được lưu giữ qua các lần đăng nhập hoặc khởi động lại.'}{' '}
+                      Vui lòng thêm biến môi trường <code className="font-mono font-semibold">KV_REST_API_URL</code> +{' '}
+                      <code className="font-mono font-semibold">KV_REST_API_TOKEN</code> (hoặc{' '}
+                      <code className="font-mono font-semibold">BLOB_READ_WRITE_TOKEN</code>) trên Vercel.
+                    </p>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {effectiveReconciliationWarnings.length > 0 && canManageSelectedBook && (
+              <div className="p-3 bg-amber-50 border border-amber-300 rounded-lg text-xs text-amber-950 space-y-1">
+                <div className="flex items-start gap-2">
+                  <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                  <div className="space-y-1 min-w-0">
+                    <strong className="block font-bold">
+                      Cảnh báo đối soát cấu hình số bắt đầu cũ ({effectiveReconciliationWarnings.length})
+                    </strong>
+                    <ul className="list-disc pl-4 space-y-0.5 text-[11px]">
+                      {effectiveReconciliationWarnings.map((warn, idx) => (
+                        <li key={idx} className="break-words">{warn}</li>
+                      ))}
+                    </ul>
+                  </div>
+                </div>
+              </div>
+            )}
+
+            {effectiveSeriesLoadError && (
               <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-900 flex flex-wrap items-center justify-between gap-2">
                 <div className="flex items-start gap-2 min-w-0">
                   <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
                   <span className="break-words">
-                    Không tải được cấu hình cho dãy <strong>{activeSeriesKeyDisplay}</strong>: {seqConfigLoadError}. Nút lưu tạm khóa để tránh ghi đè sai.
+                    <strong>Chưa tải được cấu hình số</strong> cho dãy <strong>{activeSeriesKeyDisplay}</strong>: {effectiveSeriesLoadError}. Nút lưu tạm khóa để tránh ghi đè sai.
                   </span>
                 </div>
                 <button
                   type="button"
-                  onClick={() => loadStartSequenceSeries(selectedBook.id, seqYear, effectiveSeqTypeCode)}
+                  onClick={() => {
+                    if (syncError || !configLoaded) {
+                      onRefreshData();
+                    } else {
+                      loadStartSequenceSeries(selectedBook.id, seqYear, effectiveSeqTypeCode);
+                    }
+                  }}
                   className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-md shrink-0"
                 >
                   <RefreshCw className="w-3.5 h-3.5" />
-                  <span>Thử tải lại</span>
+                  <span>Thử lại</span>
                 </button>
               </div>
             )}
@@ -2398,7 +2518,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     aria-label="Năm áp dụng số bắt đầu"
                     value={seqYear}
                     onChange={(e) => setSeqYear(parseInt(e.target.value, 10))}
-                    disabled={!canManageSelectedBook || isConfigBlocked}
+                    disabled={!canManageSelectedBook || !configLoaded || Boolean(syncError)}
                     className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   >
                     {Array.from(
@@ -2426,7 +2546,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     aria-label="Loại văn bản thiết lập số bắt đầu"
                     value={effectiveSeqTypeCode}
                     onChange={(e) => setSeqTypeCode(e.target.value)}
-                    disabled={!canManageSelectedBook || isConfigBlocked}
+                    disabled={!canManageSelectedBook || !configLoaded || Boolean(syncError)}
                     className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
                   >
                     {selectedBook.numberMode === 'shared' ? (
@@ -2478,8 +2598,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     type="number"
                     min={1}
                     step={1}
-                    value={currentStartInputValue}
-                    placeholder="Chưa thiết lập · Mặc định 01"
+                    value={isSeriesWaiting || Boolean(effectiveSeriesLoadError) ? '' : currentStartInputValue}
+                    placeholder={
+                      effectiveSeriesLoadError
+                        ? 'Chưa tải được cấu hình số'
+                        : isSeriesWaiting
+                        ? 'Đang tải mốc số đã cài…'
+                        : 'Chưa thiết lập · Mặc định 01'
+                    }
                     onChange={(e) => {
                       const raw = e.target.value;
                       setSeqSaveErrorBySeries((prev) => ({ ...prev, [activeSeriesId]: null }));
@@ -2494,9 +2620,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     }}
                     disabled={
                       !canManageSelectedBook ||
-                      isConfigBlocked ||
-                      seqConfigLoading ||
-                      Boolean(seqConfigLoadError)
+                      isSeriesWaiting ||
+                      Boolean(effectiveSeriesLoadError)
                     }
                     className={`w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border rounded-lg font-mono font-bold text-base sm:text-xs ${
                       isSeriesDirty ? 'border-amber-400 ring-1 ring-amber-300' : 'border-slate-300'
@@ -2512,16 +2637,20 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Số bắt đầu đã cài ({activeSeriesKeyDisplay})
                   </span>
                   <div className="font-mono text-base font-bold text-sky-950 break-words">
-                    {seqConfigLoading
-                      ? 'Đang tải...'
-                      : seqConfigLoadError
-                      ? 'Lỗi tải cấu hình'
+                    {effectiveSeriesLoadError
+                      ? 'Chưa tải được cấu hình số'
+                      : isSeriesWaiting
+                      ? 'Đang tải mốc số đã cài…'
                       : activeSavedConfig?.isConfigured && activeSavedConfig.customStartSequence != null
                       ? `${String(activeSavedConfig.customStartSequence).padStart(2, '0')} (${activeSavedConfig.customStartSequence})`
                       : 'Chưa thiết lập · Mặc định 01'}
                   </div>
                   <span className="text-[11px] text-sky-700 block">
-                    {isSeriesDirty
+                    {effectiveSeriesLoadError
+                      ? 'Không hiển thị mặc định 01 khi kết nối máy chủ chưa hoàn tất.'
+                      : isSeriesWaiting
+                      ? 'Đang đối chiếu mốc số trực tiếp từ nguồn dữ liệu chính trên máy chủ…'
+                      : isSeriesDirty
                       ? `Bản nháp đang nhập: "${currentStartInputValue.trim() || 'trống'}" (Chưa lưu — bấm Lưu số bắt đầu để áp dụng).`
                       : 'Mốc đã lưu giữ cố định theo sổ, năm và loại văn bản; không tự thay đổi khi cấp số mới.'}
                   </span>
@@ -2532,23 +2661,21 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     Số tiếp theo dự kiến ({selectedBook.name} · Năm {seqYear} · {effectiveSeqTypeCode})
                   </span>
                   <div className="font-mono text-base font-bold text-emerald-950 break-words">
-                    {seqConfigLoading
-                      ? 'Đang tính...'
-                      : seqConfigLoadError
-                      ? 'Chưa có dữ liệu dự kiến'
-                      : activeSavedConfig
-                      ? `${String(activeSavedConfig.nextExpectedSeq).padStart(2, '0')} → ${activeSavedConfig.previewNumber}`
-                      : 'Chưa có dữ liệu dự kiến'}
+                    {effectiveSeriesLoadError
+                      ? 'Chưa tải được cấu hình số'
+                      : isSeriesWaiting
+                      ? 'Đang tải mốc số đã cài…'
+                      : `${String(activeSavedConfig!.nextExpectedSeq).padStart(2, '0')} → ${activeSavedConfig!.previewNumber}`}
                   </div>
                   <span className="text-[11px] text-emerald-800 block">
-                    {activeSavedConfig
+                    {!isSeriesWaiting && !effectiveSeriesLoadError && activeSavedConfig
                       ? `= max(Mốc đã cài, Số lớn nhất đã cấp/hủy: ${activeSavedConfig.maxIssuedSequence} + 1). Mức đặt tối thiểu: ${activeSavedConfig.minAllowedStartSequence}.`
                       : 'Tính từ max(Mốc đã cài, Số lớn nhất đã cấp/hủy trong cùng dãy + 1).'}
                   </span>
                 </div>
               </div>
 
-              {Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
+              {hasMatchingSavedConfig && Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
                 <div className="p-3 bg-sky-50/70 border border-sky-200 rounded-lg text-[11px] text-sky-900">
                   <strong className="block mb-1">
                     Các mốc Số bắt đầu đã cài trên sổ "{selectedBook.name}":
@@ -2600,14 +2727,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   type="submit"
                   disabled={
                     isActiveSeriesSaving ||
-                    isConfigBlocked ||
-                    seqConfigLoading ||
-                    Boolean(seqConfigLoadError) ||
+                    isSeriesWaiting ||
+                    Boolean(effectiveSeriesLoadError) ||
+                    !hasMatchingSavedConfig ||
                     !isStartInputValid
                   }
                   className="w-full sm:w-auto min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
                 >
-                  {isActiveSeriesSaving ? 'Đang lưu...' : 'Lưu số bắt đầu'}
+                  {isActiveSeriesSaving ? 'Đang lưu & xác nhận...' : 'Lưu số bắt đầu'}
                 </button>
               )}
             </form>

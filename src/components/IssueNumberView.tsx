@@ -161,6 +161,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   const [previewStatus, setPreviewStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [nextNumber, setNextNumber] = useState<string | null>(null);
   const [nextSequenceNumber, setNextSequenceNumber] = useState<number | null>(null);
+  const [previewStartSequence, setPreviewStartSequence] = useState<number | null>(null);
+  const [previewYear, setPreviewYear] = useState<number | null>(null);
   const [previewSeriesKey, setPreviewSeriesKey] = useState<string | null>(null);
   const [previewError, setPreviewError] = useState<string | null>(null);
   const [sequenceConflict, setSequenceConflict] = useState<{
@@ -298,6 +300,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
           setPreviewStatus(appSyncError ? 'error' : 'loading');
           setNextNumber(null);
           setNextSequenceNumber(null);
+          setPreviewStartSequence(null);
+          setPreviewYear(null);
           setPreviewSeriesKey(null);
           setPreviewError(appSyncError || null);
         }
@@ -308,6 +312,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         setPreviewStatus('error');
         setNextNumber(null);
         setNextSequenceNumber(null);
+        setPreviewStartSequence(null);
+        setPreviewYear(null);
         setPreviewSeriesKey(null);
         setPreviewError('Tài khoản chưa có quyền đọc số trên sổ này.');
         return;
@@ -317,6 +323,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         setPreviewStatus('loading');
         setNextNumber(null);
         setNextSequenceNumber(null);
+        setPreviewStartSequence(null);
+        setPreviewYear(null);
         setPreviewSeriesKey(null);
         return;
       }
@@ -339,6 +347,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         setPreviewStatus('loading');
         setNextNumber(null);
         setNextSequenceNumber(null);
+        setPreviewStartSequence(null);
+        setPreviewYear(null);
         setPreviewSeriesKey(null);
         setPreviewError(null);
         setSequenceConflict(null);
@@ -358,10 +368,36 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
           return;
         }
 
+        const expectedRespTypeCode =
+          targetMode === 'shared' ? 'SHARED' : targetTypeCode.trim().toUpperCase();
+        const actualRespTypeCode = String(res.typeCode || '').trim().toUpperCase();
+        const isScopeValid =
+          res.bookId === targetBookId &&
+          actualRespTypeCode === expectedRespTypeCode &&
+          Number.isFinite(Number(res.year)) &&
+          typeof res.sequenceNumber === 'number' &&
+          res.sequenceNumber >= 1 &&
+          Boolean(res.previewNumber);
+
+        if (!isScopeValid) {
+          setNextNumber(null);
+          setNextSequenceNumber(null);
+          setPreviewStartSequence(null);
+          setPreviewYear(null);
+          setPreviewSeriesKey(null);
+          setPreviewStatus('error');
+          setPreviewError('Dữ liệu cấu hình số từ máy chủ không khớp sổ hoặc loại văn bản đang chọn.');
+          return;
+        }
+
         setNextNumber(res.previewNumber);
-        setNextSequenceNumber(
-          typeof res.sequenceNumber === 'number' ? res.sequenceNumber : null
+        setNextSequenceNumber(res.sequenceNumber);
+        setPreviewStartSequence(
+          typeof res.customStartSequence === 'number' && res.customStartSequence >= 1
+            ? res.customStartSequence
+            : null
         );
+        setPreviewYear(Number(res.year));
         setPreviewSeriesKey(targetSeriesKey);
         setPreviewStatus('ready');
         setPreviewError(null);
@@ -397,9 +433,11 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         if (!silent || previewSeriesKey !== targetSeriesKey) {
           setNextNumber(null);
           setNextSequenceNumber(null);
+          setPreviewStartSequence(null);
+          setPreviewYear(null);
           setPreviewSeriesKey(null);
           setPreviewStatus('error');
-          setPreviewError(err?.message || 'Chưa lấy được số mới nhất từ máy chủ.');
+          setPreviewError(err?.message || 'Chưa tải được cấu hình số từ máy chủ.');
         }
       }
     },
@@ -424,7 +462,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     ]
   );
 
-  // Immediately clear stale preview & fetch fresh number when switching book, mode, or typeCode
+  // Immediately clear stale preview & fetch fresh number when switching book, mode, typeCode, or user
   useEffect(() => {
     if (!booksLoaded) {
       if (previewAbortRef.current) {
@@ -434,6 +472,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       setPreviewStatus(appSyncError ? 'error' : 'loading');
       setNextNumber(null);
       setNextSequenceNumber(null);
+      setPreviewStartSequence(null);
+      setPreviewYear(null);
       setPreviewSeriesKey(null);
       setPreviewError(appSyncError || null);
       setSequenceConflict(null);
@@ -448,6 +488,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       }
     };
   }, [
+    currentUser.id,
     booksLoaded,
     appSyncError,
     activeBook.id,
@@ -697,6 +738,15 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       if (res.nextPreview && activeSeriesKeyRef.current === submittingSeriesKey) {
         setNextNumber(res.nextPreview.previewNumber);
         setNextSequenceNumber(res.nextPreview.sequenceNumber);
+        setPreviewStartSequence(
+          typeof res.nextPreview.customStartSequence === 'number' &&
+            res.nextPreview.customStartSequence >= 1
+            ? res.nextPreview.customStartSequence
+            : previewStartSequence
+        );
+        if (Number.isFinite(Number(res.nextPreview.year))) {
+          setPreviewYear(Number(res.nextPreview.year));
+        }
         setPreviewSeriesKey(submittingSeriesKey);
         setPreviewStatus('ready');
         setPreviewError(null);
@@ -1571,13 +1621,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       {effectivePreviewStatus === 'loading' ? (
                         <span className="text-xs font-sans font-semibold text-slate-600 inline-flex items-center gap-2">
                           <RefreshCw className="w-4 h-4 animate-spin text-sky-700 shrink-0" />
-                          <span>Đang kiểm tra số tiếp theo…</span>
+                          <span>Đang tải mốc số đã cài… · Đang kiểm tra số tiếp theo…</span>
                         </span>
                       ) : effectivePreviewStatus === 'error' ? (
                         <div className="flex flex-wrap items-center justify-between gap-2 w-full">
                           <span className="text-xs font-sans font-bold text-rose-700 inline-flex items-center gap-1.5">
                             <AlertCircle className="w-4 h-4 shrink-0" />
-                            <span>Chưa lấy được số mới nhất</span>
+                            <span>Chưa tải được cấu hình số</span>
                           </span>
                           <button
                             type="button"
@@ -1603,11 +1653,22 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     )}
                     <div className="flex items-center justify-between mt-1 text-[11px] text-slate-600 gap-1.5 flex-wrap">
                       <span className="font-semibold text-slate-700">
-                        {activeBook.name} · {activeBook.numberMode === 'shared' ? 'Dãy số chung' : `Dãy riêng ${typeCode}`} · Năm {yearRolloverNotice ? yearRolloverNotice.toYear : formYear}
+                        {activeBook.name} · {activeBook.numberMode === 'shared' ? 'Dãy số chung' : `Dãy riêng ${typeCode}`} · Năm {previewYear || (yearRolloverNotice ? yearRolloverNotice.toYear : formYear)}
                       </span>
-                      <span className="font-medium text-emerald-700 bg-white/90 px-1.5 py-0.5 rounded border border-emerald-200">
-                        Tự động nối tiếp
-                      </span>
+                      {effectivePreviewStatus === 'ready' ? (
+                        previewStartSequence !== null ? (
+                          <span className="font-semibold text-sky-800 bg-white/90 px-1.5 py-0.5 rounded border border-sky-200">
+                            Số bắt đầu đã cài: {String(previewStartSequence).padStart(2, '0')}
+                            {nextSequenceNumber !== null && nextSequenceNumber > previewStartSequence
+                              ? ` · Đang nối tiếp`
+                              : ''}
+                          </span>
+                        ) : (
+                          <span className="font-medium text-slate-700 bg-white/90 px-1.5 py-0.5 rounded border border-slate-200">
+                            Chưa thiết lập · Mặc định 01
+                          </span>
+                        )
+                      ) : null}
                     </div>
                   </div>
                 </div>

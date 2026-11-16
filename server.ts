@@ -2,6 +2,7 @@ import express, { Request, Response, NextFunction } from 'express';
 import cors from 'cors';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import ExcelJS from 'exceljs';
 import crypto from 'crypto';
@@ -21,9 +22,11 @@ import type {
   AuditLog,
   GoogleDriveConfig,
   PdfAnalyzeResponse,
+  PersistenceStatus,
   RegistryBook,
   NumberRequest,
   StartSequenceSeriesConfig,
+  StorageMode,
   SystemAuditLog,
 } from './src/types.js';
 import {
@@ -74,13 +77,33 @@ const IS_SERVERLESS = Boolean(process.env.VERCEL || process.env.AWS_LAMBDA_FUNCT
 app.set('trust proxy', 1);
 app.set('etag', false);
 
-app.use('/api', (req, res, next) => {
+app.use('/api', async (req, res, next) => {
   if (req.path !== '/events') {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate, proxy-revalidate');
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
   }
-  next();
+  if (req.path === '/events' || req.path === '/health') {
+    return next();
+  }
+  try {
+    const forceFresh =
+      req.path.startsWith('/settings/start-sequence') ||
+      req.path.startsWith('/documents/preview') ||
+      req.path === '/settings' ||
+      req.path === '/books' ||
+      req.path === '/auth/login' ||
+      req.path === '/auth/me';
+    await ensureLatestDb({ maxAgeMs: forceFresh ? 0 : 500 });
+    next();
+  } catch (err: any) {
+    console.error('[Primary Storage Error]:', err);
+    return res.status(503).json({
+      code: 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: `Không thể đọc dữ liệu mới nhất từ nguồn lưu trữ chính: ${err?.message || 'Lỗi kết nối lưu trữ'}`,
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
 });
 
 const extraCorsOrigins = (process.env.CORS_ORIGINS || '')
@@ -135,7 +158,7 @@ const BUNDLED_DB_FILE = path.resolve(BUNDLED_DATA_DIR, 'db.json');
 const DATA_DIR = process.env.DATA_DIR
   ? path.resolve(process.env.DATA_DIR)
   : IS_SERVERLESS
-  ? '/tmp/nct-registry-data'
+  ? path.join(os.tmpdir(), 'nct-registry-data')
   : BUNDLED_DATA_DIR;
 const DB_FILE = path.resolve(DATA_DIR, 'db.json');
 
@@ -144,6 +167,10 @@ if (!fs.existsSync(DATA_DIR)) {
 }
 
 interface DatabaseSchema {
+  meta?: {
+    revision: string;
+    updatedAt: string;
+  };
   settings: SystemSettings;
   documentTypes: DocumentTypeConfig[];
   signers: SignerConfig[];
@@ -276,7 +303,8 @@ function normalizeCustomStartSequencesMap(
   rawMap: any,
   bookCode: string,
   bookId: string,
-  documentTypes: DocumentTypeConfig[]
+  documentTypes: DocumentTypeConfig[],
+  diagnostics?: { scopeLabel: string; warnings: string[] }
 ): Record<string, number> {
   if (!rawMap || typeof rawMap !== 'object') return {};
   const result: Record<string, number> = {};
@@ -285,7 +313,12 @@ function normalizeCustomStartSequencesMap(
 
   for (const [rawKey, rawVal] of Object.entries(rawMap)) {
     const seqNum = typeof rawVal === 'number' ? rawVal : parseInt(String(rawVal), 10);
-    if (!Number.isFinite(seqNum) || seqNum < 1) continue;
+    if (!Number.isFinite(seqNum) || seqNum < 1) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${String(rawVal)}" tại ${diagnostics.scopeLabel} không hợp lệ (số bắt đầu phải từ 1 trở lên). Vui lòng đối chiếu sổ giấy và cài lại.`
+      );
+      continue;
+    }
 
     let keyStr = String(rawKey || '').trim();
     if (!keyStr) continue;
@@ -300,6 +333,9 @@ function normalizeCustomStartSequencesMap(
           prefix !== cleanBookId &&
           upperBookCode
         ) {
+          diagnostics?.warnings.push(
+            `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} mang mã sổ khác (${prefix}); chưa tự gán vào ${bookCode}. Vui lòng đối chiếu sổ giấy.`
+          );
           continue;
         }
         keyStr = `${parts[1]}_${parts[2]}`;
@@ -309,11 +345,35 @@ function normalizeCustomStartSequencesMap(
     }
 
     const match = keyStr.match(/^(\d{4})[_\-:](.+)$/);
-    if (!match) continue;
+    if (!match) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} thiếu năm áp dụng nên chưa đủ cơ sở gán dãy số. Vui lòng kiểm tra sổ giấy và cài lại đúng năm.`
+      );
+      continue;
+    }
     const yearNum = parseInt(match[1], 10);
-    if (!Number.isFinite(yearNum) || yearNum < 2000 || yearNum > 2100) continue;
+    if (!Number.isFinite(yearNum) || yearNum < 2000 || yearNum > 2100) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} có năm không hợp lệ (${match[1]}).`
+      );
+      continue;
+    }
     const canonicalType = resolveCanonicalTypeCode(match[2], documentTypes);
-    if (!canonicalType) continue;
+    if (!canonicalType) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} thiếu mã loại văn bản.`
+      );
+      continue;
+    }
+
+    if (
+      canonicalType !== 'SHARED' &&
+      !documentTypes.some((t) => t.code.trim().toUpperCase() === canonicalType)
+    ) {
+      diagnostics?.warnings.push(
+        `Mốc cũ "${rawKey} = ${seqNum}" tại ${diagnostics.scopeLabel} dùng mã loại "${canonicalType}" chưa có trong danh mục hiện hành; vui lòng đối chiếu với sổ giấy.`
+      );
+    }
 
     const normalizedKey = `${yearNum}_${canonicalType}`;
     const existing = result[normalizedKey];
@@ -381,7 +441,10 @@ function createPrebuiltBooks(): RegistryBook[] {
   ];
 }
 
+let currentReconciliationWarnings: string[] = [];
+
 export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): DatabaseSchema {
+  const reconciliationWarnings: string[] = [];
   const settings: SystemSettings = {
     ...DEFAULT_SETTINGS,
     ...(loaded.settings || {}),
@@ -444,13 +507,6 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
     if (!defaultBook.numberMode) defaultBook.numberMode = settings.numberMode;
     if (!defaultBook.customStartSequences || typeof defaultBook.customStartSequences !== 'object') {
       defaultBook.customStartSequences = { ...(settings.customStartSequences || {}) };
-    } else if (
-      Object.keys(defaultBook.customStartSequences).length === 0 &&
-      settings.customStartSequences &&
-      Object.keys(settings.customStartSequences).length > 0
-    ) {
-      // Bảo toàn mốc cũ từ settings.customStartSequences (vd 2026_KH = 10) vào sổ Đoàn trường
-      defaultBook.customStartSequences = { ...settings.customStartSequences };
     }
     if (defaultBook.isActive === undefined) defaultBook.isActive = true;
     if (defaultBook.isShared === undefined) defaultBook.isShared = true;
@@ -483,16 +539,36 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
       b.customStartSequences || {},
       b.code,
       b.id,
-      documentTypes
+      documentTypes,
+      { scopeLabel: `Sổ ${b.name} (${b.code})`, warnings: reconciliationWarnings }
     );
     if (!Array.isArray(b.signers)) b.signers = [];
     if (!b.configVersion) b.configVersion = 1;
     if (!b.updatedAt) b.updatedAt = b.createdAt || new Date().toISOString();
   });
 
-  if (defaultBook) {
+  if (defaultBook && settings.customStartSequences && typeof settings.customStartSequences === 'object') {
+    const normalizedLegacy = normalizeCustomStartSequencesMap(
+      settings.customStartSequences,
+      defaultBook.code,
+      defaultBook.id,
+      documentTypes,
+      { scopeLabel: `Cấu hình chung cũ (${defaultBook.name})`, warnings: reconciliationWarnings }
+    );
+    for (const [legacyKey, legacyVal] of Object.entries(normalizedLegacy)) {
+      const currentVal = defaultBook.customStartSequences[legacyKey];
+      if (currentVal === undefined) {
+        defaultBook.customStartSequences[legacyKey] = legacyVal;
+      } else if (currentVal !== legacyVal) {
+        reconciliationWarnings.push(
+          `Phát hiện chênh lệch mốc cũ tại ${defaultBook.name} (${defaultBook.code}:${legacyKey}): cấu hình chung cũ = ${legacyVal}, cấu hình sổ = ${currentVal}. Hệ thống đang giữ ${currentVal}; vui lòng đối chiếu lại với sổ giấy.`
+        );
+      }
+    }
     settings.customStartSequences = { ...(defaultBook.customStartSequences || {}) };
   }
+
+  currentReconciliationWarnings = Array.from(new Set(reconciliationWarnings));
 
   const bookMap = new Map<string, RegistryBook>();
   books.forEach((b) => bookMap.set(b.id, b));
@@ -600,6 +676,7 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
   }
 
   return {
+    meta: loaded.meta,
     settings,
     documentTypes,
     signers,
@@ -615,6 +692,290 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
 }
 
 let lastDbMtimeMs = 0;
+let remoteHydrated = false;
+let lastRemoteSyncMs = 0;
+let lastPersistedAt = '';
+let lastVerifiedAt = '';
+let inFlightRemoteLoad: Promise<void> | null = null;
+
+interface StorageAdapterConfig {
+  mode: StorageMode;
+  durable: boolean;
+  label: string;
+  kvUrl?: string;
+  kvToken?: string;
+  kvKey: string;
+  blobToken?: string;
+  blobPathname: string;
+  webhookUrl?: string;
+  webhookSecret?: string;
+}
+
+function getStorageAdapterConfig(): StorageAdapterConfig {
+  const kvUrl = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '')
+    .trim()
+    .replace(/\/+$/, '');
+  const kvToken = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+  const kvKey = (process.env.PERSISTENT_DB_KEY || 'nct_vanban_registry_db_v1').trim();
+  const blobToken = (process.env.BLOB_READ_WRITE_TOKEN || '').trim();
+  const blobPathname = (process.env.PERSISTENT_BLOB_PATHNAME || 'nct-registry/db.json')
+    .trim()
+    .replace(/^\/+/, '');
+  const webhookUrl = (process.env.PERSISTENT_DB_WEBHOOK_URL || '').trim();
+  const webhookSecret = (process.env.PERSISTENT_DB_SECRET || '').trim();
+
+  if (kvUrl && kvToken) {
+    return {
+      mode: 'upstash_kv',
+      durable: true,
+      label: 'Upstash Redis / Vercel KV (Bền vững dùng chung)',
+      kvUrl,
+      kvToken,
+      kvKey,
+      blobPathname,
+    };
+  }
+  if (blobToken) {
+    return {
+      mode: 'vercel_blob',
+      durable: true,
+      label: 'Vercel Blob Store (Bền vững dùng chung)',
+      kvKey,
+      blobToken,
+      blobPathname,
+    };
+  }
+  if (webhookUrl) {
+    return {
+      mode: 'remote_webhook',
+      durable: true,
+      label: 'Remote Storage Webhook (Bền vững dùng chung)',
+      kvKey,
+      blobPathname,
+      webhookUrl,
+      webhookSecret,
+    };
+  }
+  if (!IS_SERVERLESS || Boolean(process.env.DATA_DIR)) {
+    return {
+      mode: 'local_disk',
+      durable: true,
+      label: 'Ổ đĩa máy chủ (data/db.json)',
+      kvKey,
+      blobPathname,
+    };
+  }
+  return {
+    mode: 'ephemeral_tmp',
+    durable: false,
+    label: 'Bộ nhớ tạm Serverless (/tmp — mất dữ liệu khi tải lại hoặc đổi phiên)',
+    kvKey,
+    blobPathname,
+  };
+}
+
+function getPersistenceStatus(): PersistenceStatus {
+  const cfg = getStorageAdapterConfig();
+  return {
+    durable: cfg.durable,
+    storageMode: cfg.mode,
+    storageLabel: cfg.label,
+    requiresRemoteEnvOnVercel: IS_SERVERLESS && !cfg.durable,
+    lastSavedAt: lastPersistedAt || db?.meta?.updatedAt || undefined,
+    lastVerifiedAt: lastVerifiedAt || undefined,
+    warning: !cfg.durable
+      ? 'Môi trường Serverless đang chạy ở chế độ /tmp tạm thời nên cấu hình số bắt đầu sẽ không được lưu giữ qua các lần tải lại hoặc đổi phiên.'
+      : undefined,
+  };
+}
+
+async function fetchRemoteWithTimeout(url: string, init: RequestInit, timeoutMs = 10000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, { ...init, signal: controller.signal });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+async function readFromPrimaryRemote(cfg: StorageAdapterConfig): Promise<Partial<DatabaseSchema> | null> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    const res = await fetchRemoteWithTimeout(cfg.kvUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cfg.kvToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(['GET', cfg.kvKey]),
+    });
+    if (!res.ok) {
+      throw new Error(`Upstash/Vercel KV trả về HTTP ${res.status}`);
+    }
+    const payload = (await res.json()) as { result?: any; error?: string };
+    if (payload?.error) {
+      throw new Error(`Upstash/Vercel KV báo lỗi: ${payload.error}`);
+    }
+    if (payload.result === null || payload.result === undefined || payload.result === '') {
+      return null;
+    }
+    const parsed = typeof payload.result === 'string' ? JSON.parse(payload.result) : payload.result;
+    return parsed as Partial<DatabaseSchema>;
+  }
+
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    const listUrl = `https://blob.vercel-storage.com?prefix=${encodeURIComponent(cfg.blobPathname)}&limit=10`;
+    const listRes = await fetchRemoteWithTimeout(listUrl, {
+      method: 'GET',
+      headers: {
+        Authorization: `Bearer ${cfg.blobToken}`,
+        'x-api-version': '7',
+      },
+    });
+    if (!listRes.ok) {
+      throw new Error(`Vercel Blob list trả về HTTP ${listRes.status}`);
+    }
+    const listData = (await listRes.json()) as {
+      blobs?: Array<{ pathname: string; url: string; downloadUrl?: string }>;
+    };
+    const match = listData.blobs?.find((b) => b.pathname === cfg.blobPathname);
+    if (!match) return null;
+
+    const targetUrl = new URL(match.downloadUrl || match.url);
+    targetUrl.searchParams.set('_ts', String(Date.now()));
+    let fileRes = await fetchRemoteWithTimeout(targetUrl.toString(), {
+      method: 'GET',
+      cache: 'no-store',
+    });
+    if (fileRes.status === 401 || fileRes.status === 403) {
+      fileRes = await fetchRemoteWithTimeout(targetUrl.toString(), {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${cfg.blobToken}` },
+      });
+    }
+    if (!fileRes.ok) {
+      throw new Error(`Vercel Blob get trả về HTTP ${fileRes.status}`);
+    }
+    return (await fileRes.json()) as Partial<DatabaseSchema>;
+  }
+
+  if (cfg.mode === 'remote_webhook' && cfg.webhookUrl) {
+    const res = await fetchRemoteWithTimeout(cfg.webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'load',
+        key: cfg.kvKey,
+        ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}),
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`Remote Storage Webhook trả về HTTP ${res.status}`);
+    }
+    const json = (await res.json()) as { ok?: boolean; error?: string; data?: Partial<DatabaseSchema> | null };
+    if (json?.error || json?.ok === false) {
+      throw new Error(json?.error || 'Remote Storage Webhook báo lỗi khi đọc.');
+    }
+    return json?.data ?? null;
+  }
+
+  return null;
+}
+
+async function writeToPrimaryRemoteAndVerify(
+  cfg: StorageAdapterConfig,
+  serialized: string,
+  expectedRevision: string
+): Promise<void> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    const res = await fetchRemoteWithTimeout(cfg.kvUrl, {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${cfg.kvToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify(['SET', cfg.kvKey, serialized]),
+    });
+    if (!res.ok) {
+      throw new Error(`Ghi Upstash/Vercel KV thất bại (HTTP ${res.status})`);
+    }
+    const payload = (await res.json()) as { result?: any; error?: string };
+    if (payload?.error || payload?.result !== 'OK') {
+      throw new Error(payload?.error || 'Upstash/Vercel KV không xác nhận ghi thành công.');
+    }
+    const readBack = await readFromPrimaryRemote(cfg);
+    if (!readBack || readBack.meta?.revision !== expectedRevision) {
+      throw new Error('Đọc lại từ Upstash/Vercel KV không khớp phiên bản dữ liệu vừa lưu.');
+    }
+    return;
+  }
+
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    const putUrl = `https://blob.vercel-storage.com/${cfg.blobPathname}`;
+    const res = await fetchRemoteWithTimeout(putUrl, {
+      method: 'PUT',
+      headers: {
+        Authorization: `Bearer ${cfg.blobToken}`,
+        'x-api-version': '7',
+        'x-add-random-suffix': '0',
+        'x-allow-overwrite': '1',
+        'x-content-type': 'application/json',
+        'x-cache-control-max-age': '0',
+      },
+      body: serialized,
+    });
+    if (!res.ok) {
+      throw new Error(`Ghi Vercel Blob thất bại (HTTP ${res.status})`);
+    }
+    const putData = (await res.json()) as { url?: string; downloadUrl?: string };
+    const verifyUrl = new URL(putData.downloadUrl || putData.url || '');
+    verifyUrl.searchParams.set('_ts', String(Date.now()));
+    let checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), {
+      method: 'GET',
+      cache: 'no-store',
+    });
+    if (checkRes.status === 401 || checkRes.status === 403) {
+      checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), {
+        method: 'GET',
+        cache: 'no-store',
+        headers: { Authorization: `Bearer ${cfg.blobToken}` },
+      });
+    }
+    if (!checkRes.ok) {
+      throw new Error(`Không đọc lại được từ Vercel Blob để xác nhận (HTTP ${checkRes.status}).`);
+    }
+    const verified = (await checkRes.json()) as Partial<DatabaseSchema>;
+    if (!verified || verified.meta?.revision !== expectedRevision) {
+      throw new Error('Đọc lại từ Vercel Blob không khớp phiên bản dữ liệu vừa lưu.');
+    }
+    return;
+  }
+
+  if (cfg.mode === 'remote_webhook' && cfg.webhookUrl) {
+    const res = await fetchRemoteWithTimeout(cfg.webhookUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'save',
+        key: cfg.kvKey,
+        data: JSON.parse(serialized),
+        ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}),
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`Ghi Remote Storage Webhook thất bại (HTTP ${res.status})`);
+    }
+    const json = (await res.json()) as { ok?: boolean; error?: string };
+    if (json?.error || json?.ok === false) {
+      throw new Error(json?.error || 'Remote Storage Webhook không xác nhận ghi thành công.');
+    }
+    const verified = await readFromPrimaryRemote(cfg);
+    if (!verified || verified.meta?.revision !== expectedRevision) {
+      throw new Error('Đọc lại từ Remote Storage Webhook không khớp phiên bản dữ liệu vừa lưu.');
+    }
+  }
+}
 
 function loadDatabase(): DatabaseSchema {
   const sourceFile = fs.existsSync(DB_FILE)
@@ -665,11 +1026,11 @@ function saveDatabaseSync(data: DatabaseSchema) {
   }
 }
 
-function reloadDatabaseFromDiskIfNewer() {
+function reloadDatabaseFromDiskIfNewer(force = false) {
   if (!fs.existsSync(DB_FILE)) return;
   try {
     const stat = fs.statSync(DB_FILE);
-    if (stat.mtimeMs > lastDbMtimeMs) {
+    if (force || stat.mtimeMs > lastDbMtimeMs) {
       const content = fs.readFileSync(DB_FILE, 'utf-8');
       const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
       db = migrateDatabaseIdempotent(loaded);
@@ -678,6 +1039,90 @@ function reloadDatabaseFromDiskIfNewer() {
   } catch (err) {
     console.error('Lỗi đọc lại dữ liệu mới từ ổ đĩa:', err);
   }
+}
+
+async function ensureLatestDb(options: { maxAgeMs?: number } = {}): Promise<void> {
+  const cfg = getStorageAdapterConfig();
+  const maxAgeMs = options.maxAgeMs ?? 500;
+
+  if (cfg.mode === 'local_disk' || cfg.mode === 'ephemeral_tmp') {
+    reloadDatabaseFromDiskIfNewer(maxAgeMs === 0);
+    return;
+  }
+
+  if (remoteHydrated && maxAgeMs > 0 && Date.now() - lastRemoteSyncMs < maxAgeMs) {
+    return;
+  }
+
+  if (inFlightRemoteLoad && maxAgeMs > 0) {
+    await inFlightRemoteLoad;
+    return;
+  }
+
+  const loadPromise = (async () => {
+    const remoteRaw = await readFromPrimaryRemote(cfg);
+    if (remoteRaw === null) {
+      const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+      const seeded = migrateDatabaseIdempotent(db);
+      seeded.meta = { revision, updatedAt: new Date().toISOString() };
+      const serialized = JSON.stringify(seeded, null, 2);
+      await writeToPrimaryRemoteAndVerify(cfg, serialized, revision);
+      db = seeded;
+      saveDatabaseSync(db);
+    } else {
+      db = migrateDatabaseIdempotent(remoteRaw);
+      saveDatabaseSync(db);
+    }
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastVerifiedAt = new Date().toISOString();
+  })();
+
+  inFlightRemoteLoad = loadPromise;
+  try {
+    await loadPromise;
+  } finally {
+    if (inFlightRemoteLoad === loadPromise) {
+      inFlightRemoteLoad = null;
+    }
+  }
+}
+
+async function saveDatabasePersistent(
+  data: DatabaseSchema,
+  options: { verifyWrite?: boolean } = {}
+): Promise<PersistenceStatus> {
+  const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  const updatedAt = new Date().toISOString();
+  data.meta = { revision, updatedAt };
+  const serialized = JSON.stringify(data, null, 2);
+
+  saveDatabaseSync(data);
+  lastPersistedAt = updatedAt;
+
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'local_disk') {
+    if (options.verifyWrite) {
+      const raw = fs.readFileSync(DB_FILE, 'utf-8');
+      const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+      if (parsed?.meta?.revision !== revision) {
+        throw new Error('Xác nhận đọc lại tệp dữ liệu trên máy chủ không khớp sau khi lưu.');
+      }
+      db = migrateDatabaseIdempotent(parsed);
+      lastVerifiedAt = new Date().toISOString();
+    }
+    return getPersistenceStatus();
+  }
+
+  if (cfg.mode === 'ephemeral_tmp') {
+    return getPersistenceStatus();
+  }
+
+  await writeToPrimaryRemoteAndVerify(cfg, serialized, revision);
+  remoteHydrated = true;
+  lastRemoteSyncMs = Date.now();
+  lastVerifiedAt = new Date().toISOString();
+  return getPersistenceStatus();
 }
 
 db = loadDatabase();
@@ -931,13 +1376,13 @@ async function syncToGoogleSheets(
     doc.syncStatus = 'synced';
     doc.syncedAt = new Date().toISOString();
     delete doc.syncError;
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     return { attempted: true, ok: true };
   }
 
   doc.syncStatus = 'error';
   doc.syncError = errors[0];
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   return { attempted: true, ok: false, error: errors[0] };
 }
 
@@ -981,7 +1426,7 @@ async function syncDeletedDocumentToOnlineExcel(
         delete tState.error;
         doc.excelSyncTargets[target.url] = tState;
         doc.excelMovedToDeletedSheet = true;
-        saveDatabaseSync(db);
+        await saveDatabasePersistent(db);
       }
 
       // Bước 2: Chỉ xóa dòng khỏi sheet theo dõi chính sau khi đã xác nhận ghi xong ở sheet "VB đã xóa"
@@ -1019,7 +1464,7 @@ async function syncDeletedDocumentToOnlineExcel(
     doc.syncedAt = doc.excelSyncedAt;
     delete doc.excelSyncError;
     delete doc.syncError;
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     return { attempted: true, ok: true };
   }
 
@@ -1027,7 +1472,7 @@ async function syncDeletedDocumentToOnlineExcel(
   doc.excelSyncError = errors[0] || 'Đồng bộ xóa Excel chưa hoàn tất.';
   doc.syncStatus = 'error';
   doc.syncError = doc.excelSyncError;
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   return { attempted: true, ok: false, error: doc.excelSyncError };
 }
 
@@ -1198,7 +1643,9 @@ function computeSeriesSequenceState(
 
   const sampleTypeCode =
     canonicalType === 'SHARED'
-      ? book.enabledTypeCodes?.[0] || db.documentTypes[0]?.code || 'KH'
+      ? canonicalInput && canonicalInput !== 'SHARED'
+        ? canonicalInput
+        : book.enabledTypeCodes?.[0] || db.documentTypes[0]?.code || 'KH'
       : canonicalType;
   const seqStr = formatSequenceNumber(nextExpectedSeq);
   const previewNumber = renderFullDocNumber(book.numberFormat, seqStr, sampleTypeCode, book.unitCode);
@@ -1716,6 +2163,7 @@ app.get('/api/health', (req, res) => {
     status: 'ok',
     app: 'Sổ Cấp Số Văn Bản Đoàn Trường THPT Nguyễn Chí Thanh',
     timeVietnam: getRequestVietnamTimeInfo(req),
+    persistenceStatus: getPersistenceStatus(),
   });
 });
 
@@ -1764,7 +2212,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   res.json({ user: userSafe });
 });
 
-app.post('/api/auth/logout', (req, res) => {
+app.post('/api/auth/logout', async (req, res) => {
   const bearer = req.headers.authorization?.startsWith('Bearer ')
     ? req.headers.authorization.slice(7).trim()
     : undefined;
@@ -1781,7 +2229,7 @@ app.post('/api/auth/logout', (req, res) => {
   }
   if (changed) {
     try {
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
     } catch (err) {
       console.error('Lỗi lưu trạng thái hủy phiên:', err);
     }
@@ -1797,53 +2245,59 @@ app.get('/api/users', requireAuth, requireAdmin, (req, res) => {
   res.json({ users: safeUsers });
 });
 
-app.post('/api/users', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const actor = (req as any).user as User;
   const { username, fullName, password, bookPermissions } = req.body;
   if (!username || !fullName || !password) {
     return res.status(400).json({ error: 'Vui lòng điền đầy đủ: Tên đăng nhập, Họ tên và Mật khẩu' });
   }
 
-  const cleanUser = username.trim().toLowerCase();
-  if (db.users.some((u) => u.username.toLowerCase() === cleanUser)) {
-    return res.status(400).json({ error: 'Tên đăng nhập đã tồn tại trong hệ thống' });
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const cleanUser = username.trim().toLowerCase();
+    if (db.users.some((u) => u.username.toLowerCase() === cleanUser)) {
+      return res.status(400).json({ error: 'Tên đăng nhập đã tồn tại trong hệ thống' });
+    }
+
+    const cleanedPermissions =
+      bookPermissions && typeof bookPermissions === 'object'
+        ? sanitizeBookPermissionsMap(bookPermissions)
+        : { [DEFAULT_BOOK_ID]: ['view', 'request_number'] as BookPermission[] };
+
+    // Tài khoản do Admin tạo cố định vai trò non-admin ('issuer'), quyền chi tiết phân theo từng sổ văn bản
+    const newUser: User & { passwordHash: string } = {
+      id: `user-${Date.now()}`,
+      username: cleanUser,
+      fullName: fullName.trim(),
+      role: 'issuer',
+      isActive: true,
+      createdAt: new Date().toISOString(),
+      bookPermissions: cleanedPermissions,
+      passwordHash: hashPassword(password),
+    };
+
+    db.users.push(newUser);
+    appendSystemAuditLog({
+      actorUserId: actor.id,
+      actorName: `${actor.fullName} (${actor.username})`,
+      action: 'user_create',
+      targetUserId: newUser.id,
+      targetUsername: newUser.username,
+      details: `Tạo tài khoản ${newUser.fullName} (@${newUser.username}) và phân quyền cho ${Object.keys(cleanedPermissions).length} sổ`,
+      changes: {
+        bookPermissions: { old: null, new: JSON.stringify(cleanedPermissions) },
+      },
+    });
+    await saveDatabasePersistent(db);
+
+    res.json({ user: toSafeUser(newUser) });
+  } finally {
+    releaseLock();
   }
-
-  const cleanedPermissions =
-    bookPermissions && typeof bookPermissions === 'object'
-      ? sanitizeBookPermissionsMap(bookPermissions)
-      : { [DEFAULT_BOOK_ID]: ['view', 'request_number'] as BookPermission[] };
-
-  // Tài khoản do Admin tạo cố định vai trò non-admin ('issuer'), quyền chi tiết phân theo từng sổ văn bản
-  const newUser: User & { passwordHash: string } = {
-    id: `user-${Date.now()}`,
-    username: cleanUser,
-    fullName: fullName.trim(),
-    role: 'issuer',
-    isActive: true,
-    createdAt: new Date().toISOString(),
-    bookPermissions: cleanedPermissions,
-    passwordHash: hashPassword(password),
-  };
-
-  db.users.push(newUser);
-  appendSystemAuditLog({
-    actorUserId: actor.id,
-    actorName: `${actor.fullName} (${actor.username})`,
-    action: 'user_create',
-    targetUserId: newUser.id,
-    targetUsername: newUser.username,
-    details: `Tạo tài khoản ${newUser.fullName} (@${newUser.username}) và phân quyền cho ${Object.keys(cleanedPermissions).length} sổ`,
-    changes: {
-      bookPermissions: { old: null, new: JSON.stringify(cleanedPermissions) },
-    },
-  });
-  saveDatabaseSync(db);
-
-  res.json({ user: toSafeUser(newUser) });
 });
 
-app.put('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
+app.put('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   const actor = (req as any).user as User;
   const { id } = req.params;
   const { fullName, isActive, password, bookPermissions } = req.body;
@@ -1901,14 +2355,14 @@ app.put('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     });
   }
 
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   const safeUser = toSafeUser(target);
   refreshUserSessions(safeUser);
   broadcastSSE('user_permissions_updated', { userId: target.id, user: safeUser });
   res.json({ user: safeUser });
 });
 
-app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
+app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   const actor = (req as any).user as User;
   const { id } = req.params;
   const target = db.users.find((u) => u.id === id);
@@ -1930,7 +2384,7 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, (req, res) => {
     targetUsername: target.username,
     details: `Xóa tài khoản ${target.fullName} (@${target.username})`,
   });
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('user_permissions_updated', { userId: id, deleted: true });
   res.json({ success: true, message: `Đã xóa tài khoản ${target.username}` });
 });
@@ -2075,8 +2529,8 @@ app.get('/api/events', (req, res) => {
 });
 
 // 5. System Settings, Books, Document Types, Signers
-app.get('/api/books', requireAuth, (req, res) => {
-  reloadDatabaseFromDiskIfNewer();
+app.get('/api/books', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
   const currentUser = (req as any).user as User;
   const accessible = db.books.filter(
     (b) => isSystemAdmin(currentUser) || (b.isActive && getUserBookPermissions(currentUser, b.id).length > 0)
@@ -2084,10 +2538,11 @@ app.get('/api/books', requireAuth, (req, res) => {
   res.json({
     books: accessible.map((b) => sanitizeBookForUser(b, currentUser)),
     serverTimeVietnam: getRequestVietnamTimeInfo(req),
+    persistenceStatus: getPersistenceStatus(),
   });
 });
 
-app.post('/api/books', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/books', requireAuth, requireAdmin, async (req, res) => {
   const currentUser = (req as any).user as User;
   const { code, name, unitName, unitCode, isShared, numberMode, numberFormat, enabledTypeCodes } = req.body || {};
 
@@ -2102,53 +2557,59 @@ app.post('/api/books', requireAuth, requireAdmin, (req, res) => {
     });
   }
 
-  if (db.books.some((b) => b.code.toUpperCase() === cleanCode.toUpperCase())) {
-    return res.status(400).json({
-      error: `Mã sổ nội bộ "${cleanCode}" đã tồn tại. Vui lòng chọn mã cố định khác.`,
-    });
-  }
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    if (db.books.some((b) => b.code.toUpperCase() === cleanCode.toUpperCase())) {
+      return res.status(400).json({
+        error: `Mã sổ nội bộ "${cleanCode}" đã tồn tại. Vui lòng chọn mã cố định khác.`,
+      });
+    }
 
-  const validTypeCodes = Array.isArray(enabledTypeCodes)
-    ? Array.from(
-        new Set(
-          enabledTypeCodes
-            .filter((c: any) => typeof c === 'string' && c.trim())
-            .map((c: string) => c.trim().toUpperCase())
+    const validTypeCodes = Array.isArray(enabledTypeCodes)
+      ? Array.from(
+          new Set(
+            enabledTypeCodes
+              .filter((c: any) => typeof c === 'string' && c.trim())
+              .map((c: string) => c.trim().toUpperCase())
+          )
         )
-      )
-    : undefined;
+      : undefined;
 
-  const newBook: RegistryBook = {
-    id: `book-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
-    code: cleanCode,
-    name: cleanName,
-    unitName: cleanUnitName,
-    unitCode: cleanUnitCode,
-    isShared: Boolean(isShared),
-    numberMode: numberMode === 'shared' ? 'shared' : 'separate',
-    numberFormat: (numberFormat || '{so}-{loai}/{don_vi}').trim(),
-    customStartSequences: {},
-    enabledTypeCodes: validTypeCodes && validTypeCodes.length > 0 ? validTypeCodes : undefined,
-    signers: db.signers.map((s) => ({ ...s })),
-    isActive: true,
-    createdAt: new Date().toISOString(),
-  };
+    const newBook: RegistryBook = {
+      id: `book-${Date.now()}-${crypto.randomBytes(3).toString('hex')}`,
+      code: cleanCode,
+      name: cleanName,
+      unitName: cleanUnitName,
+      unitCode: cleanUnitCode,
+      isShared: Boolean(isShared),
+      numberMode: numberMode === 'shared' ? 'shared' : 'separate',
+      numberFormat: (numberFormat || '{so}-{loai}/{don_vi}').trim(),
+      customStartSequences: {},
+      enabledTypeCodes: validTypeCodes && validTypeCodes.length > 0 ? validTypeCodes : undefined,
+      signers: db.signers.map((s) => ({ ...s })),
+      isActive: true,
+      createdAt: new Date().toISOString(),
+    };
 
-  db.books.push(newBook);
-  appendSystemAuditLog({
-    actorUserId: currentUser.id,
-    actorName: `${currentUser.fullName} (${currentUser.username})`,
-    action: 'book_create',
-    bookId: newBook.id,
-    bookCode: newBook.code,
-    details: `Tạo sổ mới "${newBook.name}" (Mã cố định: ${newBook.code}, Ký hiệu: ${newBook.unitCode})`,
-  });
-  saveDatabaseSync(db);
-  broadcastSSE('books_updated', { bookId: newBook.id });
-  res.json({ book: sanitizeBookForUser(newBook, currentUser) });
+    db.books.push(newBook);
+    appendSystemAuditLog({
+      actorUserId: currentUser.id,
+      actorName: `${currentUser.fullName} (${currentUser.username})`,
+      action: 'book_create',
+      bookId: newBook.id,
+      bookCode: newBook.code,
+      details: `Tạo sổ mới "${newBook.name}" (Mã cố định: ${newBook.code}, Ký hiệu: ${newBook.unitCode})`,
+    });
+    await saveDatabasePersistent(db);
+    broadcastSSE('books_updated', { bookId: newBook.id });
+    res.json({ book: sanitizeBookForUser(newBook, currentUser) });
+  } finally {
+    releaseLock();
+  }
 });
 
-app.put('/api/books/:id', requireAuth, (req, res) => {
+app.put('/api/books/:id', requireAuth, async (req, res) => {
   const { id } = req.params;
   const currentUser = (req as any).user as User;
   const target = db.books.find((b) => b.id === id);
@@ -2236,7 +2697,7 @@ app.put('/api/books/:id', requireAuth, (req, res) => {
 
   bumpBookVersion(target);
   syncDefaultBookToLegacySettings(target);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('books_updated', {
     bookId: target.id,
     configVersion: target.configVersion,
@@ -2248,14 +2709,16 @@ app.put('/api/books/:id', requireAuth, (req, res) => {
   res.json({ book: sanitizeBookForUser(target, currentUser) });
 });
 
-app.get('/api/settings', requireAuth, (req, res) => {
-  reloadDatabaseFromDiskIfNewer();
+app.get('/api/settings', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
   const currentUser = (req as any).user as User;
   res.json({
     settings: sanitizeSettingsForUser(db.settings, currentUser),
     documentTypes: db.documentTypes,
     signers: db.signers,
     serverTimeVietnam: getRequestVietnamTimeInfo(req),
+    persistenceStatus: getPersistenceStatus(),
+    legacyReconciliationWarnings: [...currentReconciliationWarnings],
   });
 });
 
@@ -2263,14 +2726,29 @@ app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
   const currentUser = (req as any).user as User;
   const { unitName, unitCode, numberFormat, customStartSequences, bookId } = req.body;
 
-  const targetBook = findBookExplicitly(bookId);
-  if (!targetBook) {
+  const initialBook = findBookExplicitly(bookId);
+  if (!initialBook) {
     return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
   }
-  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+  if (customStartSequences && !getPersistenceStatus().durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      persistenceStatus: getPersistenceStatus(),
+      error:
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững (KV_REST_API_URL/TOKEN, BLOB_READ_WRITE_TOKEN hoặc PERSISTENT_DB_WEBHOOK_URL).',
+    });
+  }
+  if (checkVersionConflict(req, res, initialBook, currentUser)) return;
 
   const releaseLock = await atomicLock.acquire();
   try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const targetBook = findBookExplicitly(initialBook.id);
+    if (!targetBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+    }
+    if (checkVersionConflict(req, res, targetBook, currentUser)) return;
+
     if (unitName) targetBook.unitName = unitName.trim();
     if (unitCode) targetBook.unitCode = unitCode.trim();
     if (numberFormat) targetBook.numberFormat = numberFormat.trim();
@@ -2289,7 +2767,7 @@ app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
 
     bumpBookVersion(targetBook);
     syncDefaultBookToLegacySettings(targetBook);
-    saveDatabaseSync(db);
+    const persistenceStatus = await saveDatabasePersistent(db, { verifyWrite: true });
     broadcastSSE('books_updated', {
       bookId: targetBook.id,
       configVersion: targetBook.configVersion,
@@ -2299,6 +2777,7 @@ app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
     res.json({
       settings: sanitizeSettingsForUser(db.settings, currentUser),
       book: sanitizeBookForUser(targetBook, currentUser),
+      persistenceStatus,
     });
   } finally {
     releaseLock();
@@ -2306,53 +2785,60 @@ app.put('/api/settings', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // Chuyển đổi chế độ cấp số (riêng vs chung) theo từng sổ
-app.post('/api/settings/number-mode', requireAuth, (req, res) => {
+app.post('/api/settings/number-mode', requireAuth, async (req, res) => {
   const currentUser = (req as any).user as User;
   const { newMode, confirmationText, bookId } = req.body;
-  const targetBook = getBookById(bookId || DEFAULT_BOOK_ID);
+  const initialBook = getBookById(bookId || DEFAULT_BOOK_ID);
 
-  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, initialBook.id, 'manage_book')) {
     return res.status(403).json({
       error: 'Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để thay đổi chế độ dãy số.',
     });
   }
 
-  if (checkVersionConflict(req, res, targetBook, currentUser)) return;
-
   if (newMode !== 'separate' && newMode !== 'shared') {
     return res.status(400).json({ error: 'Chế độ dãy số không hợp lệ' });
   }
 
-  const { year: currentYear } = getRequestVietnamTimeInfo(req);
-  const currentYearDocs = db.documents.filter(
-    (d) => getDocBookId(d) === targetBook.id && d.year === currentYear && d.docCategory !== 'incoming'
-  );
+  const releaseLock = await atomicLock.acquire();
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const targetBook = getBookById(initialBook.id);
+    if (checkVersionConflict(req, res, targetBook, currentUser)) return;
 
-  if (currentYearDocs.length > 0) {
-    if (confirmationText !== 'XÁC NHẬN CHUYỂN ĐỔI') {
-      return res.status(400).json({
-        error:
-          `Sổ "${targetBook.name}" trong năm ${currentYear} đã phát sinh ${currentYearDocs.length} văn bản. ` +
-          `Để tránh trùng số hoặc sai lệch thứ tự, bạn phải nhập chính xác dòng chữ "XÁC NHẬN CHUYỂN ĐỔI" để xác nhận.`,
-      });
+    const { year: currentYear } = getRequestVietnamTimeInfo(req);
+    const currentYearDocs = db.documents.filter(
+      (d) => getDocBookId(d) === targetBook.id && d.year === currentYear && d.docCategory !== 'incoming'
+    );
+
+    if (currentYearDocs.length > 0) {
+      if (confirmationText !== 'XÁC NHẬN CHUYỂN ĐỔI') {
+        return res.status(400).json({
+          error:
+            `Sổ "${targetBook.name}" trong năm ${currentYear} đã phát sinh ${currentYearDocs.length} văn bản. ` +
+            `Để tránh trùng số hoặc sai lệch thứ tự, bạn phải nhập chính xác dòng chữ "XÁC NHẬN CHUYỂN ĐỔI" để xác nhận.`,
+        });
+      }
     }
-  }
 
-  targetBook.numberMode = newMode;
-  bumpBookVersion(targetBook);
-  syncDefaultBookToLegacySettings(targetBook);
-  saveDatabaseSync(db);
-  broadcastSSE('books_updated', {
-    bookId: targetBook.id,
-    configVersion: targetBook.configVersion,
-    updatedAt: targetBook.updatedAt,
-  });
-  broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
-  res.json({
-    success: true,
-    settings: sanitizeSettingsForUser(db.settings, currentUser),
-    book: sanitizeBookForUser(targetBook, currentUser),
-  });
+    targetBook.numberMode = newMode;
+    bumpBookVersion(targetBook);
+    syncDefaultBookToLegacySettings(targetBook);
+    await saveDatabasePersistent(db, { verifyWrite: true });
+    broadcastSSE('books_updated', {
+      bookId: targetBook.id,
+      configVersion: targetBook.configVersion,
+      updatedAt: targetBook.updatedAt,
+    });
+    broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
+    res.json({
+      success: true,
+      settings: sanitizeSettingsForUser(db.settings, currentUser),
+      book: sanitizeBookForUser(targetBook, currentUser),
+    });
+  } finally {
+    releaseLock();
+  }
 });
 
 // Quản lý loại văn bản
@@ -2386,7 +2872,7 @@ app.post('/api/document-types', requireAuth, async (req, res) => {
 
   const releaseLock = await atomicLock.acquire();
   try {
-    reloadDatabaseFromDiskIfNewer();
+    await ensureLatestDb({ maxAgeMs: 0 });
     const scopedBook = targetBook ? findBookExplicitly(targetBook.id) : null;
     const existingType = db.documentTypes.find(
       (t) => t.code.trim().replace(/\s+/g, '').toUpperCase() === cleanCode
@@ -2410,7 +2896,7 @@ app.post('/api/document-types', requireAuth, async (req, res) => {
             }
           }
           bumpBookVersion(scopedBook);
-          saveDatabaseSync(db);
+          await saveDatabasePersistent(db);
           broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
           broadcastSSE('books_updated', {
             bookId: scopedBook.id,
@@ -2459,7 +2945,7 @@ app.post('/api/document-types', requireAuth, async (req, res) => {
       updatedBookPayload = sanitizeBookForUser(scopedBook, currentUser);
     }
 
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
     if (scopedBook && updatedBookPayload) {
       broadcastSSE('books_updated', {
@@ -2477,18 +2963,18 @@ app.post('/api/document-types', requireAuth, async (req, res) => {
   }
 });
 
-app.delete('/api/document-types/:id', requireAuth, requireAdmin, (req, res) => {
+app.delete('/api/document-types/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const idx = db.documentTypes.findIndex((t) => t.id === id || t.code === id);
   if (idx === -1) return res.status(404).json({ error: 'Không tìm thấy loại văn bản cần xóa' });
 
   db.documentTypes.splice(idx, 1);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
   res.json({ success: true });
 });
 
-app.put('/api/document-types/:id', requireAuth, requireAdmin, (req, res) => {
+app.put('/api/document-types/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, code, color, isActive } = req.body;
 
@@ -2506,13 +2992,13 @@ app.put('/api/document-types/:id', requireAuth, requireAdmin, (req, res) => {
   if (color) target.color = color;
   if (typeof isActive === 'boolean') target.isActive = isActive;
 
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { documentTypes: db.documentTypes });
   res.json({ documentType: target });
 });
 
 // Quản lý người ký
-app.post('/api/signers', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/signers', requireAuth, requireAdmin, async (req, res) => {
   const { name, role } = req.body;
   if (!name || !role) {
     return res.status(400).json({ error: 'Vui lòng nhập tên người ký và chức vụ' });
@@ -2525,12 +3011,12 @@ app.post('/api/signers', requireAuth, requireAdmin, (req, res) => {
   };
 
   db.signers.push(newSigner);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { signers: db.signers });
   res.json({ signer: newSigner });
 });
 
-app.put('/api/signers/:id', requireAuth, requireAdmin, (req, res) => {
+app.put('/api/signers/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const { name, role } = req.body;
 
@@ -2540,25 +3026,25 @@ app.put('/api/signers/:id', requireAuth, requireAdmin, (req, res) => {
   if (name) target.name = name.trim();
   if (role) target.role = role.trim();
 
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { signers: db.signers });
   res.json({ signer: target });
 });
 
-app.delete('/api/signers/:id', requireAuth, requireAdmin, (req, res) => {
+app.delete('/api/signers/:id', requireAuth, requireAdmin, async (req, res) => {
   const { id } = req.params;
   const idx = db.signers.findIndex((s) => s.id === id);
   if (idx === -1) return res.status(404).json({ error: 'Không tìm thấy người ký' });
 
   db.signers.splice(idx, 1);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { signers: db.signers });
   res.json({ success: true });
 });
 
 // Đọc cấu hình số bắt đầu theo khóa (mã sổ + năm áp dụng + mã loại văn bản)
-app.get('/api/settings/start-sequence', requireAuth, (req, res) => {
-  reloadDatabaseFromDiskIfNewer();
+app.get('/api/settings/start-sequence', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
   const currentUser = (req as any).user as User;
   const bookIdParam = typeof req.query.bookId === 'string' ? req.query.bookId : undefined;
   const targetBook = findBookExplicitly(bookIdParam);
@@ -2607,6 +3093,9 @@ app.get('/api/settings/start-sequence', requireAuth, (req, res) => {
   res.json({
     ...seriesState,
     serverYear: vietnamNow.year,
+    persistenceStatus: getPersistenceStatus(),
+    legacyReconciliationWarnings: [...currentReconciliationWarnings],
+    verifiedFromPrimary: true,
   });
 });
 
@@ -2622,6 +3111,16 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
   if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'manage_book')) {
     return res.status(403).json({
       error: 'Bạn cần quyền "Quản trị sổ" hoặc Quản trị viên để cấu hình số bắt đầu.',
+    });
+  }
+
+  const currentPersistence = getPersistenceStatus();
+  if (!currentPersistence.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      persistenceStatus: currentPersistence,
+      error:
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững (KV_REST_API_URL/TOKEN, BLOB_READ_WRITE_TOKEN hoặc PERSISTENT_DB_WEBHOOK_URL). Đã chặn lưu tạm vào /tmp để tránh mất mốc số sau khi tải lại trang hoặc đăng nhập lại.',
     });
   }
 
@@ -2652,39 +3151,64 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
 
   const releaseLock = await atomicLock.acquire();
   try {
-    reloadDatabaseFromDiskIfNewer();
-    const beforeState = computeSeriesSequenceState(targetBook, targetYear, canonicalType);
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const lockedBook = findBookExplicitly(targetBook.id);
+    if (!lockedBook) {
+      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+    }
+
+    const beforeState = computeSeriesSequenceState(lockedBook, targetYear, canonicalType);
     if (nextSeq <= beforeState.maxIssuedSequence) {
       return res.status(400).json({
-        error: `Số bắt đầu (${nextSeq}) không được nhỏ hơn hoặc bằng số lớn nhất đã cấp/hủy trong dãy ${targetBook.name} - ${targetYear} - ${canonicalType} (${beforeState.maxIssuedSequence}). Mức tối thiểu phải từ ${beforeState.minAllowedStartSequence} trở lên.`,
+        error: `Số bắt đầu (${nextSeq}) không được nhỏ hơn hoặc bằng số lớn nhất đã cấp/hủy trong dãy ${lockedBook.name} - ${targetYear} - ${canonicalType} (${beforeState.maxIssuedSequence}). Mức tối thiểu phải từ ${beforeState.minAllowedStartSequence} trở lên.`,
       });
     }
 
-    targetBook.customStartSequences = {
-      ...(targetBook.customStartSequences || {}),
+    lockedBook.customStartSequences = {
+      ...(lockedBook.customStartSequences || {}),
       [beforeState.storageKey]: nextSeq,
     };
-    bumpBookVersion(targetBook);
-    syncDefaultBookToLegacySettings(targetBook);
-    saveDatabaseSync(db);
+    bumpBookVersion(lockedBook);
+    syncDefaultBookToLegacySettings(lockedBook);
+    const persistenceAfter = await saveDatabasePersistent(db, { verifyWrite: true });
+
+    // Đọc lại từ nguồn dữ liệu chính để xác nhận chắc chắn mốc mới đã bền vững
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const verifiedBook = findBookExplicitly(lockedBook.id);
+    if (!verifiedBook) {
+      throw new Error('Không tìm thấy sổ văn bản khi đọc lại xác nhận từ nguồn dữ liệu chính.');
+    }
 
     const { sampleTypeCode: _, ...afterState } = computeSeriesSequenceState(
-      targetBook,
+      verifiedBook,
       targetYear,
       canonicalType
     );
+    if (!afterState.isConfigured || afterState.customStartSequence !== nextSeq) {
+      throw new Error('Dữ liệu đọc lại từ nguồn lưu trữ chính không khớp với mốc số vừa lưu.');
+    }
 
     broadcastSSE('books_updated', {
-      bookId: targetBook.id,
-      configVersion: targetBook.configVersion,
-      updatedAt: targetBook.updatedAt,
+      bookId: verifiedBook.id,
+      configVersion: verifiedBook.configVersion,
+      updatedAt: verifiedBook.updatedAt,
     });
     broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
 
     res.json({
       success: true,
       ...afterState,
-      book: sanitizeBookForUser(targetBook, currentUser),
+      verifiedFromPrimary: true,
+      persistenceStatus: persistenceAfter,
+      legacyReconciliationWarnings: [...currentReconciliationWarnings],
+      book: sanitizeBookForUser(verifiedBook, currentUser),
+    });
+  } catch (err: any) {
+    console.error('[StartSequence Save Error]:', err);
+    return res.status(503).json({
+      code: 'PRIMARY_PERSISTENCE_FAILED',
+      error: `Chưa xác nhận được lưu mốc số vào nguồn dữ liệu chính: ${err?.message || 'Lỗi lưu trữ'}`,
+      persistenceStatus: getPersistenceStatus(),
     });
   } finally {
     releaseLock();
@@ -2714,12 +3238,13 @@ function buildPreviewResponseForSeries(
     maxIssuedSequence: seriesState.maxIssuedSequence,
     configVersion: book.configVersion || 1,
     serverTimeMs: Date.now(),
+    persistenceStatus: getPersistenceStatus(),
   };
 }
 
 // 6. Tính toán số văn bản dự kiến theo sổ (Preview ONLY - Chưa lưu, chưa cấp)
-app.get('/api/documents/preview', requireAuth, (req, res) => {
-  reloadDatabaseFromDiskIfNewer();
+app.get('/api/documents/preview', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
   const currentUser = (req as any).user as User;
   const book = findBookExplicitly(typeof req.query.bookId === 'string' ? req.query.bookId : undefined);
   if (!book) {
@@ -2847,7 +3372,7 @@ app.get('/api/number-requests', requireAuth, (req, res) => {
   res.json({ requests: list });
 });
 
-app.post('/api/number-requests', requireAuth, (req, res) => {
+app.post('/api/number-requests', requireAuth, async (req, res) => {
   const currentUser = (req as any).user as User;
   const { bookId, typeCode, docName, title, signer, signerRole, notes } = req.body || {};
   const targetBook = getBookById(bookId);
@@ -2895,7 +3420,7 @@ app.post('/api/number-requests', requireAuth, (req, res) => {
   };
 
   db.numberRequests.unshift(newReq);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('number_requests_updated', { bookId: targetBook.id, request: newReq });
   res.json({ request: newReq, success: true });
 });
@@ -2922,10 +3447,11 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
   let issuedDocForSync: DocumentRecord | null = null;
   const releaseLock = await atomicLock.acquire();
   try {
-    reloadDatabaseFromDiskIfNewer();
+    await ensureLatestDb({ maxAgeMs: 0 });
+    const lockedBook = getBookById(reqItem.bookId);
     const { year, formattedDate } = getRequestVietnamTimeInfo(req);
     const canonicalReqType = resolveCanonicalTypeCode(reqItem.typeCode, db.documentTypes);
-    const seriesState = computeSeriesSequenceState(targetBook, year, canonicalReqType);
+    const seriesState = computeSeriesSequenceState(lockedBook, year, canonicalReqType);
     const nextSeq = seriesState.nextExpectedSeq;
 
     const seqStr = formatSequenceNumber(nextSeq);
@@ -3001,7 +3527,7 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
 
     db.documents.unshift(newDocument);
     db.idempotencyKeys[newDocument.idempotencyKey] = docId;
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db, { verifyWrite: true });
 
     broadcastSSE('document_issued', { document: newDocument });
     broadcastSSE('number_requests_updated', { bookId: targetBook.id, request: reqItem });
@@ -3025,7 +3551,7 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/number-requests/:id/reject', requireAuth, (req, res) => {
+app.post('/api/number-requests/:id/reject', requireAuth, async (req, res) => {
   const { id } = req.params;
   const { reason } = req.body || {};
   const currentUser = (req as any).user as User;
@@ -3049,7 +3575,7 @@ app.post('/api/number-requests/:id/reject', requireAuth, (req, res) => {
   reqItem.rejectReason = typeof reason === 'string' && reason.trim() ? reason.trim() : 'Không được duyệt';
   reqItem.reviewedBy = currentUser.fullName;
   reqItem.reviewedAt = new Date().toISOString();
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('number_requests_updated', { bookId: targetBook.id, request: reqItem });
   res.json({ request: reqItem, success: true });
 });
@@ -3090,7 +3616,7 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
   const releaseLock = await atomicLock.acquire();
 
   try {
-    reloadDatabaseFromDiskIfNewer();
+    await ensureLatestDb({ maxAgeMs: 0 });
 
     const targetBook = getBookById(bookId);
     const freshUser = db.users.find((u) => u.id === currentUser.id);
@@ -3311,7 +3837,7 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     db.documents.unshift(newDocument);
     db.idempotencyKeys[idempotencyKey] = docId;
 
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db, { verifyWrite: true });
 
     const nextPreview = buildPreviewResponseForSeries(
       targetBook,
@@ -3450,7 +3976,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
         doc.driveFileSize = file.size;
         doc.driveError =
           driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.';
-        saveDatabaseSync(db);
+        await saveDatabasePersistent(db);
         broadcastSSE('document_updated', { document: doc });
       }
       throw new Error(driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.');
@@ -3461,7 +3987,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
       doc.driveFileName = targetOverrideName;
       doc.driveOriginalFileName = file.originalname;
       doc.driveFileSize = file.size;
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
     }
 
     try {
@@ -3509,7 +4035,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
           : 'Tải lên tệp Word đính kèm vào Google Drive',
       });
 
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
       broadcastSSE('document_updated', { document: doc });
       await syncToGoogleSheets(doc, 'update');
       return doc;
@@ -3520,7 +4046,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
         doc.driveOriginalFileName = file.originalname;
         doc.driveFileSize = file.size;
         doc.driveError = err.message || 'Lỗi không xác định khi tải tệp lên Google Drive.';
-        saveDatabaseSync(db);
+        await saveDatabasePersistent(db);
         broadcastSSE('document_updated', { document: doc });
       }
       throw err;
@@ -3868,7 +4394,7 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
 
     db.documents.unshift(newDocument);
     db.idempotencyKeys[idempotencyKey] = docId;
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
 
     broadcastSSE('document_issued', { document: newDocument });
     await syncToGoogleSheets(newDocument, 'create');
@@ -3886,7 +4412,7 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
   if (!driveCfg.isConfigured) {
     createdDoc.driveStatus = 'failed';
     createdDoc.driveError = driveCfg.missingReason || 'Chưa cấu hình thư mục Google Drive hợp lệ.';
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('document_updated', { document: createdDoc });
     return res.json({
       document: createdDoc,
@@ -3932,7 +4458,7 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
       reason: 'Lưu bản PDF gốc lên thư mục Google Drive',
     });
 
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('document_updated', { document: createdDoc });
     await syncToGoogleSheets(createdDoc, 'update');
     stagedPdfs.delete(stageToken);
@@ -3944,7 +4470,7 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
   } catch (err: any) {
     createdDoc.driveStatus = 'failed';
     createdDoc.driveError = err.message || 'Lỗi kết nối khi lưu tệp PDF lên Google Drive.';
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('document_updated', { document: createdDoc });
     return res.json({
       document: createdDoc,
@@ -4062,7 +4588,7 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
         doc.driveStatus = 'failed';
         doc.driveFileName = targetOverrideName;
         doc.driveError = driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.';
-        saveDatabaseSync(db);
+        await saveDatabasePersistent(db);
         broadcastSSE('document_updated', { document: doc });
       }
       throw new Error(driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.');
@@ -4073,7 +4599,7 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
       doc.driveFileName = targetOverrideName;
       doc.driveOriginalFileName = originalName;
       doc.driveFileSize = pdfBuffer.length;
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
     }
 
     try {
@@ -4121,7 +4647,7 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
           : 'Thử lưu lại tệp PDF vào Google Drive',
       });
 
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
       broadcastSSE('document_updated', { document: doc });
       await syncToGoogleSheets(doc, 'update');
       if (stageToken) stagedPdfs.delete(stageToken);
@@ -4131,7 +4657,7 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
         doc.driveStatus = 'failed';
         doc.driveFileName = targetOverrideName;
         doc.driveError = err.message || 'Lỗi kết nối Google Drive.';
-        saveDatabaseSync(db);
+        await saveDatabasePersistent(db);
         broadcastSSE('document_updated', { document: doc });
       }
       throw err;
@@ -4153,8 +4679,8 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
 });
 
 // 8. Sổ Theo Dõi - Danh sách văn bản theo quyền Xem từng sổ
-app.get('/api/documents', requireAuth, (req, res) => {
-  reloadDatabaseFromDiskIfNewer();
+app.get('/api/documents', requireAuth, async (req, res) => {
+  await ensureLatestDb({ maxAgeMs: 0 });
   const currentUser = (req as any).user as User;
   const {
     bookId,
@@ -4469,7 +4995,7 @@ app.put('/api/documents/:id', requireAuth, async (req, res) => {
     if (doc.syncStatus === 'synced') {
       doc.syncStatus = 'pending';
     }
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('document_updated', { document: doc });
     await syncToGoogleSheets(doc, 'update');
   }
@@ -4507,43 +5033,45 @@ app.delete('/api/documents/:id', requireAuth, async (req, res) => {
 
   const releaseLock = await atomicLock.acquire();
   try {
+    await ensureLatestDb({ maxAgeMs: 0 });
     const lockedDoc = db.documents.find((d) => d.id === id);
     if (!lockedDoc || lockedDoc.status === 'deleted') {
       return res.status(400).json({ error: 'Văn bản này đã được xóa trước đó.' });
     }
 
+    const lockedBook = getBookById(getDocBookId(lockedDoc));
     const prevStatus = lockedDoc.status;
-    const deletedSnapshot = buildDocumentSnapshot(doc, targetBook);
+    const deletedSnapshot = buildDocumentSnapshot(lockedDoc, lockedBook);
     const nowIso = new Date().toISOString();
     const nowVn = formatVietnamDateTime(new Date(nowIso));
 
-    doc.status = 'deleted';
-    doc.deleteReason = cleanReason;
-    doc.deletedAt = nowIso;
-    doc.deletedAtVietnam = nowVn;
-    doc.deletedBy = `${currentUser.fullName} (${currentUser.username})`;
-    doc.deletedByUsername = currentUser.username;
-    doc.deletedByUserId = currentUser.id;
-    doc.deletedSnapshot = deletedSnapshot;
-    doc.excelMovedToDeletedSheet = false;
-    doc.excelRemovedFromMainSheet = false;
-    delete doc.excelSyncError;
-    delete doc.excelSyncedAt;
-    doc.excelSyncTargets = {};
+    lockedDoc.status = 'deleted';
+    lockedDoc.deleteReason = cleanReason;
+    lockedDoc.deletedAt = nowIso;
+    lockedDoc.deletedAtVietnam = nowVn;
+    lockedDoc.deletedBy = `${currentUser.fullName} (${currentUser.username})`;
+    lockedDoc.deletedByUsername = currentUser.username;
+    lockedDoc.deletedByUserId = currentUser.id;
+    lockedDoc.deletedSnapshot = deletedSnapshot;
+    lockedDoc.excelMovedToDeletedSheet = false;
+    lockedDoc.excelRemovedFromMainSheet = false;
+    delete lockedDoc.excelSyncError;
+    delete lockedDoc.excelSyncedAt;
+    lockedDoc.excelSyncTargets = {};
 
-    const hasExcelTargets = getGoogleSheetsTargets(targetBook).length > 0;
-    doc.excelDeleteSyncStatus = hasExcelTargets ? 'pending' : 'not_configured';
+    const hasExcelTargets = getGoogleSheetsTargets(lockedBook).length > 0;
+    lockedDoc.excelDeleteSyncStatus = hasExcelTargets ? 'pending' : 'not_configured';
 
     recordDocumentHistoryEntry({
-      doc,
-      book: targetBook,
+      doc: lockedDoc,
+      book: lockedBook,
       actor: currentUser,
       action: 'delete',
       changes: {
         status: { old: prevStatus, new: 'deleted' },
         deleteReason: { old: null, new: cleanReason },
-        ...(doc.driveFileId
-          ? { driveFilePreserved: { old: doc.driveFileName || doc.driveFileId, new: doc.driveFileName || doc.driveFileId } }
+        ...(lockedDoc.driveFileId
+          ? { driveFilePreserved: { old: lockedDoc.driveFileName || lockedDoc.driveFileId, new: lockedDoc.driveFileName || lockedDoc.driveFileId } }
           : {}),
       },
       reason: cleanReason,
@@ -4551,24 +5079,24 @@ app.delete('/api/documents/:id', requireAuth, async (req, res) => {
       snapshot: deletedSnapshot,
     });
 
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
 
-    const syncResult = await syncDeletedDocumentToOnlineExcel(doc, targetBook);
+    const syncResult = await syncDeletedDocumentToOnlineExcel(lockedDoc, lockedBook);
 
     broadcastSSE('document_deleted', {
-      id: doc.id,
-      fullDocNumber: doc.fullDocNumber,
-      document: doc,
+      id: lockedDoc.id,
+      fullDocNumber: lockedDoc.fullDocNumber,
+      document: lockedDoc,
     });
 
     res.json({
       success: true,
-      document: doc,
+      document: lockedDoc,
       excelSync: syncResult,
       message:
         syncResult.attempted && !syncResult.ok
-          ? `Đã xóa văn bản ${doc.fullDocNumber} trên hệ thống (Chờ đồng bộ Excel: ${syncResult.error || 'Lỗi kết nối'})`
-          : `Đã xóa văn bản ${doc.fullDocNumber} và chuyển vào mục VB đã xóa`,
+          ? `Đã xóa văn bản ${lockedDoc.fullDocNumber} trên hệ thống (Chờ đồng bộ Excel: ${syncResult.error || 'Lỗi kết nối'})`
+          : `Đã xóa văn bản ${lockedDoc.fullDocNumber} và chuyển vào mục VB đã xóa`,
     });
   } finally {
     releaseLock();
@@ -4613,7 +5141,7 @@ app.post('/api/documents/:id/retry-excel-sync', requireAuth, async (req, res) =>
           ? 'Thử đồng bộ lại chuyển dòng sang sheet VB đã xóa thành công'
           : `Thử đồng bộ lại Excel chưa thành công: ${result.error || 'Lỗi kết nối'}`,
       });
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
       broadcastSSE('document_updated', { document: doc });
 
       if (!result.ok) {
@@ -4642,7 +5170,7 @@ app.post('/api/documents/:id/retry-excel-sync', requireAuth, async (req, res) =>
       },
       reason: result.ok ? 'Thử đồng bộ lại Excel thành công' : `Đồng bộ lại thất bại: ${result.error || ''}`,
     });
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('document_updated', { document: doc });
 
     if (!result.ok) {
@@ -4710,7 +5238,7 @@ app.post('/api/documents/:id/cancel', requireAuth, async (req, res) => {
     doc.syncStatus = 'pending';
   }
 
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('document_cancelled', { document: doc });
   await syncToGoogleSheets(doc, 'cancel');
   res.json({ document: doc });
@@ -5267,7 +5795,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
 });
 
 // 11. Cấu hình & Đồng bộ Microsoft Graph (OneDrive / SharePoint)
-app.post('/api/sync/config', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/sync/config', requireAuth, requireAdmin, async (req, res) => {
   const { enabled, tenantId, clientId, clientSecret, driveId, filePath, tableName } = req.body;
 
   const nextSecret =
@@ -5286,7 +5814,7 @@ app.post('/api/sync/config', requireAuth, requireAdmin, (req, res) => {
     lastSyncTime: db.settings.msGraphConfig.lastSyncTime,
   };
 
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   res.json({
     msGraphConfig: {
@@ -5384,7 +5912,7 @@ app.post('/api/sync/sync-all', requireAuth, requireAdmin, async (req, res) => {
     }
 
     db.settings.msGraphConfig.lastSyncTime = new Date().toISOString();
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('sync_completed', { syncedCount: pendingDocs.length });
 
     res.json({
@@ -5397,7 +5925,7 @@ app.post('/api/sync/sync-all', requireAuth, requireAdmin, async (req, res) => {
       d.syncStatus = 'error';
       d.syncError = err.message || 'Lỗi kết nối Microsoft Graph';
     }
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     res.status(500).json({
       error: 'Đồng bộ thất bại: ' + err.message,
     });
@@ -5405,7 +5933,7 @@ app.post('/api/sync/sync-all', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // 12. Cấu hình & Đồng bộ Google Sheets Webhook (Cách đồng bộ dễ nhất cho trường học)
-app.post('/api/sync/google-sheets/config', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/sync/google-sheets/config', requireAuth, requireAdmin, async (req, res) => {
   const { enabled, webhookUrl } = req.body;
   if (!db.settings.googleSheetsConfig) {
     db.settings.googleSheetsConfig = { enabled: false, webhookUrl: '', lastSyncTime: '' };
@@ -5413,7 +5941,7 @@ app.post('/api/sync/google-sheets/config', requireAuth, requireAdmin, (req, res)
 
   db.settings.googleSheetsConfig.enabled = Boolean(enabled);
   db.settings.googleSheetsConfig.webhookUrl = webhookUrl ? webhookUrl.trim() : '';
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   res.json({ googleSheetsConfig: db.settings.googleSheetsConfig });
 });
@@ -5468,7 +5996,7 @@ app.post('/api/sync/google-sheets/test', requireAuth, requireAdmin, async (req, 
 
     if (cfg) {
       cfg.lastSyncTime = new Date().toISOString();
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
     }
 
     res.json({
@@ -5511,7 +6039,7 @@ app.post('/api/sync/google-sheets/sync-all', requireAuth, requireAdmin, async (r
     if (cfg && cfg.enabled) {
       cfg.lastSyncTime = new Date().toISOString();
     }
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
 
     res.json({
       success: true,
@@ -5525,7 +6053,7 @@ app.post('/api/sync/google-sheets/sync-all', requireAuth, requireAdmin, async (r
 });
 
 // Tùy chọn Google Sheets riêng cho từng sổ (để đơn vị tự chia sẻ file riêng ngoài file tổng Admin)
-app.post('/api/books/:id/google-sheets', requireAuth, (req, res) => {
+app.post('/api/books/:id/google-sheets', requireAuth, async (req, res) => {
   const currentUser = (req as any).user as User;
   const targetBook = db.books.find((b) => b.id === req.params.id);
   if (!targetBook) {
@@ -5544,7 +6072,7 @@ app.post('/api/books/:id/google-sheets', requireAuth, (req, res) => {
     lastSyncTime: targetBook.googleSheetsConfig?.lastSyncTime || '',
   };
   bumpBookVersion(targetBook);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('books_updated', {
     bookId: targetBook.id,
     configVersion: targetBook.configVersion,
@@ -5554,7 +6082,7 @@ app.post('/api/books/:id/google-sheets', requireAuth, (req, res) => {
 });
 
 // 13. Cấu hình & Kiểm tra kết nối Lưu trữ Google Drive (Theo sổ hoặc mặc định hệ thống)
-app.post('/api/drive/config', requireAuth, (req, res) => {
+app.post('/api/drive/config', requireAuth, async (req, res) => {
   const currentUser = (req as any).user as User;
   const {
     bookId,
@@ -5655,7 +6183,7 @@ app.post('/api/drive/config', requireAuth, (req, res) => {
       serviceAccountEmail: nextSaEmail,
     };
     bumpBookVersion(targetBook);
-    saveDatabaseSync(db);
+    await saveDatabasePersistent(db);
     broadcastSSE('books_updated', {
       bookId: targetBook.id,
       configVersion: targetBook.configVersion,
@@ -5698,7 +6226,7 @@ app.post('/api/drive/config', requireAuth, (req, res) => {
 
   db.settings.googleDriveConfig = updatedConfig;
   bumpBookVersion(targetBook);
-  saveDatabaseSync(db);
+  await saveDatabasePersistent(db);
   broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
   broadcastSSE('books_updated', {
     bookId: targetBook.id,
@@ -5757,7 +6285,7 @@ app.post('/api/drive/test', requireAuth, async (req, res) => {
       if (result.success && result.folderName && result.folderId === targetBook.googleDriveConfig.folderId) {
         targetBook.googleDriveConfig.folderName = result.folderName;
       }
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
       broadcastSSE('books_updated', { bookId: targetBook.id });
     } else if (db.settings.googleDriveConfig) {
       db.settings.googleDriveConfig.lastCheckedAt = new Date().toISOString();
@@ -5769,7 +6297,7 @@ app.post('/api/drive/test', requireAuth, async (req, res) => {
           db.settings.googleDriveConfig.folderByUnit[db.settings.unitCode].folderName = result.folderName;
         }
       }
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
       broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
       broadcastSSE('books_updated', { bookId: targetBook.id });
     }
@@ -5792,12 +6320,12 @@ app.post('/api/drive/test', requireAuth, async (req, res) => {
       targetBook.googleDriveConfig.lastCheckedAt = new Date().toISOString();
       targetBook.googleDriveConfig.lastCheckStatus = 'error';
       targetBook.googleDriveConfig.lastCheckMessage = msg;
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
     } else if (db.settings.googleDriveConfig) {
       db.settings.googleDriveConfig.lastCheckedAt = new Date().toISOString();
       db.settings.googleDriveConfig.lastCheckStatus = 'error';
       db.settings.googleDriveConfig.lastCheckMessage = msg;
-      saveDatabaseSync(db);
+      await saveDatabasePersistent(db);
     }
     res.status(500).json({
       success: false,

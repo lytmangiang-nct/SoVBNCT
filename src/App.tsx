@@ -11,6 +11,7 @@ import type {
   DocumentRecord,
   DocumentTypeConfig,
   NumberRequest,
+  PersistenceStatus,
   RegistryBook,
   SignerConfig,
   SystemSettings,
@@ -87,6 +88,8 @@ export default function App() {
   const [settingsLoaded, setSettingsLoaded] = useState<boolean>(false);
   const [lastSyncAt, setLastSyncAt] = useState<Date | null>(null);
   const [syncError, setSyncError] = useState<string | null>(null);
+  const [persistenceStatus, setPersistenceStatus] = useState<PersistenceStatus | null>(null);
+  const [legacyReconciliationWarnings, setLegacyReconciliationWarnings] = useState<string[]>([]);
   const syncInFlightRef = React.useRef<boolean>(false);
 
   // Live Toast Notification
@@ -126,6 +129,8 @@ export default function App() {
     const handleExpired = () => {
       setCurrentUser(null);
       setSettingsLoaded(false);
+      setPersistenceStatus(null);
+      setLegacyReconciliationWarnings([]);
       setBooks([]);
       setDocuments([]);
       setDeletedDocuments([]);
@@ -198,6 +203,10 @@ export default function App() {
       setDeletedDocuments(deletedDocsRes.documents);
       setBooks(booksRes.books);
       setNumberRequests(reqsRes.requests);
+      if (settingsRes.persistenceStatus) {
+        setPersistenceStatus(settingsRes.persistenceStatus);
+      }
+      setLegacyReconciliationWarnings(settingsRes.legacyReconciliationWarnings || []);
       applyServerTime(settingsRes.serverTimeVietnam || booksRes.serverTimeVietnam);
 
       setSettingsLoaded(true);
@@ -205,6 +214,9 @@ export default function App() {
       setLastSyncAt(new Date());
     } catch (err: any) {
       console.error('Lỗi khi tải dữ liệu ứng dụng:', err);
+      if (err?.persistenceStatus) {
+        setPersistenceStatus(err.persistenceStatus);
+      }
       if (err?.status !== 401) {
         setSyncError(err?.message || 'Không thể đồng bộ dữ liệu mới nhất từ máy chủ.');
       }
@@ -476,6 +488,8 @@ export default function App() {
     setSettingsLoaded(false);
     setLastSyncAt(null);
     setSyncError(null);
+    setPersistenceStatus(null);
+    setLegacyReconciliationWarnings([]);
     setBooks([]);
     setDocuments([]);
     setDeletedDocuments([]);
@@ -782,6 +796,8 @@ export default function App() {
                 serverYear={serverYear}
                 configLoaded={settingsLoaded}
                 syncError={syncError}
+                persistenceStatus={persistenceStatus}
+                legacyReconciliationWarnings={legacyReconciliationWarnings}
                 onSettingsUpdated={(newSettings) => setSettings(newSettings)}
                 onBooksUpdated={refreshBooks}
                 onRefreshData={loadAppData}
