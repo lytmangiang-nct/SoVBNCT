@@ -68,7 +68,12 @@ import {
   validatePdfFileBuffer,
   validateWordFileBuffer,
 } from './server/googleDrive.js';
-import { analyzePdfBuffer, fetchPdfFromUrl } from './server/pdfExtractor.js';
+import {
+  PdfUrlFetchError,
+  analyzePdfBuffer,
+  fetchPdfFromUrl,
+  getServerPdfWorkerDiagnostics,
+} from './server/pdfExtractor.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -5079,36 +5084,47 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
   const file = req.file;
   const rawUrl = typeof req.body?.url === 'string' ? req.body.url.trim() : '';
   const targetBook = getBookById(typeof req.body?.bookId === 'string' ? req.body.bookId : undefined);
+  const requestId =
+    (typeof req.headers['x-vercel-id'] === 'string' && req.headers['x-vercel-id'].trim()) ||
+    (typeof req.headers['x-request-id'] === 'string' && req.headers['x-request-id'].trim()) ||
+    `pdfreq-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+  res.setHeader('X-Request-Id', requestId);
 
   if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_incoming')) {
     return res.status(403).json({
       error: `Bạn chưa được phân quyền "Nhập văn bản đến" trong ${targetBook.name}.`,
+      requestId,
     });
   }
 
+  let originalFileName = file?.originalname || '';
+  let sourceType: 'pdf_url' | 'pdf_upload' | 'unknown' = file ? 'pdf_upload' : rawUrl ? 'pdf_url' : 'unknown';
+
   try {
     let buffer: Buffer;
-    let originalFileName = '';
-    let sourceType: 'pdf_url' | 'pdf_upload';
+    let resolvedSourceType: 'pdf_url' | 'pdf_upload';
     let sourceUrl: string | undefined;
 
     if (file) {
       const validation = validatePdfFileBuffer(file.originalname, file.mimetype, file.buffer);
       if (!validation.valid) {
-        return res.status(400).json({ error: validation.error });
+        return res.status(400).json({ error: validation.error, requestId });
       }
       buffer = file.buffer;
       originalFileName = file.originalname || 'van-ban.pdf';
-      sourceType = 'pdf_upload';
+      resolvedSourceType = 'pdf_upload';
+      sourceType = resolvedSourceType;
     } else if (rawUrl) {
       const fetched = await fetchPdfFromUrl(rawUrl);
       buffer = fetched.buffer;
       originalFileName = fetched.fileName;
-      sourceType = 'pdf_url';
+      resolvedSourceType = 'pdf_url';
+      sourceType = resolvedSourceType;
       sourceUrl = rawUrl;
     } else {
       return res.status(400).json({
         error: 'Vui lòng dán đường dẫn PDF hoặc chọn tệp PDF từ máy để phân tích.',
+        requestId,
       });
     }
 
@@ -5140,7 +5156,7 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
       buffer,
       sha256,
       originalFileName,
-      sourceType,
+      sourceType: resolvedSourceType,
       sourceUrl,
       userId: currentUser.id,
       createdAt: Date.now(),
@@ -5152,7 +5168,7 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
       sha256,
       fileSize: buffer.length,
       originalFileName,
-      sourceType,
+      sourceType: resolvedSourceType,
       sourceUrl,
       extraction,
       duplicateDocument,
@@ -5161,9 +5177,38 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
 
     return res.json(payload);
   } catch (err: any) {
-    console.error('[PDF Analyze] Lỗi phân tích PDF:', err);
-    return res.status(400).json({
-      error: err.message || 'Không thể đọc hoặc phân tích tệp PDF.',
+    if (err instanceof PdfUrlFetchError) {
+      console.warn(`[PDF Analyze][requestId=${requestId}] Lỗi tải PDF từ URL:`, {
+        requestId,
+        bookId: targetBook.id,
+        userId: currentUser.id,
+        message: err.message,
+      });
+      return res.status(err.statusCode || 400).json({
+        error: err.message,
+        code: 'PDF_URL_FETCH_FAILED',
+        requestId,
+      });
+    }
+
+    const diag = getServerPdfWorkerDiagnostics();
+    console.error(`[PDF Analyze][requestId=${requestId}] Lỗi kỹ thuật khi đọc PDF:`, {
+      requestId,
+      sourceType,
+      originalFileName,
+      bookId: targetBook.id,
+      userId: currentUser.id,
+      pdfjsVersion: diag.pdfjsVersion,
+      workerExists: diag.workerExists,
+      workerPath: diag.workerPath,
+      errorName: err?.name,
+      errorMessage: err?.message,
+      stack: err?.stack,
+    });
+    return res.status(500).json({
+      error: 'Chưa đọc được PDF. Vui lòng thử lại.',
+      code: 'PDF_READ_FAILED',
+      requestId,
     });
   }
 });

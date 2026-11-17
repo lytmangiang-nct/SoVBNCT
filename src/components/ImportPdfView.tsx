@@ -70,8 +70,21 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<PdfAnalyzeResponse | null>(null);
+  const [localFilePreviewUrl, setLocalFilePreviewUrl] = useState<string | null>(null);
   const [jumpToPage, setJumpToPage] = useState<number | null>(null);
   const [highlightBox, setHighlightBox] = useState<PdfHighlightTarget | null>(null);
+
+  useEffect(() => {
+    if (analysis?.sourceType === 'pdf_upload' && selectedPdfFile) {
+      const objectUrl = URL.createObjectURL(selectedPdfFile);
+      setLocalFilePreviewUrl(objectUrl);
+      return () => {
+        URL.revokeObjectURL(objectUrl);
+      };
+    }
+    setLocalFilePreviewUrl(null);
+    return undefined;
+  }, [analysis?.stageToken, analysis?.sourceType, selectedPdfFile]);
 
   // Mobile responsive view toggle while preserving form edits
   const [activeMobilePane, setActiveMobilePane] = useState<'form' | 'pdf'>('form');
@@ -230,8 +243,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     );
   };
 
-  const handleAnalyzeUrl = async (e: React.FormEvent) => {
-    e.preventDefault();
+  const runAnalyzeUrl = async () => {
     if (!pdfUrlInput.trim() || analyzing) return;
     setAnalyzing(true);
     setAnalyzeError(null);
@@ -239,14 +251,24 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       const res = await api.analyzePdfUrl(pdfUrlInput.trim(), activeBook.id);
       applyAnalysisResult(res);
     } catch (err: any) {
-      setAnalyzeError(err.message || 'Không thể tải và phân tích PDF từ đường dẫn.');
+      const msg =
+        err?.code === 'PDF_READ_FAILED' || (typeof err?.status === 'number' && err.status >= 500)
+          ? 'Chưa đọc được PDF. Vui lòng thử lại.'
+          : err?.message || 'Chưa đọc được PDF. Vui lòng thử lại.';
+      setAnalyzeError(msg);
     } finally {
       setAnalyzing(false);
     }
   };
 
+  const handleAnalyzeUrl = async (e: React.FormEvent) => {
+    e.preventDefault();
+    await runAnalyzeUrl();
+  };
+
   const handleAnalyzeFile = async (file: File) => {
     setAnalyzeError(null);
+    setSelectedPdfFile(file);
     if (!file.name.toLowerCase().endsWith('.pdf')) {
       setAnalyzeError('Chỉ hỗ trợ tệp định dạng .pdf.');
       return;
@@ -262,13 +284,16 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       return;
     }
 
-    setSelectedPdfFile(file);
     setAnalyzing(true);
     try {
       const res = await api.analyzePdfFile(file, activeBook.id);
       applyAnalysisResult(res);
     } catch (err: any) {
-      setAnalyzeError(err.message || 'Không thể đọc và trích xuất thông tin từ tệp PDF.');
+      const msg =
+        err?.code === 'PDF_READ_FAILED' || (typeof err?.status === 'number' && err.status >= 500)
+          ? 'Chưa đọc được PDF. Vui lòng thử lại.'
+          : err?.message || 'Chưa đọc được PDF. Vui lòng thử lại.';
+      setAnalyzeError(msg);
     } finally {
       setAnalyzing(false);
     }
@@ -696,6 +721,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 className="hidden"
                 onChange={(e) => {
                   const f = e.target.files?.[0];
+                  e.target.value = '';
                   if (f) handleAnalyzeFile(f);
                 }}
               />
@@ -738,18 +764,42 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
                 <span>{analyzeError}</span>
               </div>
-              {inputMode === 'url' && (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setInputMode('file');
-                    setAnalyzeError(null);
-                  }}
-                  className="px-3 py-1.5 bg-white hover:bg-rose-100 border border-rose-300 text-rose-800 font-semibold rounded-md shrink-0"
-                >
-                  Chuyển sang Tải PDF từ máy
-                </button>
-              )}
+              <div className="flex flex-wrap items-center gap-2 shrink-0">
+                {inputMode === 'file' && selectedPdfFile && (
+                  <button
+                    type="button"
+                    disabled={analyzing}
+                    onClick={() => handleAnalyzeFile(selectedPdfFile)}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Thử lại</span>
+                  </button>
+                )}
+                {inputMode === 'url' && pdfUrlInput.trim() && (
+                  <button
+                    type="button"
+                    disabled={analyzing}
+                    onClick={() => runAnalyzeUrl()}
+                    className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md"
+                  >
+                    <RefreshCw className="w-3.5 h-3.5" />
+                    <span>Thử lại</span>
+                  </button>
+                )}
+                {inputMode === 'url' && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setInputMode('file');
+                      setAnalyzeError(null);
+                    }}
+                    className="px-3 py-1.5 bg-white hover:bg-rose-100 border border-rose-300 text-rose-800 font-semibold rounded-md"
+                  >
+                    Chuyển sang Tải PDF từ máy
+                  </button>
+                )}
+              </div>
             </div>
           )}
         </div>
@@ -918,7 +968,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </div>
               )}
               <PdfPreviewPane
-                pdfUrl={api.getStagedPdfUrl(analysis.stageToken)}
+                pdfUrl={localFilePreviewUrl || api.getStagedPdfUrl(analysis.stageToken)}
                 fileName={analysis.originalFileName}
                 relevantPages={analysis.extraction.relevantPages}
                 jumpToPage={jumpToPage}

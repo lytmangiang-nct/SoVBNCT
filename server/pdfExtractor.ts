@@ -2,7 +2,9 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { createRequire } from 'module';
 import { execFile } from 'child_process';
+import { pathToFileURL } from 'url';
 import { promisify } from 'util';
 import type {
   ExtractableFieldKey,
@@ -18,6 +20,16 @@ import {
 import { normalizeDateOnlyDdMmYyyy, removeVietnameseDiacritics } from '../src/utils/fileNaming.js';
 
 const execFileAsync = promisify(execFile);
+const requireFromHere = createRequire(import.meta.url);
+
+export class PdfUrlFetchError extends Error {
+  public readonly statusCode: number;
+  constructor(message: string, statusCode = 400) {
+    super(message);
+    this.name = 'PdfUrlFetchError';
+    this.statusCode = statusCode;
+  }
+}
 
 interface NormalizedBox {
   text: string;
@@ -93,17 +105,19 @@ export async function fetchPdfFromUrl(rawUrl: string): Promise<{
   try {
     parsed = new URL((rawUrl || '').trim());
   } catch {
-    throw new Error('Đường dẫn PDF không đúng định dạng URL (cần bắt đầu bằng http:// hoặc https://).');
+    throw new PdfUrlFetchError(
+      'Đường dẫn PDF không đúng định dạng URL (cần bắt đầu bằng http:// hoặc https://).'
+    );
   }
 
   if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
-    throw new Error('Chỉ hỗ trợ đường dẫn giao thức http:// hoặc https://.');
+    throw new PdfUrlFetchError('Chỉ hỗ trợ đường dẫn giao thức http:// hoặc https://.');
   }
 
   // Chặn truy cập metadata nội bộ đám mây
   const blockedHosts = ['169.254.169.254', 'metadata.google.internal', 'metadata.goog'];
   if (blockedHosts.includes(parsed.hostname.toLowerCase())) {
-    throw new Error('Đường dẫn không hợp lệ hoặc bị từ chối vì lý do bảo mật.');
+    throw new PdfUrlFetchError('Đường dẫn không hợp lệ hoặc bị từ chối vì lý do bảo mật.');
   }
 
   const targetUrl = normalizeUrlForPdfFetch(parsed.toString());
@@ -124,12 +138,12 @@ export async function fetchPdfFromUrl(rawUrl: string): Promise<{
     });
 
     if (res.status === 401 || res.status === 403) {
-      throw new Error(
+      throw new PdfUrlFetchError(
         `Đường dẫn yêu cầu đăng nhập hoặc không có quyền truy cập (HTTP ${res.status}). Vui lòng tải tệp PDF về máy và dùng cách "Tải PDF từ máy".`
       );
     }
     if (!res.ok) {
-      throw new Error(
+      throw new PdfUrlFetchError(
         `Không thể tải tệp từ đường dẫn (HTTP ${res.status}). Vui lòng kiểm tra lại liên kết hoặc tải PDF về máy để nhập thủ công.`
       );
     }
@@ -138,19 +152,19 @@ export async function fetchPdfFromUrl(rawUrl: string): Promise<{
     if (contentLengthHeader) {
       const expectedLen = parseInt(contentLengthHeader, 10);
       if (Number.isFinite(expectedLen) && expectedLen > maxBytes) {
-        throw new Error(`Dung lượng tệp PDF từ đường dẫn vượt quá giới hạn tối đa ${maxMB} MB.`);
+        throw new PdfUrlFetchError(`Dung lượng tệp PDF từ đường dẫn vượt quá giới hạn tối đa ${maxMB} MB.`);
       }
     }
 
     const contentType = (res.headers.get('content-type') || '').toLowerCase();
     if (contentType.includes('text/html')) {
-      throw new Error(
+      throw new PdfUrlFetchError(
         'Đường dẫn trả về trang web hoặc trang đăng nhập thay vì tệp PDF trực tiếp. Vui lòng tải tệp PDF về máy rồi dùng cách "Tải PDF từ máy".'
       );
     }
 
     if (!res.body) {
-      throw new Error('Máy chủ nguồn không trả về dữ liệu tệp.');
+      throw new PdfUrlFetchError('Máy chủ nguồn không trả về dữ liệu tệp.');
     }
 
     const reader = res.body.getReader();
@@ -164,7 +178,7 @@ export async function fetchPdfFromUrl(rawUrl: string): Promise<{
         totalBytes += value.byteLength;
         if (totalBytes > maxBytes) {
           controller.abort();
-          throw new Error(`Dung lượng tệp PDF từ đường dẫn vượt quá giới hạn tối đa ${maxMB} MB.`);
+          throw new PdfUrlFetchError(`Dung lượng tệp PDF từ đường dẫn vượt quá giới hạn tối đa ${maxMB} MB.`);
         }
         chunks.push(value);
       }
@@ -189,7 +203,7 @@ export async function fetchPdfFromUrl(rawUrl: string): Promise<{
 
     const validation = validatePdfFileBuffer(fileName, contentType, buffer);
     if (!validation.valid) {
-      throw new Error(
+      throw new PdfUrlFetchError(
         validation.error + ' Vui lòng kiểm tra lại đường dẫn hoặc tải tệp PDF về máy để nhập thủ công.'
       );
     }
@@ -200,12 +214,15 @@ export async function fetchPdfFromUrl(rawUrl: string): Promise<{
       finalUrl: res.url || targetUrl,
     };
   } catch (err: any) {
+    if (err instanceof PdfUrlFetchError) throw err;
     if (err?.name === 'AbortError') {
-      throw new Error(
+      throw new PdfUrlFetchError(
         'Quá thời gian tải PDF từ đường dẫn (20 giây). Vui lòng tải tệp PDF về máy và dùng cách "Tải PDF từ máy".'
       );
     }
-    throw err;
+    throw new PdfUrlFetchError(
+      err?.message || 'Không thể tải tệp PDF từ đường dẫn. Vui lòng kiểm tra lại liên kết hoặc tải PDF từ máy.'
+    );
   } finally {
     clearTimeout(timeout);
   }
@@ -427,18 +444,115 @@ async function detectHorizontalDividerYsFromPdfOps(
   return Array.from(new Set(dividerYs.map((y) => Math.round(y * 1000) / 1000))).sort((a, b) => a - b);
 }
 
+let serverPdfJsLoadPromise: Promise<{
+  pdfjs: any;
+  standardFontDataUrl?: string;
+  cMapUrl?: string;
+  workerResolvedPath: string;
+}> | null = null;
+
+export function getServerPdfWorkerDiagnostics(): {
+  workerPath: string;
+  workerExists: boolean;
+  standardFontsExists: boolean;
+  cmapsExists: boolean;
+  pdfjsVersion: string;
+} {
+  let workerPath = '';
+  let workerExists = false;
+  let standardFontsExists = false;
+  let cmapsExists = false;
+  let pdfjsVersion = '';
+  try {
+    workerPath = requireFromHere.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
+    workerExists = fs.existsSync(workerPath);
+  } catch {
+    workerPath = path.resolve(process.cwd(), 'node_modules/pdfjs-dist/legacy/build/pdf.worker.mjs');
+    workerExists = fs.existsSync(workerPath);
+  }
+  try {
+    const pkgPath = requireFromHere.resolve('pdfjs-dist/package.json');
+    const pkgDir = path.dirname(pkgPath);
+    pdfjsVersion = JSON.parse(fs.readFileSync(pkgPath, 'utf8'))?.version || '';
+    standardFontsExists = fs.existsSync(path.join(pkgDir, 'standard_fonts'));
+    cmapsExists = fs.existsSync(path.join(pkgDir, 'cmaps'));
+  } catch {
+    // ignore
+  }
+  return {
+    workerPath,
+    workerExists,
+    standardFontsExists,
+    cmapsExists,
+    pdfjsVersion,
+  };
+}
+
+async function loadServerPdfJs() {
+  if (!serverPdfJsLoadPromise) {
+    serverPdfJsLoadPromise = (async () => {
+      // Import tường minh cả pdf.mjs và pdf.worker.mjs cùng phiên bản để trình đóng gói Vercel (@vercel/nft)
+      // luôn theo dõi và đưa tệp worker vào gói Serverless Function (/var/task/node_modules/pdfjs-dist/legacy/build/)
+      const [pdfjs, pdfjsWorker] = await Promise.all([
+        import('pdfjs-dist/legacy/build/pdf.mjs'),
+        // @ts-ignore pdfjs-dist legacy worker module has no .d.mts declarations
+        import('pdfjs-dist/legacy/build/pdf.worker.mjs'),
+      ]);
+
+      // Cấu hình worker riêng cho runtime máy chủ (tách biệt hoàn toàn khỏi PdfPreviewPane phía trình duyệt)
+      if (pdfjsWorker?.WorkerMessageHandler) {
+        (globalThis as any).pdfjsWorker = pdfjsWorker;
+      }
+
+      let workerResolvedPath = '';
+      try {
+        workerResolvedPath = requireFromHere.resolve('pdfjs-dist/legacy/build/pdf.worker.mjs');
+        if (workerResolvedPath && fs.existsSync(workerResolvedPath) && pdfjs?.GlobalWorkerOptions) {
+          pdfjs.GlobalWorkerOptions.workerSrc = pathToFileURL(workerResolvedPath).href;
+        }
+      } catch {
+        // Fallback sử dụng globalThis.pdfjsWorker đã nạp trực tiếp ở trên
+      }
+
+      let standardFontDataUrl: string | undefined;
+      let cMapUrl: string | undefined;
+      try {
+        const pdfPkgDir = path.dirname(requireFromHere.resolve('pdfjs-dist/package.json'));
+        const fontsDir = path.join(pdfPkgDir, 'standard_fonts');
+        const cmapsDir = path.join(pdfPkgDir, 'cmaps');
+        if (fs.existsSync(fontsDir)) {
+          standardFontDataUrl = pathToFileURL(fontsDir + path.sep).href;
+        }
+        if (fs.existsSync(cmapsDir)) {
+          cMapUrl = pathToFileURL(cmapsDir + path.sep).href;
+        }
+      } catch {
+        // ignore optional font/cmap assets
+      }
+
+      return { pdfjs, standardFontDataUrl, cMapUrl, workerResolvedPath };
+    })().catch((err) => {
+      serverPdfJsLoadPromise = null;
+      throw err;
+    });
+  }
+  return serverPdfJsLoadPromise;
+}
+
 async function extractPdfTextWithPdfJs(buffer: Buffer): Promise<{
   pageCount: number;
   pages: PdfPageTextInfo[];
   rawSigDates: string[];
   rawSigSigners: string[];
 }> {
-  const pdfjs: any = await import('pdfjs-dist/legacy/build/pdf.mjs');
+  const { pdfjs, standardFontDataUrl, cMapUrl } = await loadServerPdfJs();
   const loadingTask = pdfjs.getDocument({
     data: new Uint8Array(buffer),
     verbosity: 0,
     useSystemFonts: true,
     isEvalSupported: false,
+    ...(standardFontDataUrl ? { standardFontDataUrl } : {}),
+    ...(cMapUrl ? { cMapUrl, cMapPacked: true } : {}),
   });
 
   const pdfDoc = await loadingTask.promise;
@@ -630,18 +744,59 @@ interface OcrPageResult {
   boxes: NormalizedBox[];
 }
 
+async function extractEmbeddedJpegFromPdfPage(
+  buffer: Buffer,
+  pageNumber: number
+): Promise<Buffer | null> {
+  try {
+    const { PDFDocument, PDFDict, PDFName, PDFRawStream } = await import('pdf-lib');
+    const doc = await PDFDocument.load(buffer, { ignoreEncryption: true });
+    const pages = doc.getPages();
+    const page = pages[pageNumber - 1];
+    if (!page) return null;
+    const resources = page.node.Resources();
+    if (!resources) return null;
+    const xObject = resources.lookup(PDFName.of('XObject'));
+    if (!(xObject instanceof PDFDict)) return null;
+
+    let bestJpeg: Buffer | null = null;
+    for (const [, val] of xObject.entries()) {
+      const resolved = doc.context.lookup(val);
+      if (resolved instanceof PDFRawStream) {
+        const subtype = resolved.dict.lookup(PDFName.of('Subtype'));
+        const filter = resolved.dict.lookup(PDFName.of('Filter'));
+        const isImage = subtype === PDFName.of('Image');
+        const filterText = filter?.toString?.() || '';
+        if (isImage && filterText.includes('DCTDecode') && resolved.contents.length > 0) {
+          const candidate = Buffer.from(resolved.contents);
+          if (!bestJpeg || candidate.length > bestJpeg.length) {
+            bestJpeg = candidate;
+          }
+        }
+      }
+    }
+    return bestJpeg;
+  } catch {
+    return null;
+  }
+}
+
 async function runVietnameseOcrOnPages(
   buffer: Buffer,
   pageNumbers: number[]
-): Promise<Map<number, OcrPageResult>> {
+): Promise<{
+  results: Map<number, OcrPageResult>;
+  ocrUnavailableReason?: string;
+}> {
   const results = new Map<number, OcrPageResult>();
-  if (pageNumbers.length === 0) return results;
+  if (pageNumbers.length === 0) return { results };
 
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nct-pdf-ocr-'));
   const pdfPath = path.join(tmpDir, 'input.pdf');
   fs.writeFileSync(pdfPath, buffer);
 
   let worker: any = null;
+  let ocrUnavailableReason: string | undefined;
   try {
     const { createWorker } = await import('tesseract.js');
     const langPath = path.resolve(process.cwd(), 'node_modules/@tesseract.js-data/vie/4.0.0');
@@ -652,11 +807,34 @@ async function runVietnameseOcrOnPages(
     worker = await createWorker('vie', 1, workerOpts);
 
     for (const p of pageNumbers) {
+      let imagePathToRecognize = '';
       const outPng = path.join(tmpDir, `page-${p}.png`);
-      await renderPdfPageToPng(pdfPath, p, outPng);
-      if (fs.existsSync(outPng)) {
-        const dims = getPngDimensions(outPng);
-        const ret = await worker.recognize(outPng, {}, { blocks: true });
+      try {
+        await renderPdfPageToPng(pdfPath, p, outPng);
+        if (fs.existsSync(outPng)) {
+          imagePathToRecognize = outPng;
+        }
+      } catch (renderErr: any) {
+        // Trên môi trường serverless không cài Ghostscript (gs), fallback trích ảnh JPEG nhúng trong trang scan
+        const jpegBuf = await extractEmbeddedJpegFromPdfPage(buffer, p);
+        if (jpegBuf) {
+          const outJpg = path.join(tmpDir, `page-${p}.jpg`);
+          fs.writeFileSync(outJpg, jpegBuf);
+          imagePathToRecognize = outJpg;
+        } else {
+          console.warn(
+            `[PDF OCR] Không thể chuyển trang ${p} sang ảnh để OCR (${renderErr?.code || renderErr?.message || 'render_error'}).`
+          );
+          ocrUnavailableReason =
+            'Bản PDF dạng scan trên máy chủ hiện cần kiểm tra trực tiếp từ bản gốc bên cạnh; vui lòng đối chiếu và bổ sung thông tin còn thiếu trước khi lưu.';
+        }
+      }
+
+      if (imagePathToRecognize && fs.existsSync(imagePathToRecognize)) {
+        const dims = imagePathToRecognize.endsWith('.png')
+          ? getPngDimensions(imagePathToRecognize)
+          : { width: 1654, height: 2339 };
+        const ret = await worker.recognize(imagePathToRecognize, {}, { blocks: true });
         const boxes = extractBoxesFromTesseractData(ret?.data, dims.width, dims.height);
         const rawText = (ret?.data?.text || '').trim();
         const reconstructed = boxes.length > 0 ? boxesToText(boxes) : rawText;
@@ -667,6 +845,10 @@ async function runVietnameseOcrOnPages(
         });
       }
     }
+  } catch (ocrErr: any) {
+    console.warn('[PDF OCR] Lỗi chạy OCR tiếng Việt, giữ lại kết quả đọc PDF & xác nhận thủ công:', ocrErr?.message);
+    ocrUnavailableReason =
+      'Không thể chạy OCR tự động cho bản scan này; vui lòng đối chiếu bản PDF gốc bên cạnh và kiểm tra các trường thông tin.';
   } finally {
     if (worker) {
       await worker.terminate().catch(() => {});
@@ -674,7 +856,7 @@ async function runVietnameseOcrOnPages(
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 
-  return results;
+  return { results, ocrUnavailableReason };
 }
 
 function formatDateDdMmYyyy(day: string, month: string, year: string): string {
@@ -1478,10 +1660,14 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     }
   };
 
+  let ocrUnavailableReason: string | undefined;
   if (ocrNeededPages.length > 0) {
     usedOcr = true;
-    const ocrResults = await runVietnameseOcrOnPages(buffer, ocrNeededPages);
-    mergeOcrResults(ocrResults);
+    const ocrRun = await runVietnameseOcrOnPages(buffer, ocrNeededPages);
+    mergeOcrResults(ocrRun.results);
+    if (ocrRun.ocrUnavailableReason) {
+      ocrUnavailableReason = ocrRun.ocrUnavailableReason;
+    }
   }
 
   // Nếu PDF scan nhiều trang (> 3) và các trang cuối là Phụ lục hoặc chưa có chữ ký, lùi thêm về các trang trước phụ lục
@@ -1503,8 +1689,8 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
         }
       }
       if (extraPagesToOcr.length > 0) {
-        const extraOcrResults = await runVietnameseOcrOnPages(buffer, extraPagesToOcr);
-        mergeOcrResults(extraOcrResults);
+        const extraOcrRun = await runVietnameseOcrOnPages(buffer, extraPagesToOcr);
+        mergeOcrResults(extraOcrRun.results);
       }
     }
   }
@@ -1618,7 +1804,9 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
 
   const reviewReasons: string[] = [];
   if (usedOcr) {
-    if (ocrConfidence !== undefined && ocrConfidence < 75) {
+    if (ocrUnavailableReason && ocrConfidence === undefined) {
+      reviewReasons.push(ocrUnavailableReason);
+    } else if (ocrConfidence !== undefined && ocrConfidence < 75) {
       reviewReasons.push(`Chất lượng quét/OCR thấp (${ocrConfidence}%), vui lòng đối chiếu lại với bản PDF gốc.`);
     } else {
       reviewReasons.push('Văn bản dạng bản scan đã nhận diện bằng OCR tiếng Việt, vui lòng rà soát trước khi lưu.');

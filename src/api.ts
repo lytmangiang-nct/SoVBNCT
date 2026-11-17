@@ -187,6 +187,7 @@ async function request<T>(endpoint: string, options: ApiRequestOptions = {}): Pr
     const err: any = new Error(message);
     err.status = res.status;
     if (errorData.code) err.code = errorData.code;
+    if (errorData.requestId) err.requestId = errorData.requestId;
     if (errorData.persistenceStatus) err.persistenceStatus = errorData.persistenceStatus;
     if (errorData.document) err.document = errorData.document;
     if (errorData.existingDocument) err.existingDocument = errorData.existingDocument;
