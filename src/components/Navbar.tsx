@@ -13,11 +13,26 @@ import {
   Trash2,
   MoreHorizontal,
   UserCircle2,
+  ListChecks,
+  ClipboardCheck,
 } from 'lucide-react';
 import type { BookPermission, RegistryBook, User } from '../types';
-import { hasAnyBookPermission, hasBookPermission, isSystemAdmin } from '../utils/permissions';
+import {
+  getUserDisplayName,
+  getUserSystemRoleLabel,
+  hasAnyBookPermission,
+  hasBookPermission,
+  isSystemAdmin,
+} from '../utils/permissions';
 
-export type AppTab = 'issue' | 'import_pdf' | 'registry' | 'statistics' | 'settings';
+export type AppTab =
+  | 'issue'
+  | 'import_pdf'
+  | 'registry'
+  | 'tasks'
+  | 'reconciliation'
+  | 'statistics'
+  | 'settings';
 export type RegistrySection = 'active' | 'deleted' | 'history';
 
 interface NavbarProps {
@@ -92,16 +107,10 @@ export const Navbar: React.FC<NavbarProps> = ({
   const canViewRegistry = hasPermForActiveBook('view');
   const canViewDeleted = canViewRegistry || hasPermForActiveBook('delete');
   const canManageSettings = hasPermForActiveBook('manage_book');
+  const canAccessReconciliation = isAdmin || hasAnyBookPermission(currentUser, 'manage_book', books);
 
-  const roleLabel = isAdmin
-    ? 'Quản trị viên'
-    : canIssueDirect
-    ? 'Cán bộ cấp số'
-    : canRequestNumber
-    ? 'Cán bộ xin số'
-    : canManageSettings
-    ? 'Quản lý sổ'
-    : 'Cán bộ theo dõi';
+  const displayName = getUserDisplayName(currentUser);
+  const systemRoleLabel = getUserSystemRoleLabel(currentUser);
 
   type PrimaryNavItem = {
     key: 'issue' | 'import_pdf' | 'registry';
@@ -163,6 +172,17 @@ export const Navbar: React.FC<NavbarProps> = ({
 
   const allMoreItems: MoreNavItem[] = [
     {
+      key: 'tasks',
+      label: 'Việc của tôi',
+      visible: Boolean(currentUser),
+      active: activeTab === 'tasks',
+      icon: <ListChecks className="w-4 h-4 text-sky-700 shrink-0" />,
+      onClick: () => {
+        setActiveTab('tasks');
+        setMoreMenuOpen(false);
+      },
+    },
+    {
       key: 'statistics',
       label: 'Thống kê',
       visible: canViewRegistry,
@@ -196,6 +216,17 @@ export const Navbar: React.FC<NavbarProps> = ({
       onClick: () => {
         onSelectRegistrySection('deleted');
         setActiveTab('registry');
+        setMoreMenuOpen(false);
+      },
+    },
+    {
+      key: 'reconciliation',
+      label: 'Đối soát dữ liệu',
+      visible: canAccessReconciliation,
+      active: activeTab === 'reconciliation',
+      icon: <ClipboardCheck className="w-4 h-4 text-sky-700 shrink-0" />,
+      onClick: () => {
+        setActiveTab('reconciliation');
         setMoreMenuOpen(false);
       },
     },
@@ -276,7 +307,7 @@ export const Navbar: React.FC<NavbarProps> = ({
                 {pendingExcelSyncCount > 0 && (
                   <span
                     className="w-2 h-2 rounded-full bg-amber-500 shrink-0"
-                    title="Có văn bản đã xóa chờ đồng bộ Excel"
+                    title="Có văn bản đã xóa chờ đồng bộ Google Trang tính"
                   />
                 )}
                 <ChevronDown
@@ -325,7 +356,7 @@ export const Navbar: React.FC<NavbarProps> = ({
             </div>
           )}
 
-          {/* Account Icon Button & Menu */}
+          {/* Account Trigger Button & Menu */}
           {currentUser && (
             <div ref={accountRef} className="relative">
               <button
@@ -336,19 +367,22 @@ export const Navbar: React.FC<NavbarProps> = ({
                 }}
                 aria-haspopup="menu"
                 aria-expanded={accountMenuOpen}
-                aria-label="Tài khoản"
-                title={`${currentUser.fullName} (${roleLabel})`}
-                className={`w-9 h-9 rounded-full border flex items-center justify-center transition-colors shrink-0 ${
+                aria-label={`Tài khoản: ${displayName}`}
+                title={`${displayName} (@${currentUser.username} · ${systemRoleLabel})`}
+                className={`inline-flex items-center justify-center w-9 h-9 md:w-auto md:px-2.5 md:gap-2 rounded-full border transition-colors shrink-0 min-w-0 max-w-full ${
                   accountMenuOpen
                     ? 'bg-sky-100 text-sky-900 border-sky-300'
                     : 'bg-slate-100 text-slate-700 border-slate-200 hover:bg-slate-200/70'
                 }`}
               >
                 {isAdmin ? (
-                  <ShieldCheck className="w-4 h-4 text-amber-600" />
+                  <ShieldCheck className="w-4 h-4 text-amber-600 shrink-0" />
                 ) : (
-                  <UserCircle2 className="w-5 h-5 text-sky-700" />
+                  <UserCircle2 className="w-5 h-5 text-sky-700 shrink-0" />
                 )}
+                <span className="hidden md:block truncate max-w-[140px] lg:max-w-[190px] text-xs font-semibold text-slate-800">
+                  {displayName}
+                </span>
               </button>
 
               {accountMenuOpen && (
@@ -367,9 +401,11 @@ export const Navbar: React.FC<NavbarProps> = ({
                     </div>
                     <div className="min-w-0 flex-1">
                       <p className="text-sm font-bold text-slate-900 break-words leading-snug">
-                        {currentUser.fullName}
+                        {displayName}
                       </p>
-                      <p className="text-xs text-slate-500 mt-0.5 truncate">{roleLabel}</p>
+                      <p className="text-xs text-slate-500 mt-0.5 break-words">
+                        @{currentUser.username} · {systemRoleLabel}
+                      </p>
                     </div>
                   </div>
 

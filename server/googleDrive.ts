@@ -203,12 +203,7 @@ export function buildDriveFolderHierarchy(
   };
 }
 
-export function resolveEffectiveDriveConfig(
-  stored?: GoogleDriveConfig,
-  unitCode?: string,
-  bookDriveConfig?: Partial<GoogleDriveConfig>,
-  isDefaultBook: boolean = true
-): {
+export interface ResolvedGoogleDriveConfig {
   enabled: boolean;
   authMode: 'apps_script' | 'service_account';
   folderUrl: string;
@@ -219,7 +214,14 @@ export function resolveEffectiveDriveConfig(
   serviceAccountEmail: string;
   isConfigured: boolean;
   missingReason?: string;
-} {
+}
+
+export function resolveEffectiveDriveConfig(
+  stored?: GoogleDriveConfig,
+  unitCode?: string,
+  bookDriveConfig?: Partial<GoogleDriveConfig>,
+  isDefaultBook: boolean = true
+): ResolvedGoogleDriveConfig {
   const envEnabled =
     isDefaultBook && process.env.GOOGLE_DRIVE_ENABLED !== undefined
       ? process.env.GOOGLE_DRIVE_ENABLED === 'true'
@@ -726,6 +728,7 @@ export async function uploadWordToGoogleDrive(params: {
   overrideFileName?: string;
   replaceMode?: boolean;
   previousFileId?: string;
+  keepPreviousFile?: boolean;
 }): Promise<DriveUploadResult> {
   const {
     config,
@@ -741,6 +744,7 @@ export async function uploadWordToGoogleDrive(params: {
     overrideFileName,
     replaceMode,
     previousFileId,
+    keepPreviousFile,
   } = params;
 
   if (!config.isConfigured || !config.folderId) {
@@ -759,8 +763,8 @@ export async function uploadWordToGoogleDrive(params: {
       : buildStandardDriveFileName(fullDocNumber, docName, originalFileName);
 
   if (config.authMode === 'apps_script') {
-    // Step 1: Check existing file by docId first (skip when replacing an existing file intentionally)
-    if (!replaceMode) {
+    // Step 1: Check existing file by docId first (skip when replacing or adding versioned attachments)
+    if (!replaceMode && !keepPreviousFile) {
       const checkRes = await fetch(config.appsScriptUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -802,8 +806,9 @@ export async function uploadWordToGoogleDrive(params: {
         docName,
         fileName: finalFileName,
         mimeType,
-        replaceMode: Boolean(replaceMode),
-        previousFileId: previousFileId || '',
+        replaceMode: Boolean(replaceMode || keepPreviousFile),
+        keepPreviousFile: Boolean(keepPreviousFile),
+        previousFileId: keepPreviousFile ? '' : previousFileId || '',
         fileBase64: buffer.toString('base64'),
       }),
     });
@@ -834,8 +839,8 @@ export async function uploadWordToGoogleDrive(params: {
   // Resolve/create folder layout: Tên sổ → Năm → Văn bản đi / Văn bản đến
   const targetFolderId = await resolveServiceAccountTargetFolder(accessToken, config.folderId, hierarchy);
 
-  // Step 1: Deduplication lookup by appProperties.nctDocId (skip when replacing intentionally)
-  if (!replaceMode) {
+  // Step 1: Deduplication lookup by appProperties.nctDocId (skip when replacing or keeping separate versions)
+  if (!replaceMode && !keepPreviousFile) {
     const existing = await findExistingFileServiceAccount(accessToken, targetFolderId, docId);
     if (existing) {
       if (existing.name !== finalFileName) {
@@ -860,7 +865,7 @@ export async function uploadWordToGoogleDrive(params: {
         deduplicated: true,
       };
     }
-  } else if (previousFileId) {
+  } else if (replaceMode && previousFileId && !keepPreviousFile) {
     // Move previous file to trash when replacing via Service Account (best-effort)
     await fetch(
       `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(previousFileId)}?supportsAllDrives=true`,
@@ -935,3 +940,103 @@ export async function uploadWordToGoogleDrive(params: {
 }
 
 export const uploadFileToGoogleDrive = uploadWordToGoogleDrive;
+
+export interface DriveFileCheckResult {
+  status: 'ok' | 'not_found' | 'access_denied' | 'unverified';
+  message?: string;
+}
+
+/**
+ * Kiểm tra trạng thái tồn tại và quyền truy cập của 1 tệp theo driveFileId trên Google Drive.
+ */
+export async function checkGoogleDriveFileStatus(
+  config: ResolvedGoogleDriveConfig,
+  fileId: string
+): Promise<DriveFileCheckResult> {
+  const cleanId = (fileId || '').trim();
+  if (!cleanId) {
+    return { status: 'not_found', message: 'Thiếu mã tệp Google Drive.' };
+  }
+  if (!config.isConfigured) {
+    return { status: 'unverified', message: config.missingReason || 'Chưa cấu hình Google Drive.' };
+  }
+
+  try {
+    if (config.authMode === 'service_account') {
+      const { parsed, error } = parseServiceAccountJson(config.serviceAccountJson);
+      if (!parsed || error) {
+        return { status: 'unverified', message: error || 'Khóa Service Account không hợp lệ.' };
+      }
+      const accessToken = await getServiceAccountAccessToken(parsed);
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cleanId)}?supportsAllDrives=true&fields=id,name,trashed,capabilities(canDownload)`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      if (res.status === 404) {
+        return { status: 'not_found', message: 'Tệp không còn tồn tại trên Google Drive (404).' };
+      }
+      if (res.status === 401 || res.status === 403) {
+        return {
+          status: 'access_denied',
+          message: 'Tài khoản tích hợp thiếu quyền truy cập tệp này trên Google Drive.',
+        };
+      }
+      if (!res.ok) {
+        return { status: 'unverified', message: `Google Drive trả về mã ${res.status}.` };
+      }
+      const data: any = await res.json().catch(() => ({}));
+      if (data?.trashed) {
+        return { status: 'not_found', message: 'Tệp đã bị chuyển vào thùng rác trên Google Drive.' };
+      }
+      return { status: 'ok' };
+    }
+
+    if (!config.appsScriptUrl) {
+      return { status: 'unverified', message: 'Thiếu URL Apps Script.' };
+    }
+
+    const res = await fetch(config.appsScriptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'check_file',
+        folderId: config.folderId,
+        fileId: cleanId,
+      }),
+    });
+    const data = await parseAppsScriptJsonResponse(res);
+    if (data.result === 'success') {
+      if (data.status === 'not_found' || data.exists === false || data.trashed === true) {
+        return { status: 'not_found', message: data.message || 'Tệp không tìm thấy trên Google Drive.' };
+      }
+      if (data.status === 'access_denied') {
+        return {
+          status: 'access_denied',
+          message: data.message || 'Tài khoản Apps Script không có quyền truy cập tệp này.',
+        };
+      }
+      return { status: 'ok' };
+    }
+    const errText = String(data.error || '').toLowerCase();
+    if (errText.includes('thao tác không hợp lệ') || errText.includes('check_file')) {
+      return {
+        status: 'unverified',
+        message: 'Apps Script hiện tại chưa cập nhật hàm kiểm tra check_file.',
+      };
+    }
+    if (errText.includes('permission') || errText.includes('access denied') || errText.includes('quyền')) {
+      return { status: 'access_denied', message: data.error };
+    }
+    if (errText.includes('no item with the given id') || errText.includes('not found') || errText.includes('không tìm thấy')) {
+      return { status: 'not_found', message: 'Tệp không tìm thấy trên Google Drive.' };
+    }
+    return { status: 'unverified', message: data.error || 'Chưa xác minh được liên kết Drive.' };
+  } catch (err: any) {
+    return {
+      status: 'unverified',
+      message: err?.message || 'Lỗi kết nối khi kiểm tra tệp trên Google Drive.',
+    };
+  }
+}

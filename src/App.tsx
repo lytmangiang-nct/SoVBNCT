@@ -3,11 +3,13 @@ import { Navbar, type AppTab, type RegistrySection } from './components/Navbar';
 import { IssueNumberView } from './components/IssueNumberView';
 import { ImportPdfView } from './components/ImportPdfView';
 import { DocumentRegistryView } from './components/DocumentRegistryView';
+import { TasksView } from './components/TasksView';
+import { ReconciliationView } from './components/ReconciliationView';
 import { StatisticsView } from './components/StatisticsView';
 import { SettingsView } from './components/SettingsView';
 import type { SettingsSubTab } from './components/settings/settingsConstants';
 import { LoginModal } from './components/LoginModal';
-import { api, buildApiUrl, clearAuth } from './api';
+import { api, buildApiUrl, clearAuth, updateStoredUser } from './api';
 import type {
   DocumentRecord,
   DocumentTypeConfig,
@@ -26,6 +28,7 @@ import {
   hasBookPermission,
   isSystemAdmin,
 } from './utils/permissions';
+import { getDocumentFilterYear } from './utils/fileNaming';
 import { AlertTriangle, Bell, BookOpen, RefreshCw } from 'lucide-react';
 
 function getClientVietnamTimeFallback() {
@@ -55,6 +58,8 @@ export default function App() {
   const [authChecking, setAuthChecking] = useState<boolean>(true);
   const [activeTab, setActiveTab] = useState<AppTab>('issue');
   const [registrySection, setRegistrySection] = useState<RegistrySection>('active');
+  const [registryScopeAll, setRegistryScopeAll] = useState<boolean>(false);
+  const [registryPresetCategory, setRegistryPresetCategory] = useState<'all' | 'outgoing' | 'incoming' | null>(null);
   const [pendingOpenDocId, setPendingOpenDocId] = useState<string | null>(null);
 
   const initialVnTime = useMemo(() => getClientVietnamTimeFallback(), []);
@@ -176,13 +181,15 @@ export default function App() {
         return;
       }
 
+      updateStoredUser(meRes.user);
       setCurrentUser((prev) => {
         if (!prev) return meRes.user;
         if (
           JSON.stringify(prev.bookPermissions || {}) !== JSON.stringify(meRes.user.bookPermissions || {}) ||
           prev.role !== meRes.user.role ||
           prev.isActive !== meRes.user.isActive ||
-          prev.fullName !== meRes.user.fullName
+          prev.fullName !== meRes.user.fullName ||
+          (prev.displayName || '') !== (meRes.user.displayName || '')
         ) {
           return meRes.user;
         }
@@ -266,6 +273,9 @@ export default function App() {
           if (updatedDoc.status === 'deleted') {
             setDocuments((prev) => prev.filter((d) => d.id !== updatedDoc.id));
             setDeletedDocuments((prev) => {
+              if (updatedDoc.deletedListArchived) {
+                return prev.filter((d) => d.id !== updatedDoc.id);
+              }
               const exists = prev.some((d) => d.id === updatedDoc.id);
               return exists
                 ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
@@ -327,8 +337,20 @@ export default function App() {
             data.userId === currentUser.id ||
             data.targetUserId === currentUser.id;
           if (matchesMe) {
-            await loadAppData();
-            showToast('Quyền truy cập sổ văn bản của bạn vừa được cập nhật.', 'info');
+            const permsUnchanged =
+              data.user &&
+              JSON.stringify(currentUser.bookPermissions || {}) ===
+                JSON.stringify(data.user.bookPermissions || {}) &&
+              currentUser.isActive === data.user.isActive &&
+              currentUser.role === data.user.role;
+            if (data.user && permsUnchanged && (currentUser.displayName || '') !== (data.user.displayName || '')) {
+              updateStoredUser(data.user);
+              setCurrentUser(data.user);
+              showToast('Tên hiển thị tài khoản của bạn vừa được cập nhật.', 'info');
+            } else {
+              await loadAppData();
+              showToast('Quyền truy cập sổ văn bản của bạn vừa được cập nhật.', 'info');
+            }
           }
         } catch {
           // ignore
@@ -337,6 +359,14 @@ export default function App() {
 
       eventSource.addEventListener('number_requests_updated', () => {
         refreshRequests();
+      });
+
+      eventSource.addEventListener('documents_deleted_archived', () => {
+        loadAppData();
+      });
+
+      eventSource.addEventListener('document_history_cleaned', () => {
+        loadAppData();
       });
 
       eventSource.addEventListener('settings_updated', (e: MessageEvent) => {
@@ -374,6 +404,13 @@ export default function App() {
     };
 
     const pollInterval = setInterval(syncLiveState, 30000);
+    const midnightCheckInterval = setInterval(() => {
+      if (document.visibilityState !== 'visible') return;
+      const clientVn = getClientVietnamTimeFallback();
+      if (clientVn.year !== serverYear) {
+        loadAppData();
+      }
+    }, 10000);
 
     const handleVisibilityOrFocus = () => {
       syncLiveState();
@@ -389,11 +426,12 @@ export default function App() {
       if (eventSource) eventSource.close();
       clearTimeout(reconnectTimeout);
       clearInterval(pollInterval);
+      clearInterval(midnightCheckInterval);
       window.removeEventListener('focus', handleVisibilityOrFocus);
       window.removeEventListener('online', handleOnline);
       document.removeEventListener('visibilitychange', handleVisibilityOrFocus);
     };
-  }, [currentUser?.id, loadAppData, refreshBooks, refreshRequests, applyServerTime]);
+  }, [currentUser?.id, serverYear, loadAppData, refreshBooks, refreshRequests, applyServerTime]);
 
   const accessibleBooks = useMemo(
     () => getAccessibleBooks(currentUser, books),
@@ -457,6 +495,10 @@ export default function App() {
     if (hasPerm('view')) {
       allowedTabs.push('statistics');
     }
+    allowedTabs.push('tasks');
+    if (isAdmin || hasAnyBookPermission(currentUser, 'manage_book', books)) {
+      allowedTabs.push('reconciliation');
+    }
     if (hasPerm('manage_book') || isAdmin) {
       allowedTabs.push('settings');
     }
@@ -504,6 +546,9 @@ export default function App() {
     if (updatedDoc.status === 'deleted') {
       setDocuments((prev) => prev.filter((d) => d.id !== updatedDoc.id));
       setDeletedDocuments((prev) => {
+        if (updatedDoc.deletedListArchived) {
+          return prev.filter((d) => d.id !== updatedDoc.id);
+        }
         const exists = prev.some((d) => d.id === updatedDoc.id);
         return exists
           ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
@@ -523,6 +568,13 @@ export default function App() {
     setActiveTab('registry');
   };
 
+  const handleNavigateToIncomingRegistry = () => {
+    setRegistryScopeAll(false);
+    setRegistryPresetCategory('incoming');
+    setRegistrySection('active');
+    setActiveTab('registry');
+  };
+
   if (authChecking) {
     return (
       <div className="min-h-screen bg-slate-50 flex items-center justify-center">
@@ -538,13 +590,21 @@ export default function App() {
     return <LoginModal onLoginSuccess={(user) => setCurrentUser(user)} />;
   }
 
-  // Quick stats summary for server Vietnam year on active book
+  // Quick stats summary for server Vietnam year on active book (or all accessible books on registry)
   const currentYear = serverYear;
-  const currentYearDocs = documents.filter(
-    (d) => d.year === currentYear && getDocBookId(d) === activeBook.id
-  );
+  const effectiveRegistryBookId =
+    activeTab === 'registry' && registryScopeAll && accessibleBooks.length > 1
+      ? 'all'
+      : activeBook.id;
+  const currentYearDocs = documents.filter((d) => {
+    if (getDocumentFilterYear(d) !== currentYear) return false;
+    if (effectiveRegistryBookId === 'all') return true;
+    return getDocBookId(d) === activeBook.id;
+  });
   const totalCount = currentYearDocs.length;
-  const activeBookDeletedDocs = deletedDocuments.filter((d) => getDocBookId(d) === activeBook.id);
+  const activeBookDeletedDocs = deletedDocuments.filter((d) =>
+    effectiveRegistryBookId === 'all' ? true : getDocBookId(d) === activeBook.id
+  );
   const pendingExcelSyncCount = activeBookDeletedDocs.filter(
     (d) => d.excelDeleteSyncStatus === 'failed' || d.excelDeleteSyncStatus === 'pending'
   ).length;
@@ -573,7 +633,7 @@ export default function App() {
       >
         <div className="max-w-7xl mx-auto flex items-center justify-between gap-2.5 sm:gap-4">
           <div className="flex flex-wrap items-center gap-x-3 sm:gap-x-4 gap-y-2 min-w-0 flex-1">
-            {/* Bộ chọn sổ */}
+            {/* Bộ chọn sổ duy nhất */}
             {accessibleBooks.length > 0 && (
               <div className="flex items-center gap-2 bg-sky-800/90 border border-sky-600/80 rounded-lg px-2.5 h-9 shrink-0 max-w-full min-w-0">
                 <BookOpen className="w-4 h-4 text-sky-200 shrink-0" />
@@ -581,10 +641,21 @@ export default function App() {
                 {accessibleBooks.length > 1 ? (
                   <select
                     aria-label="Sổ đang chọn"
-                    value={activeBook.id}
-                    onChange={(e) => setActiveBookId(e.target.value)}
-                    className="min-w-0 max-w-[200px] sm:max-w-[260px] bg-transparent text-white text-xs sm:text-sm font-bold focus:outline-hidden cursor-pointer truncate [&>option]:text-slate-900"
+                    value={effectiveRegistryBookId}
+                    onChange={(e) => {
+                      const val = e.target.value;
+                      if (val === 'all') {
+                        setRegistryScopeAll(true);
+                      } else {
+                        setRegistryScopeAll(false);
+                        setActiveBookId(val);
+                      }
+                    }}
+                    className="min-w-0 max-w-[210px] sm:max-w-[270px] bg-transparent text-white text-xs sm:text-sm font-bold focus:outline-hidden cursor-pointer truncate [&>option]:text-slate-900"
                   >
+                    {activeTab === 'registry' && (
+                      <option value="all">Tất cả sổ có quyền ({accessibleBooks.length})</option>
+                    )}
                     {accessibleBooks.map((b) => (
                       <option key={b.id} value={b.id}>
                         {b.name} ({b.unitCode})
@@ -611,12 +682,12 @@ export default function App() {
             </div>
           </div>
 
-          {/* Nút Làm mới dạng biểu tượng (kích thước cố định chống nhảy bố cục) */}
+          {/* Nút Làm mới duy nhất */}
           <button
             type="button"
             onClick={loadAppData}
             disabled={loadingData}
-            aria-label="Làm mới dữ liệu"
+            aria-label="Làm mới"
             title={
               lastSyncAt
                 ? `Làm mới dữ liệu (Cập nhật lúc ${lastSyncAt.toLocaleTimeString('vi-VN', {
@@ -626,9 +697,10 @@ export default function App() {
                   })})`
                 : 'Làm mới dữ liệu'
             }
-            className="w-9 h-9 rounded-lg bg-sky-800/90 hover:bg-sky-700 border border-sky-600/80 text-white flex items-center justify-center transition-colors shrink-0 disabled:opacity-60"
+            className="inline-flex items-center gap-1.5 h-9 px-3 rounded-lg bg-sky-800/90 hover:bg-sky-700 border border-sky-600/80 text-white text-xs font-semibold transition-colors shrink-0 disabled:opacity-60 whitespace-nowrap"
           >
-            <RefreshCw className={`w-4 h-4 ${loadingData ? 'animate-spin' : ''}`} />
+            <RefreshCw className={`w-3.5 h-3.5 shrink-0 ${loadingData ? 'animate-spin' : ''}`} />
+            <span>Làm mới</span>
           </button>
         </div>
       </section>
@@ -765,6 +837,7 @@ export default function App() {
                 onDocumentImported={handleDocumentIssued}
                 onDocumentUpdated={handleDocumentUpdated}
                 onOpenExistingDocument={handleOpenExistingDocument}
+                onNavigateToIncomingRegistry={handleNavigateToIncomingRegistry}
               />
             )}
 
@@ -774,8 +847,15 @@ export default function App() {
                 deletedDocuments={deletedDocuments}
                 documentTypes={documentTypes}
                 books={books.length > 0 ? books : [activeBook]}
-                activeBookId={activeBook.id}
-                onSelectBookId={setActiveBookId}
+                activeBookId={effectiveRegistryBookId}
+                onSelectBookId={(val) => {
+                  if (val === 'all') {
+                    setRegistryScopeAll(true);
+                  } else {
+                    setRegistryScopeAll(false);
+                    setActiveBookId(val);
+                  }
+                }}
                 settings={settings}
                 serverYear={serverYear}
                 currentUser={currentUser}
@@ -785,6 +865,28 @@ export default function App() {
                 onDocumentUpdated={handleDocumentUpdated}
                 initialOpenDocId={pendingOpenDocId}
                 onClearInitialOpenDocId={() => setPendingOpenDocId(null)}
+                presetCategory={registryPresetCategory}
+                onClearPresetCategory={() => setRegistryPresetCategory(null)}
+              />
+            )}
+
+            {activeTab === 'tasks' && (
+              <TasksView
+                currentUser={currentUser}
+                accessibleBooks={accessibleBooks.length > 0 ? accessibleBooks : [activeBook]}
+                activeBookId={activeBook.id}
+                onOpenDocument={handleOpenExistingDocument}
+              />
+            )}
+
+            {activeTab === 'reconciliation' && (
+              <ReconciliationView
+                currentUser={currentUser}
+                books={books.length > 0 ? books : [activeBook]}
+                activeBookId={activeBook.id}
+                serverYear={serverYear}
+                onOpenDocument={handleOpenExistingDocument}
+                onRefreshApp={loadAppData}
               />
             )}
 
@@ -818,6 +920,10 @@ export default function App() {
                 onSettingsUpdated={(newSettings) => setSettings(newSettings)}
                 onBooksUpdated={refreshBooks}
                 onRefreshData={loadAppData}
+                onCurrentUserUpdated={(updatedUser) => {
+                  updateStoredUser(updatedUser);
+                  setCurrentUser(updatedUser);
+                }}
               />
             )}
           </>

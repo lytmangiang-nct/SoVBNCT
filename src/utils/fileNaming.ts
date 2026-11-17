@@ -251,3 +251,24 @@ export function normalizeDocNumberForCompare(input: string | undefined | null): 
     .trim();
 }
 
+export function getDocumentFilterYear(doc: {
+  docCategory?: 'outgoing' | 'incoming';
+  issueDate?: string;
+  year?: number;
+}): number | 'unknown' {
+  if (doc.docCategory === 'incoming') {
+    const cleanIssue = normalizeDateOnlyDdMmYyyy(doc.issueDate || '');
+    if (!cleanIssue) return 'unknown';
+    const parts = cleanIssue.split('/');
+    if (parts.length === 3 && /^\d{4}$/.test(parts[2])) {
+      const y = parseInt(parts[2], 10);
+      if (Number.isFinite(y) && y >= 1900 && y <= 2100) {
+        return y;
+      }
+    }
+    return 'unknown';
+  }
+  return typeof doc.year === 'number' && Number.isFinite(doc.year) ? doc.year : 'unknown';
+}
+
+

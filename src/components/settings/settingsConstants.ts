@@ -7,6 +7,7 @@ export type SettingsSubTab =
   | 'numbering'
   | 'signers'
   | 'docTypes'
+  | 'wordTemplates'
   | 'database'
   | 'googledrive'
   | 'googlesheets'
@@ -47,6 +48,7 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroupDef[] = [
       { id: 'numbering', label: 'Quy tắc dãy số và số bắt đầu' },
       { id: 'signers', label: 'Người ký' },
       { id: 'docTypes', label: 'Loại văn bản' },
+      { id: 'wordTemplates', label: 'Mẫu Word (.docx)' },
     ],
   },
   {
@@ -371,6 +373,33 @@ function doPost(e) {
       });
     }
 
+    // 1b. Kiểm tra nhanh sự tồn tại của tệp theo fileId (dùng cho Đối soát dữ liệu)
+    if (data.action === "check_file") {
+      var targetFileId = (data.fileId || "").trim();
+      if (!targetFileId) {
+        return jsonOut({ result: "success", exists: false, status: "not_found" });
+      }
+      try {
+        var checkFile = DriveApp.getFileById(targetFileId);
+        if (checkFile.isTrashed()) {
+          return jsonOut({ result: "success", exists: false, trashed: true, status: "not_found" });
+        }
+        return jsonOut({
+          result: "success",
+          exists: true,
+          status: "ok",
+          fileName: checkFile.getName(),
+          webViewLink: checkFile.getUrl()
+        });
+      } catch (eCheck) {
+        var msgCheck = eCheck.toString().toLowerCase();
+        if (msgCheck.indexOf("access") !== -1 || msgCheck.indexOf("permission") !== -1) {
+          return jsonOut({ result: "success", exists: false, status: "access_denied", message: eCheck.toString() });
+        }
+        return jsonOut({ result: "success", exists: false, status: "not_found", message: eCheck.toString() });
+      }
+    }
+
     var targetFolder = resolveHierarchyFolder(rootFolder, data);
     var docId = (data.docId || "").trim();
     var marker = docId ? "[NCT_DOC_ID:" + docId + "]" : "";
@@ -412,7 +441,7 @@ function doPost(e) {
 
     // 3. Tải tệp vào đúng cây thư mục Tên sổ -> Năm -> Văn bản đi / Văn bản đến
     if (data.action === "upload") {
-      var dup = findExisting();
+      var dup = data.keepPreviousFile ? null : findExisting();
       if (dup && !data.replaceMode) {
         if (data.fileName && dup.getName() !== data.fileName) {
           dup.setName(data.fileName);
@@ -427,7 +456,7 @@ function doPost(e) {
         });
       }
 
-      if (data.replaceMode) {
+      if (data.replaceMode && !data.keepPreviousFile) {
         if (data.previousFileId) {
           try { DriveApp.getFileById(data.previousFileId).setTrashed(true); } catch (ePrev) {}
         }

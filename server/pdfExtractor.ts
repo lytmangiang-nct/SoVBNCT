@@ -11,6 +11,8 @@ import type {
   FieldLocation,
   NormalizedBBox,
   PdfExtractionResult,
+  PdfPageContent,
+  PdfTaskSuggestion,
 } from '../src/types.js';
 import {
   getMaxWordFileSizeBytes,
@@ -1617,9 +1619,220 @@ function extractSignerInfo(
   };
 }
 
+const ACTION_LINE_REGEX =
+  /\b(?:bao cao|nop|gui|hoan thanh|thuc hien|trien khai|tham du|to chuc|dang ky|cu|ra soat|tong hop|cap nhat|phan cong|chuan bi|lap danh sach|de nghi|yeu cau|thong bao cho)\b/i;
+
+const EXPLICIT_DEADLINE_REGEX =
+  /(?:truoc\s+ngay|cham\s+nhat(?:\s+la)?\s+ngay|han\s+cuoi(?:\s+la)?(?:\s+ngay)?|han\s+nop(?:\s+la)?(?:\s+ngay)?|den\s+het\s+ngay|tu\s+ngay\s+\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\s+den(?:\s+het)?\s+ngay|ngay\s+het\s+han(?:\s+la)?(?:\s+ngay)?)\s*[:\-]?\s*(?:ngay\s+)?(\d{1,2})\s*(?:[\/\-\.]|\s+thang\s+)\s*(\d{1,2})\s*(?:[\/\-\.]|\s+nam\s+)\s*(\d{2,4})/gi;
+
+const RELATIVE_DEADLINE_REGEX =
+  /(?:trong\s+(?:vong\s+)?\d+\s*(?:ngay|tuan|thang)(?:\s+lam\s+viec)?(?:\s+ke\s+tu\s+ngay[^.,;\n]*)?|sau\s+\d+\s*(?:ngay|tuan|thang)[^.,;\n]*|trong\s+thoi\s+han\s+\d+\s*(?:ngay|tuan|thang)[^.,;\n]*|ngay\s+sau\s+khi\s+nhan\s+duoc[^.,;\n]*|truoc\s+khi\s+(?:bat\s+dau|khai\s+mac|to\s+chuc)[^.,;\n]*)/gi;
+
+function extractDocumentRecipients(pageTexts: PdfPageContent[]): string {
+  const recipients: string[] = [];
+  for (const p of pageTexts) {
+    const lines = p.text
+      .split('\n')
+      .map((l) => l.trim())
+      .filter(Boolean);
+    for (let i = 0; i < lines.length; i++) {
+      const norm = removeVietnameseDiacritics(lines[i]);
+      const m = lines[i].match(/^(?:Kính\s+gửi|Nơi\s+nhận|Thành\s+phần|Đơn\s+vị\s+thực\s+hiện)\s*[:\-]\s*(.*)$/i);
+      if (m) {
+        const inline = (m[1] || '').replace(/;$/, '').trim();
+        if (inline && !/^như\s+trên$/i.test(inline)) {
+          recipients.push(inline);
+        }
+        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
+          const next = lines[j];
+          const normNext = removeVietnameseDiacritics(next);
+          if (/^(?:Luu|KT\.|TM\.|BI THU|HIEU TRUONG|CONG HOA|DIEU \d+)/i.test(normNext)) break;
+          if (/^[-•+]\s*/.test(next)) {
+            const cleanItem = next.replace(/^[-•+]\s*/, '').replace(/[;.]$/, '').trim();
+            if (cleanItem && !/^luu\b/i.test(removeVietnameseDiacritics(cleanItem)) && !/^nhu tren$/i.test(removeVietnameseDiacritics(cleanItem))) {
+              recipients.push(cleanItem);
+            }
+          } else {
+            break;
+          }
+        }
+      } else if (/^(?:Kinh\s+gui)\s*[:\-]/i.test(norm) && recipients.length === 0) {
+        recipients.push(lines[i].replace(/^Kính\s+gửi\s*[:\-]?\s*/i, '').trim());
+      }
+    }
+  }
+  const unique = Array.from(new Set(recipients.map((r) => r.trim()).filter((r) => r.length >= 2)));
+  return unique.slice(0, 4).join('; ');
+}
+
+function summarizeTaskTitleFromSegment(segment: string): string {
+  const cleaned = segment
+    .replace(/\s+/g, ' ')
+    .replace(/^[-•*\d.)\s]+/, '')
+    .trim();
+  if (!cleaned) return 'Thực hiện nội dung theo văn bản';
+  if (cleaned.length <= 140) return cleaned;
+  return cleaned.slice(0, 137).trim() + '...';
+}
+
+export function extractPdfTaskSuggestions(pageTexts: PdfPageContent[]): PdfTaskSuggestion[] {
+  const suggestions: PdfTaskSuggestion[] = [];
+  const defaultRecipient = extractDocumentRecipients(pageTexts);
+  const seenKeys = new Set<string>();
+
+  for (const pageEntry of pageTexts) {
+    const rawText = (pageEntry.text || '').trim();
+    if (!rawText) continue;
+
+    // Tách theo câu/dòng giữ ngữ cảnh gọn
+    const sentences = rawText
+      .replace(/\r/g, '\n')
+      .split(/(?<=[.;!\n])\s+|\n+/)
+      .map((s) => s.replace(/\s+/g, ' ').trim())
+      .filter((s) => s.length >= 12);
+
+    for (let idx = 0; idx < sentences.length; idx++) {
+      const sentence = sentences[idx];
+      const norm = removeVietnameseDiacritics(sentence);
+
+      // Bỏ qua dòng tiêu đề/ngày ban hành ở đầu trang hoặc dòng lưu văn thư
+      if (/^(?:CONG HOA|DOC LAP|SO\s*:|NGAY\s+\d+|LUU\s*:)/i.test(norm)) continue;
+
+      // Tìm hạn nộp rõ ràng có ngày cụ thể dd/mm/yyyy
+      EXPLICIT_DEADLINE_REGEX.lastIndex = 0;
+      let explicitMatch: RegExpExecArray | null;
+      let matchedAnyDeadline = false;
+
+      while ((explicitMatch = EXPLICIT_DEADLINE_REGEX.exec(norm)) !== null) {
+        matchedAnyDeadline = true;
+        const dd = explicitMatch[1].padStart(2, '0');
+        const mm = explicitMatch[2].padStart(2, '0');
+        let yyyy = explicitMatch[3];
+        if (yyyy.length === 2) yyyy = `20${yyyy}`;
+        const dueDate = normalizeDateOnlyDdMmYyyy(`${dd}/${mm}/${yyyy}`);
+        if (!dueDate) continue;
+
+        const key = `${pageEntry.page}|${dueDate}|${norm.slice(0, 40)}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+
+        const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 6);
+        suggestions.push({
+          id: `sug-p${pageEntry.page}-${suggestions.length + 1}-${hash}`,
+          taskTitle: summarizeTaskTitleFromSegment(sentence),
+          dueDate,
+          rawDeadlineText: sentence.slice(explicitMatch.index, explicitMatch.index + explicitMatch[0].length).trim() || dueDate,
+          needsConfirmation: false,
+          recipient: defaultRecipient || undefined,
+          sourceExcerpt: sentence,
+          page: pageEntry.page,
+        });
+      }
+
+      // Tìm hạn tương đối / chưa rõ ngày cụ thể (vd: "trong 05 ngày kể từ ngày nhận")
+      RELATIVE_DEADLINE_REGEX.lastIndex = 0;
+      let relMatch: RegExpExecArray | null;
+      while ((relMatch = RELATIVE_DEADLINE_REGEX.exec(norm)) !== null) {
+        matchedAnyDeadline = true;
+        const phraseStart = relMatch.index;
+        const phraseEnd = phraseStart + relMatch[0].length;
+        const exactPhrase = sentence.slice(phraseStart, phraseEnd).trim() || relMatch[0];
+        const key = `${pageEntry.page}|REL|${removeVietnameseDiacritics(exactPhrase).slice(0, 40)}`;
+        if (seenKeys.has(key)) continue;
+        seenKeys.add(key);
+
+        const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 6);
+        suggestions.push({
+          id: `sug-p${pageEntry.page}-${suggestions.length + 1}-${hash}`,
+          taskTitle: summarizeTaskTitleFromSegment(sentence),
+          dueDate: '',
+          rawDeadlineText: exactPhrase,
+          needsConfirmation: true,
+          recipient: defaultRecipient || undefined,
+          sourceExcerpt: sentence,
+          page: pageEntry.page,
+        });
+      }
+
+      // Nếu không bắt được từ khóa hạn nộp nhưng câu có động từ yêu cầu rõ ràng + ngày dd/mm/yyyy
+      if (!matchedAnyDeadline && ACTION_LINE_REGEX.test(norm)) {
+        const inlineDateMatch = sentence.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
+        if (inlineDateMatch) {
+          const dueDate = normalizeDateOnlyDdMmYyyy(
+            `${inlineDateMatch[1].padStart(2, '0')}/${inlineDateMatch[2].padStart(2, '0')}/${inlineDateMatch[3]}`
+          );
+          if (dueDate) {
+            const key = `${pageEntry.page}|ACT|${dueDate}|${norm.slice(0, 35)}`;
+            if (!seenKeys.has(key)) {
+              seenKeys.add(key);
+              const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 6);
+              suggestions.push({
+                id: `sug-p${pageEntry.page}-${suggestions.length + 1}-${hash}`,
+                taskTitle: summarizeTaskTitleFromSegment(sentence),
+                dueDate,
+                rawDeadlineText: inlineDateMatch[0],
+                needsConfirmation: true,
+                recipient: defaultRecipient || undefined,
+                sourceExcerpt: sentence,
+                page: pageEntry.page,
+              });
+            }
+          }
+        }
+      }
+    }
+  }
+
+  return suggestions;
+}
+
+export async function extractPdfPageContentsForIndex(buffer: Buffer): Promise<{
+  pageTexts: PdfPageContent[];
+  taskSuggestions: PdfTaskSuggestion[];
+}> {
+  const { pageCount, pages } = await extractPdfTextWithPdfJs(buffer);
+  const pageTextByNum = new Map<number, string>();
+  const ocrPages: number[] = [];
+
+  for (const p of pages) {
+    pageTextByNum.set(p.pageNumber, p.fullText);
+    if (isGarbledText(p.fullText) && ocrPages.length < 10) {
+      ocrPages.push(p.pageNumber);
+    }
+  }
+
+  if (ocrPages.length > 0) {
+    try {
+      const ocrRun = await runVietnameseOcrOnPages(buffer, ocrPages);
+      for (const [pNum, ocrRes] of ocrRun.results.entries()) {
+        const existing = pageTextByNum.get(pNum) || '';
+        if (countMeaningfulChars(ocrRes.text) > countMeaningfulChars(existing) || isGarbledText(existing)) {
+          pageTextByNum.set(pNum, ocrRes.text);
+        }
+      }
+    } catch {
+      // ignore OCR failure during background indexing
+    }
+  }
+
+  const pageTexts: PdfPageContent[] = [];
+  for (let p = 1; p <= pageCount; p++) {
+    pageTexts.push({
+      page: p,
+      text: (pageTextByNum.get(p) || '').trim(),
+    });
+  }
+
+  return {
+    pageTexts,
+    taskSuggestions: extractPdfTaskSuggestions(pageTexts),
+  };
+}
+
 export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   sha256: string;
   extraction: PdfExtractionResult;
+  pageTexts: PdfPageContent[];
 }> {
   const sha256 = crypto.createHash('sha256').update(buffer).digest('hex');
   const { pageCount, pages, rawSigDates, rawSigSigners } = await extractPdfTextWithPdfJs(buffer);
@@ -1918,8 +2131,19 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
 
   const needsReview = reviewReasons.length > 0;
 
+  const pageTexts: PdfPageContent[] = [];
+  for (let p = 1; p <= pageCount; p++) {
+    pageTexts.push({
+      page: p,
+      text: (pageTextByNum.get(p) || '').trim(),
+    });
+  }
+  const taskSuggestions = extractPdfTaskSuggestions(pageTexts);
+  const indexedPageCount = pageTexts.filter((p) => countMeaningfulChars(p.text) >= 10).length;
+
   return {
     sha256,
+    pageTexts,
     extraction: {
       docNumber,
       docName,
@@ -1937,6 +2161,8 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
       pageCount,
       signerCandidates,
       fieldLocations,
+      taskSuggestions,
+      indexedPageCount,
     },
   };
 }

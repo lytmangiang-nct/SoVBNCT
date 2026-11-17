@@ -115,6 +115,23 @@ export function isSystemAdmin(user: Pick<User, 'role' | 'username'> | null | und
   return user.role === 'admin' || user.username.toLowerCase() === 'admin';
 }
 
+export function getUserDisplayName(
+  user: Pick<User, 'displayName' | 'fullName' | 'username'> | null | undefined
+): string {
+  if (!user) return '';
+  const display = typeof user.displayName === 'string' ? user.displayName.trim() : '';
+  if (display) return display;
+  const full = typeof user.fullName === 'string' ? user.fullName.trim() : '';
+  if (full) return full;
+  return user.username || '';
+}
+
+export function getUserSystemRoleLabel(
+  user: Pick<User, 'role' | 'username'> | null | undefined
+): string {
+  return isSystemAdmin(user) ? 'Quản trị viên' : 'Người dùng';
+}
+
 export function getUserBookPermissions(
   user: User | null | undefined,
   bookId: string = DEFAULT_BOOK_ID

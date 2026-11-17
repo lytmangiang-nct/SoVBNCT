@@ -23,18 +23,23 @@ import {
   Inbox,
   CheckSquare,
   XCircle,
+  Download,
+  FileCheck2,
+  Loader2,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
   DocumentRecord,
   DocumentTypeConfig,
   NumberRequest,
+  PreIssueCheckResult,
   RegistryBook,
   SignerConfig,
   SystemSettings,
   User,
+  WordTemplate,
 } from '../types';
-import { getTypeColorStyle, DOCUMENT_COLOR_PALETTE } from '../utils/documentColors';
+import { getTypeColorStyle, DOCUMENT_COLOR_PALETTE, SEMANTIC_STATUS_STYLES } from '../utils/documentColors';
 import {
   buildStandardDriveFileName,
   DEFAULT_MAX_WORD_MB,
@@ -42,7 +47,13 @@ import {
   generateSuggestedFileName,
   getWordFileExtension,
 } from '../utils/fileNaming';
-import { DEFAULT_BOOK_ID, getBookEnabledTypes, hasBookPermission, isSystemAdmin } from '../utils/permissions';
+import {
+  DEFAULT_BOOK_ID,
+  getBookEnabledTypes,
+  getUserDisplayName,
+  hasBookPermission,
+  isSystemAdmin,
+} from '../utils/permissions';
 
 interface IssueNumberViewProps {
   currentUser: User;
@@ -189,9 +200,12 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   // Queue Approval State (for issue_number users)
   const [processingReqId, setProcessingReqId] = useState<string | null>(null);
   const [queueError, setQueueError] = useState<string | null>(null);
+  const [rejectingReqId, setRejectingReqId] = useState<string | null>(null);
+  const [rejectReasonInput, setRejectReasonInput] = useState<string>('Chưa đủ thông tin văn bản');
 
   // Word File Attachment State
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
+  const [selectedFileSha256, setSelectedFileSha256] = useState<string | undefined>(undefined);
   const [fileError, setFileError] = useState<string | null>(null);
   const [uploadStep, setUploadStep] = useState<'idle' | 'issuing' | 'uploading' | 'saved' | 'failed'>('idle');
   const [pendingRetryFile, setPendingRetryFile] = useState<File | null>(null);
@@ -205,6 +219,24 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const retryFileInputRef = useRef<HTMLInputElement>(null);
+
+  // Word Templates State (auto-generate .docx from template)
+  const [wordTemplates, setWordTemplates] = useState<WordTemplate[]>([]);
+  const [selectedTemplateId, setSelectedTemplateId] = useState<string>('');
+  const [templateDraftCheck, setTemplateDraftCheck] = useState<{
+    missingFields: string[];
+    replacedPlaceholders: string[];
+  } | null>(null);
+  const [downloadingDraft, setDownloadingDraft] = useState<boolean>(false);
+  const [draftError, setDraftError] = useState<string | null>(null);
+  const [isRetryingTemplateWord, setIsRetryingTemplateWord] = useState<boolean>(false);
+
+  // Pre-Issue Confirmation Modal State
+  const [checkingPreIssue, setCheckingPreIssue] = useState<boolean>(false);
+  const [preIssueModalData, setPreIssueModalData] = useState<{
+    check: PreIssueCheckResult;
+    fileSha256?: string;
+  } | null>(null);
 
   const driveConfig =
     activeBook.id !== DEFAULT_BOOK_ID
@@ -253,17 +285,32 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   useEffect(() => {
     if (!serverYear || serverYear === formYear) return;
     if (hasOpenFormDraft) {
-      setYearRolloverNotice({
-        fromYear: formYear,
+      setYearRolloverNotice((prev) => ({
+        fromYear: prev?.fromYear ?? formYear,
         toYear: serverYear,
-        newPreviewNumber: nextNumber && nextNumber !== '...' && nextNumber !== '---' ? nextNumber : undefined,
-        confirmed: false,
-      });
+        newPreviewNumber:
+          previewStatus === 'ready' && previewYear === serverYear && nextNumber
+            ? nextNumber
+            : prev?.newPreviewNumber,
+        confirmed: prev?.toYear === serverYear ? prev.confirmed : false,
+      }));
     } else {
       setFormYear(serverYear);
       setYearRolloverNotice(null);
     }
-  }, [serverYear, formYear, hasOpenFormDraft, nextNumber]);
+  }, [serverYear, formYear, hasOpenFormDraft, previewStatus, previewYear, nextNumber]);
+
+  // Đồng bộ số dự kiến mới nhất vào banner chuyển năm ngay khi preview năm mới trả về
+  useEffect(() => {
+    if (!yearRolloverNotice) return;
+    if (previewStatus === 'ready' && previewYear === yearRolloverNotice.toYear && nextNumber) {
+      if (yearRolloverNotice.newPreviewNumber !== nextNumber) {
+        setYearRolloverNotice((prev) =>
+          prev ? { ...prev, newPreviewNumber: nextNumber } : prev
+        );
+      }
+    }
+  }, [yearRolloverNotice, previewStatus, previewYear, nextNumber]);
 
   // Reset signer default when book changes
   useEffect(() => {
@@ -282,6 +329,75 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       setTypeCode(activeTypes[0].code);
     }
   }, [activeTypes, activeBook.id, typeCode]);
+
+  // Load Word Templates scoped to activeBook
+  useEffect(() => {
+    if (!canIssue) {
+      setWordTemplates([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .getWordTemplates(activeBook.id)
+      .then((res) => {
+        if (!cancelled) setWordTemplates(res.templates || []);
+      })
+      .catch(() => {
+        if (!cancelled) setWordTemplates([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [activeBook.id, canIssue]);
+
+  const matchingTemplates = useMemo(
+    () =>
+      wordTemplates.filter(
+        (t) =>
+          t.bookId === activeBook.id &&
+          t.typeCode.trim().toUpperCase() === typeCode.trim().toUpperCase()
+      ),
+    [wordTemplates, activeBook.id, typeCode]
+  );
+
+  useEffect(() => {
+    if (selectedFile) {
+      if (selectedTemplateId) setSelectedTemplateId('');
+      return;
+    }
+    if (selectedTemplateId && !matchingTemplates.some((t) => t.id === selectedTemplateId)) {
+      setSelectedTemplateId('');
+    }
+  }, [matchingTemplates, selectedTemplateId, selectedFile]);
+
+  useEffect(() => {
+    if (!selectedTemplateId || selectedFile) {
+      setTemplateDraftCheck(null);
+      setDraftError(null);
+      return;
+    }
+    const timer = setTimeout(() => {
+      api
+        .checkWordTemplateDraft(selectedTemplateId, {
+          docName: docName.trim(),
+          title: title.trim(),
+          signer: signer.trim(),
+          signerRole: signerRole.trim(),
+          issueDate: todayVietnam,
+        })
+        .then((res) => {
+          setTemplateDraftCheck({
+            missingFields: res.missingFields || [],
+            replacedPlaceholders: res.replacedPlaceholders || [],
+          });
+          setDraftError(null);
+        })
+        .catch(() => {
+          setTemplateDraftCheck(null);
+        });
+    }, 280);
+    return () => clearTimeout(timer);
+  }, [selectedTemplateId, selectedFile, docName, title, signer, signerRole, todayVietnam]);
 
   const effectiveSeriesTypeCode = activeBook.numberMode === 'shared' ? 'SHARED' : typeCode;
   const currentSeriesKey = `${activeBook.id}::${effectiveSeriesTypeCode}::${activeBook.numberMode}`;
@@ -498,11 +614,26 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     canIssue,
     canRequest,
     canView,
+    serverYear,
   ]);
 
-  // Background recheck when configVersion changes, documents update from other tabs/devices, or tab regains focus
+  // Background recheck when configVersion changes, documents update from other tabs/devices, VN midnight rolls over, or tab regains focus
   useEffect(() => {
     if (!booksLoaded) return;
+
+    const getLocalVnYear = () => {
+      try {
+        const y = Number(
+          new Intl.DateTimeFormat('en-CA', {
+            timeZone: 'Asia/Ho_Chi_Minh',
+            year: 'numeric',
+          }).format(new Date())
+        );
+        return Number.isFinite(y) && y > 2000 ? y : formYear;
+      } catch {
+        return formYear;
+      }
+    };
 
     const handleRecheck = () => {
       if (document.visibilityState === 'visible') {
@@ -512,11 +643,19 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     window.addEventListener('focus', handleRecheck);
     document.addEventListener('visibilitychange', handleRecheck);
 
+    const midnightTimer = window.setInterval(() => {
+      const localVnYear = getLocalVnYear();
+      if (localVnYear !== formYear && !yearRolloverNotice) {
+        fetchNextNumber({ silent: true });
+      }
+    }, 10000);
+
     return () => {
       window.removeEventListener('focus', handleRecheck);
       document.removeEventListener('visibilitychange', handleRecheck);
+      window.clearInterval(midnightTimer);
     };
-  }, [booksLoaded, fetchNextNumber, previewStatus, previewSeriesKey, currentSeriesKey]);
+  }, [booksLoaded, fetchNextNumber, previewStatus, previewSeriesKey, currentSeriesKey, formYear, yearRolloverNotice]);
 
   const lastDocSignatureRef = useRef<string>('');
   useEffect(() => {
@@ -577,6 +716,19 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     return null;
   };
 
+  const computeFileSha256Hex = async (file: File): Promise<string | undefined> => {
+    try {
+      if (!window.crypto?.subtle) return undefined;
+      const buf = await file.arrayBuffer();
+      const hashBuffer = await window.crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(hashBuffer))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      return undefined;
+    }
+  };
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0] || null;
     setFileError(null);
@@ -587,22 +739,47 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     if (err) {
       setFileError(err);
       setSelectedFile(null);
+      setSelectedFileSha256(undefined);
       if (fileInputRef.current) fileInputRef.current.value = '';
       return;
     }
     setSelectedFile(file);
+    setSelectedTemplateId('');
+    void computeFileSha256Hex(file).then((hex) => setSelectedFileSha256(hex));
   };
 
   const handleClearSelectedFile = () => {
     setSelectedFile(null);
+    setSelectedFileSha256(undefined);
     setFileError(null);
     setSubmitError(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const handleDownloadTemplateDraft = async () => {
+    if (!selectedTemplateId || downloadingDraft) return;
+    setDownloadingDraft(true);
+    setDraftError(null);
+    try {
+      await api.downloadWordTemplateDraft(selectedTemplateId, {
+        docName: docName.trim(),
+        title: title.trim(),
+        signer: signer.trim(),
+        signerRole: signerRole.trim(),
+        issueDate: todayVietnam,
+      });
+    } catch (err: any) {
+      setDraftError(err?.message || 'Không thể tải bản nháp Word.');
+    } finally {
+      setDownloadingDraft(false);
+    }
+  };
+
   const performIssueSubmit = async (
     conflictAction?: 'suffix' | 'overwrite',
-    confirmUpdatedSequence = false
+    confirmUpdatedSequence = false,
+    overrideSha256?: string,
+    overrideExpected?: { expectedYear?: number; expectedNextSeq?: number }
   ) => {
     if (isSubmitting) return;
     setSubmitError(null);
@@ -702,6 +879,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     const submittingBookId = activeBook.id;
 
     try {
+      const effectiveSha = overrideSha256 || selectedFileSha256;
       const res = await api.issueDocument({
         bookId: submittingBookId,
         typeCode: submittingTypeCode,
@@ -714,10 +892,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         hasAttachment: Boolean(fileToUpload),
         attachmentName: fileToUpload?.name,
         attachmentSize: fileToUpload?.size,
+        fileSha256: effectiveSha,
         conflictAction,
-        expectedYear: yearRolloverNotice?.confirmed ? yearRolloverNotice.toYear : formYear,
-        expectedNextSeq: nextSequenceNumber,
+        expectedYear:
+          overrideExpected?.expectedYear ??
+          (yearRolloverNotice?.confirmed ? yearRolloverNotice.toYear : formYear),
+        expectedNextSeq: overrideExpected?.expectedNextSeq ?? nextSequenceNumber,
         confirmUpdatedSequence,
+        templateId: !fileToUpload && selectedTemplateId ? selectedTemplateId : undefined,
       });
 
       issuedDoc = res.document;
@@ -734,6 +916,15 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       setFormYear(issuedDoc.year);
       setIssuedSuccessDoc(issuedDoc);
       setIdempotencyKey(generateKey());
+      if (issuedDoc.templateId && !fileToUpload) {
+        setUploadStep(
+          issuedDoc.wordGenerationStatus === 'generated' && issuedDoc.driveStatus === 'saved'
+            ? 'saved'
+            : issuedDoc.wordGenerationStatus === 'failed' || issuedDoc.driveStatus === 'failed'
+            ? 'failed'
+            : 'idle'
+        );
+      }
 
       if (res.nextPreview && activeSeriesKeyRef.current === submittingSeriesKey) {
         setNextNumber(res.nextPreview.previewNumber);
@@ -842,7 +1033,107 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
-    await performIssueSubmit();
+    if (isSubmitting || checkingPreIssue) return;
+
+    if (!canIssue) {
+      await performIssueSubmit();
+      return;
+    }
+
+    setSubmitError(null);
+    setFilenameConflict(null);
+    setRequestSuccess(null);
+
+    if (!typeCode.trim()) {
+      setSubmitError('Vui lòng chọn loại văn bản');
+      return;
+    }
+    if (!docName.trim()) {
+      setSubmitError('Vui lòng nhập tên văn bản (thông tin bắt buộc)');
+      return;
+    }
+    if (!signer.trim()) {
+      setSubmitError('Vui lòng chọn hoặc nhập người ký văn bản');
+      return;
+    }
+    if (!signerRole.trim()) {
+      setSubmitError('Vui lòng nhập chức vụ của người ký');
+      return;
+    }
+    if (
+      !booksLoaded ||
+      previewStatus !== 'ready' ||
+      previewSeriesKey !== currentSeriesKey ||
+      nextSequenceNumber === null
+    ) {
+      setSubmitError('Đang kiểm tra số tiếp theo từ máy chủ hoặc chưa lấy được số mới nhất. Vui lòng thử lại.');
+      return;
+    }
+    if (selectedFile) {
+      const validationErr = validateWordFile(selectedFile);
+      if (validationErr) {
+        setFileError(validationErr);
+        setSubmitError(validationErr);
+        return;
+      }
+      if (!driveConfigured) {
+        setSubmitError(
+          `${driveConfig?.lastCheckMessage || 'Thư mục Google Drive chưa được cấu hình hợp lệ.'} Vui lòng bỏ chọn tệp để tiếp tục cấp số hoặc kiểm tra cấu hình Drive của sổ.`
+        );
+        return;
+      }
+    }
+    if (yearRolloverNotice && !yearRolloverNotice.confirmed) {
+      setSubmitError(
+        `Hệ thống vừa chuyển sang năm mới ${yearRolloverNotice.toYear} (giờ Việt Nam). Vui lòng xác nhận chuyển năm ở khung thông báo phía trên trước khi cấp số.`
+      );
+      return;
+    }
+
+    setCheckingPreIssue(true);
+    try {
+      const sha = selectedFile ? selectedFileSha256 || (await computeFileSha256Hex(selectedFile)) : undefined;
+      if (sha && sha !== selectedFileSha256) {
+        setSelectedFileSha256(sha);
+      }
+      const checkRes = await api.preIssueCheck({
+        bookId: activeBook.id,
+        typeCode: typeCode.trim().toUpperCase(),
+        docName: docName.trim(),
+        title: title.trim(),
+        fileSha256: sha,
+      });
+      if (checkRes.previewNumber) {
+        setNextNumber(checkRes.previewNumber);
+        setNextSequenceNumber(checkRes.sequenceNumber);
+      }
+      setPreIssueModalData({ check: checkRes, fileSha256: sha });
+    } catch (err: any) {
+      setSubmitError(err?.message || 'Không thể kiểm tra đối chiếu trước khi cấp số. Vui lòng thử lại.');
+    } finally {
+      setCheckingPreIssue(false);
+    }
+  };
+
+  const handleRetryTemplateWord = async () => {
+    if (!issuedSuccessDoc || isRetryingTemplateWord) return;
+    setIsRetryingTemplateWord(true);
+    setRetryError(null);
+    try {
+      const res = await api.retryWordDrive(issuedSuccessDoc.id, issuedSuccessDoc.templateId);
+      setIssuedSuccessDoc(res.document);
+      onDocumentUpdated?.(res.document);
+      setUploadStep('saved');
+    } catch (err: any) {
+      if (err.document) {
+        setIssuedSuccessDoc(err.document);
+        onDocumentUpdated?.(err.document);
+      }
+      setUploadStep('failed');
+      setRetryError(err?.message || 'Chưa tạo/lưu lại được tệp Word từ mẫu lên Google Drive.');
+    } finally {
+      setIsRetryingTemplateWord(false);
+    }
   };
 
   const handleRetryUpload = async (overrideFile?: File) => {
@@ -905,14 +1196,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   };
 
-  const handleRejectRequest = async (reqId: string) => {
+  const handleRejectRequest = async (reqId: string, reason: string) => {
     if (processingReqId) return;
-    const reason = window.prompt('Nhập lý do từ chối yêu cầu xin số (tùy chọn):', 'Chưa đủ thông tin văn bản');
-    if (reason === null) return;
     setProcessingReqId(reqId);
     setQueueError(null);
     try {
       await api.rejectNumberRequest(reqId, reason);
+      setRejectingReqId(null);
+      setRejectReasonInput('Chưa đủ thông tin văn bản');
       onRefreshRequests();
     } catch (err: any) {
       setQueueError(err.message || 'Không thể từ chối yêu cầu này.');
@@ -931,6 +1222,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     setSequenceConflict(null);
     setCopied(false);
     setSelectedFile(null);
+    setSelectedFileSha256(undefined);
     setFileError(null);
     setPendingRetryFile(null);
     setRetryError(null);
@@ -1098,12 +1390,18 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
 
   return (
     <div className="max-w-4xl mx-auto py-5 sm:py-8 px-3 sm:px-6 space-y-5 sm:space-y-6">
-      {/* Banner Intro + Book Switcher */}
+      {/* Banner Intro */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 sm:gap-4">
         <div className="min-w-0">
-          <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
-            {canIssue ? 'Cấp Số Văn Bản Tự Động' : 'Xin Số Văn Bản'}
-          </h1>
+          <div className="flex flex-wrap items-center gap-2">
+            <h1 className="text-xl sm:text-2xl font-bold tracking-tight text-slate-900">
+              {canIssue ? 'Cấp Số Văn Bản Tự Động' : 'Xin Số Văn Bản'}
+            </h1>
+            <span className={`inline-flex items-center gap-1.5 text-xs font-semibold px-2.5 py-0.5 rounded-md border ${SEMANTIC_STATUS_STYLES.outgoing.badge}`}>
+              <span className={`w-2 h-2 rounded-full ${SEMANTIC_STATUS_STYLES.outgoing.dot}`} />
+              <span>Văn bản đi</span>
+            </span>
+          </div>
           <p className="text-xs sm:text-sm text-slate-600 mt-1 leading-relaxed">
             {canIssue
               ? `Cấp số chính thức vào ${activeBook.name} (${activeBook.unitCode}) theo thứ tự nguyên tử và chống trùng số.`
@@ -1111,28 +1409,10 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
           </p>
         </div>
 
-        {issueAccessibleBooks.length > 1 && (
-          <div className="flex items-center gap-2 bg-white border border-slate-300 rounded-lg px-3 py-2 min-h-[44px] sm:min-h-[40px] shadow-2xs text-xs w-full sm:w-auto min-w-0 shrink-0">
-            <BookOpen className="w-4 h-4 text-sky-700 shrink-0" />
-            <select
-              aria-label="Chọn sổ làm việc"
-              value={activeBook.id}
-              onChange={(e) => {
-                onSelectBook(e.target.value);
-                setIssuedSuccessDoc(null);
-                setRequestSuccess(null);
-                setSubmitError(null);
-              }}
-              className="flex-1 sm:flex-initial min-w-0 font-semibold text-base sm:text-xs text-slate-800 bg-transparent focus:outline-hidden cursor-pointer"
-            >
-              {issueAccessibleBooks.map((b) => (
-                <option key={b.id} value={b.id}>
-                  {b.name} ({b.unitCode})
-                </option>
-              ))}
-            </select>
-          </div>
-        )}
+        <span className="inline-flex items-center gap-1.5 px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-xs font-semibold text-slate-700 shrink-0 self-start sm:self-center">
+          <BookOpen className="w-4 h-4 text-blue-700 shrink-0" />
+          <span>{activeBook.name} ({activeBook.unitCode})</span>
+        </span>
       </div>
 
       {/* Permission Guard if user has neither request_number nor issue_number on activeBook */}
@@ -1220,25 +1500,49 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   {reqItem.title && <p className="text-slate-500 text-[11px]">Trích yếu: {reqItem.title}</p>}
                 </div>
 
-                <div className="flex items-center gap-2 shrink-0">
-                  <button
-                    type="button"
-                    disabled={processingReqId === reqItem.id}
-                    onClick={() => handleApproveRequest(reqItem.id)}
-                    className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-semibold rounded-lg"
-                  >
-                    <CheckSquare className="w-3.5 h-3.5" />
-                    <span>{processingReqId === reqItem.id ? 'Đang cấp số...' : 'Duyệt & Cấp số'}</span>
-                  </button>
-                  <button
-                    type="button"
-                    disabled={processingReqId === reqItem.id}
-                    onClick={() => handleRejectRequest(reqItem.id)}
-                    className="inline-flex items-center gap-1 px-3 py-2 bg-white hover:bg-rose-50 border border-rose-300 text-rose-700 font-semibold rounded-lg"
-                  >
-                    <XCircle className="w-3.5 h-3.5" />
-                    <span>Từ chối</span>
-                  </button>
+                <div className="flex flex-col items-stretch sm:items-end gap-2 shrink-0">
+                  <div className="flex items-center gap-2">
+                    <button
+                      type="button"
+                      disabled={processingReqId === reqItem.id}
+                      onClick={() => handleApproveRequest(reqItem.id)}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-semibold rounded-lg"
+                    >
+                      <CheckSquare className="w-3.5 h-3.5" />
+                      <span>{processingReqId === reqItem.id ? 'Đang cấp số...' : 'Duyệt & Cấp số'}</span>
+                    </button>
+                    <button
+                      type="button"
+                      disabled={processingReqId === reqItem.id}
+                      onClick={() => {
+                        setRejectingReqId(rejectingReqId === reqItem.id ? null : reqItem.id);
+                        setRejectReasonInput('Chưa đủ thông tin văn bản');
+                      }}
+                      className="inline-flex items-center gap-1 px-3 py-2 bg-white hover:bg-rose-50 border border-rose-300 text-rose-700 font-semibold rounded-lg"
+                    >
+                      <XCircle className="w-3.5 h-3.5" />
+                      <span>Từ chối</span>
+                    </button>
+                  </div>
+                  {rejectingReqId === reqItem.id && (
+                    <div className="flex flex-wrap items-center gap-1.5 bg-rose-50 border border-rose-200 rounded-lg p-2">
+                      <input
+                        type="text"
+                        value={rejectReasonInput}
+                        onChange={(e) => setRejectReasonInput(e.target.value)}
+                        placeholder="Lý do từ chối..."
+                        className="px-2.5 py-1 bg-white border border-rose-300 rounded text-xs text-slate-900 min-w-[180px]"
+                      />
+                      <button
+                        type="button"
+                        disabled={processingReqId === reqItem.id}
+                        onClick={() => handleRejectRequest(reqItem.id, rejectReasonInput)}
+                        className="px-2.5 py-1 bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded text-xs"
+                      >
+                        Xác nhận
+                      </button>
+                    </div>
+                  )}
                 </div>
               </div>
             ))}
@@ -1276,9 +1580,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                           <span
                             className={`text-xs font-bold px-2.5 py-0.5 rounded border ${
                               driveSaved
-                                ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                                ? SEMANTIC_STATUS_STYLES.saved.badge
                                 : issuedSuccessDoc.driveStatus === 'uploading'
-                                ? 'bg-sky-50 text-sky-800 border-sky-200'
+                                ? SEMANTIC_STATUS_STYLES.pending.badge
                                 : 'bg-slate-100 text-slate-600 border-slate-200'
                             }`}
                           >
@@ -1290,6 +1594,25 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                           </span>
                         </>
                       )}
+                      <span
+                        className={`text-xs font-bold px-2.5 py-0.5 rounded border ${
+                          issuedSuccessDoc.syncStatus === 'synced'
+                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
+                            : issuedSuccessDoc.syncStatus === 'error'
+                            ? 'bg-rose-50 text-rose-800 border-rose-200'
+                            : issuedSuccessDoc.syncStatus === 'pending'
+                            ? 'bg-amber-50 text-amber-800 border-amber-200'
+                            : 'bg-slate-100 text-slate-600 border-slate-200'
+                        }`}
+                      >
+                        {issuedSuccessDoc.syncStatus === 'synced'
+                          ? 'Đã đồng bộ Trang tính'
+                          : issuedSuccessDoc.syncStatus === 'error'
+                          ? 'Lỗi Trang tính'
+                          : issuedSuccessDoc.syncStatus === 'pending'
+                          ? 'Đang đồng bộ Trang tính'
+                          : 'Trang tính chưa bật'}
+                      </span>
                       <span className="text-[11px] font-medium text-slate-600">
                         {issuedSuccessDoc.bookName || activeBook.name}
                       </span>
@@ -1464,39 +1787,53 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         </div>
 
                         <div className="flex flex-wrap items-center gap-2 pt-1">
-                          <input
-                            ref={retryFileInputRef}
-                            type="file"
-                            accept=".doc,.docx"
-                            className="hidden"
-                            onChange={(e) => {
-                              const f = e.target.files?.[0];
-                              if (!f) return;
-                              const err = validateWordFile(f);
-                              if (err) {
-                                setRetryError(err);
-                                return;
-                              }
-                              setRetryError(null);
-                              setPendingRetryFile(f);
-                            }}
-                          />
-                          <button
-                            type="button"
-                            onClick={() => retryFileInputRef.current?.click()}
-                            className="px-3 py-1.5 bg-white hover:bg-slate-50 border border-rose-300 text-rose-800 font-semibold rounded-md transition-colors"
-                          >
-                            Chọn lại tệp khác
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleRetryUpload()}
-                            disabled={isRetryingUpload || !pendingRetryFile}
-                            className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md shadow-2xs transition-colors"
-                          >
-                            <RefreshCw className="w-3.5 h-3.5" />
-                            <span>Thử lưu lại</span>
-                          </button>
+                          {issuedSuccessDoc.templateId && !pendingRetryFile ? (
+                            <button
+                              type="button"
+                              onClick={handleRetryTemplateWord}
+                              disabled={isRetryingTemplateWord}
+                              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md shadow-2xs transition-colors"
+                            >
+                              <RefreshCw className={`w-3.5 h-3.5 ${isRetryingTemplateWord ? 'animate-spin' : ''}`} />
+                              <span>{isRetryingTemplateWord ? 'Đang tạo & lưu lại...' : 'Thử tạo & lưu lại Word'}</span>
+                            </button>
+                          ) : (
+                            <>
+                              <input
+                                ref={retryFileInputRef}
+                                type="file"
+                                accept=".doc,.docx"
+                                className="hidden"
+                                onChange={(e) => {
+                                  const f = e.target.files?.[0];
+                                  if (!f) return;
+                                  const err = validateWordFile(f);
+                                  if (err) {
+                                    setRetryError(err);
+                                    return;
+                                  }
+                                  setRetryError(null);
+                                  setPendingRetryFile(f);
+                                }}
+                              />
+                              <button
+                                type="button"
+                                onClick={() => retryFileInputRef.current?.click()}
+                                className="px-3 py-1.5 bg-white hover:bg-slate-50 border border-rose-300 text-rose-800 font-semibold rounded-md transition-colors"
+                              >
+                                Chọn lại tệp khác
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => handleRetryUpload()}
+                                disabled={isRetryingUpload || !pendingRetryFile}
+                                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md shadow-2xs transition-colors"
+                              >
+                                <RefreshCw className="w-3.5 h-3.5" />
+                                <span>Thử lưu lại</span>
+                              </button>
+                            </>
+                          )}
                         </div>
                       </div>
                     )}
@@ -1574,35 +1911,14 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                         <option value="__add_new_type__">+ Thêm loại văn bản...</option>
                       )}
                     </select>
-                    <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-1">
+                    <div className="flex flex-wrap items-center justify-between gap-2 pt-1">
                       <span className="text-xs text-slate-500 break-words">
                         Sổ đang chọn: <strong className="text-slate-800">{activeBook.name}</strong> · Ký hiệu:{' '}
                         <strong className="text-slate-800">{activeBook.unitCode}</strong>
                       </span>
-                      {issueAccessibleBooks.length > 1 && (
-                        <div className="inline-flex items-center gap-1.5 text-xs bg-sky-50 border border-sky-200 rounded-md px-2.5 py-1.5 min-h-[38px] w-full sm:w-auto min-w-0">
-                          <BookOpen className="w-3.5 h-3.5 text-sky-700 shrink-0" />
-                          <select
-                            aria-label="Chọn sổ cấp số"
-                            value={activeBook.id}
-                            onChange={(e) => {
-                              onSelectBook(e.target.value);
-                              setIssuedSuccessDoc(null);
-                              setRequestSuccess(null);
-                              setSubmitError(null);
-                              setSequenceConflict(null);
-                            }}
-                            disabled={isSubmitting}
-                            className="flex-1 sm:flex-initial min-w-0 font-bold text-base sm:text-xs text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
-                          >
-                            {issueAccessibleBooks.map((b) => (
-                              <option key={b.id} value={b.id}>
-                                {b.name} ({b.unitCode})
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-                      )}
+                      <span className={`inline-flex items-center gap-1.5 text-[11px] font-semibold px-2 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.outgoing.badge}`}>
+                        Văn bản đi
+                      </span>
                     </div>
                   </div>
 
@@ -1851,7 +2167,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                     {canIssue ? 'Người lấy số (Tự động)' : 'Người xin số (Tự động)'}
                   </span>
                   <span className="text-sm font-semibold text-slate-900 break-words">
-                    {currentUser.fullName} <span className="text-slate-400 font-normal">({currentUser.username})</span>
+                    {getUserDisplayName(currentUser)} <span className="text-slate-400 font-normal">({currentUser.username})</span>
                   </span>
                 </div>
               </div>
@@ -2005,6 +2321,74 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       <span className="break-words min-w-0">{fileError}</span>
                     </div>
                   )}
+
+                  {/* Mẫu Word tự động (khi không tải tệp Word thủ công) */}
+                  {!selectedFile && matchingTemplates.length > 0 && (
+                    <div className="mt-2 pt-3 border-t border-slate-200 space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="text-xs font-bold text-slate-800 flex items-center gap-1.5">
+                          <FileCheck2 className="w-4 h-4 text-sky-700 shrink-0" />
+                          <span>Hoặc tạo tự động từ Mẫu Word ({matchingTemplates.length} mẫu)</span>
+                        </span>
+                        <span className="text-[11px] text-slate-500">
+                          Tự điền số chính thức &amp; lưu vào Google Drive khi cấp số
+                        </span>
+                      </div>
+
+                      <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                        <select
+                          aria-label="Chọn mẫu Word"
+                          value={selectedTemplateId}
+                          onChange={(e) => setSelectedTemplateId(e.target.value)}
+                          disabled={isSubmitting}
+                          className="flex-1 min-h-[40px] px-3 py-1.5 bg-white border border-slate-300 rounded-lg text-xs font-medium text-slate-900"
+                        >
+                          <option value="">— Không dùng mẫu Word —</option>
+                          {matchingTemplates.map((tpl) => (
+                            <option key={tpl.id} value={tpl.id}>
+                              {tpl.name} ({tpl.originalFileName})
+                            </option>
+                          ))}
+                        </select>
+
+                        {selectedTemplateId && (
+                          <button
+                            type="button"
+                            onClick={handleDownloadTemplateDraft}
+                            disabled={downloadingDraft}
+                            className="inline-flex items-center justify-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold bg-white hover:bg-sky-50 text-sky-800 border border-sky-300 rounded-lg shrink-0 disabled:opacity-50"
+                          >
+                            <Download className="w-3.5 h-3.5 shrink-0" />
+                            <span>{downloadingDraft ? 'Đang tạo nháp...' : 'Tải bản nháp (DỰ THẢO)'}</span>
+                          </button>
+                        )}
+                      </div>
+
+                      {selectedTemplateId && templateDraftCheck && (
+                        <div className="text-[11px] bg-white border border-slate-200 rounded-lg p-2.5 space-y-1">
+                          {templateDraftCheck.missingFields.length > 0 ? (
+                            <p className="text-amber-800 font-medium">
+                              Trường còn trống trong biểu mẫu:{' '}
+                              <span className="font-mono">{templateDraftCheck.missingFields.join(', ')}</span>
+                            </p>
+                          ) : (
+                            <p className="text-emerald-700 font-medium">
+                              Đã đủ dữ liệu điền vào các trường của mẫu Word.
+                            </p>
+                          )}
+                          {!driveConfigured && (
+                            <p className="text-amber-700">
+                              Lưu ý: Drive của sổ chưa cấu hình xong — số vẫn được cấp, trạng thái tệp sẽ là chưa lưu Drive để thử lại sau.
+                            </p>
+                          )}
+                        </div>
+                      )}
+
+                      {draftError && (
+                        <p className="text-xs text-rose-700 font-medium">{draftError}</p>
+                      )}
+                    </div>
+                  )}
                 </div>
               );
             })()}
@@ -2147,40 +2531,16 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
               </div>
 
               <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2.5">
-                {issueAccessibleBooks.length > 1 ? (
-                  <div className="inline-flex items-center justify-between gap-1.5 min-h-[44px] h-11 sm:h-12 px-3 bg-sky-50 border border-sky-200 rounded-lg text-xs min-w-0">
-                    <span className="text-sky-700 font-medium whitespace-nowrap">Sổ:</span>
-                    <select
-                      aria-label="Xác nhận sổ khi cấp số"
-                      value={activeBook.id}
-                      onChange={(e) => {
-                        onSelectBook(e.target.value);
-                        setIssuedSuccessDoc(null);
-                        setRequestSuccess(null);
-                        setSubmitError(null);
-                        setSequenceConflict(null);
-                      }}
-                      disabled={isSubmitting}
-                      className="flex-1 sm:flex-initial min-w-0 font-bold text-base sm:text-xs text-sky-900 bg-transparent focus:outline-hidden cursor-pointer"
-                    >
-                      {issueAccessibleBooks.map((b) => (
-                        <option key={b.id} value={b.id}>
-                          {b.name} ({b.unitCode})
-                        </option>
-                      ))}
-                    </select>
-                  </div>
-                ) : (
-                  <span className="inline-flex items-center justify-center gap-1.5 min-h-[44px] h-11 sm:h-12 px-3 bg-slate-100 border border-slate-200 rounded-lg text-xs font-bold text-slate-700">
-                    <BookOpen className="w-3.5 h-3.5 text-sky-700 shrink-0" />
-                    <span className="truncate">{activeBook.name}</span>
-                  </span>
-                )}
+                <span className="inline-flex items-center justify-center gap-1.5 min-h-[44px] h-11 sm:h-12 px-3 bg-slate-100 border border-slate-200 rounded-lg text-xs font-bold text-slate-700">
+                  <BookOpen className="w-3.5 h-3.5 text-blue-700 shrink-0" />
+                  <span className="truncate">{activeBook.name} ({activeBook.unitCode})</span>
+                </span>
 
                 <button
                   type="submit"
                   disabled={
                     isSubmitting ||
+                    checkingPreIssue ||
                     !booksLoaded ||
                     (canIssue &&
                       (previewStatus !== 'ready' ||
@@ -2191,7 +2551,12 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                   }
                   className="w-full sm:w-auto sm:min-w-[210px] min-h-[48px] h-12 px-6 bg-sky-700 hover:bg-sky-800 active:bg-sky-900 text-white font-semibold text-base sm:text-sm rounded-lg shadow-sm transition-all flex items-center justify-center gap-2 disabled:opacity-50 disabled:cursor-not-allowed"
                 >
-                  {isSubmitting ? (
+                  {checkingPreIssue ? (
+                    <>
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      <span>Đang kiểm tra trước cấp số...</span>
+                    </>
+                  ) : isSubmitting ? (
                     <>
                       <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
                       <span>
@@ -2389,6 +2754,170 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
           </div>
         </div>
       )}
+
+      {/* Modal: Pre-Issue Confirmation (Kiểm tra trước khi cấp số) */}
+      {preIssueModalData && (() => {
+        const { check, fileSha256 } = preIssueModalData;
+        const selectedTypeObj = activeTypes.find((t) => t.code === typeCode);
+        const selectedTplObj = selectedTemplateId
+          ? matchingTemplates.find((t) => t.id === selectedTemplateId)
+          : undefined;
+        const expectedWillSaveName = selectedFile
+          ? buildStandardDriveFileName(check.previewNumber, docName, selectedFile.name)
+          : selectedTplObj
+          ? buildStandardDriveFileName(check.previewNumber, docName, '.docx')
+          : 'Không đính kèm';
+
+        return (
+          <div className="fixed inset-0 z-50 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+            <div className="bg-white rounded-xl max-w-lg w-full p-4 sm:p-6 shadow-2xl border border-slate-200 space-y-4 max-h-[90dvh] overflow-y-auto">
+              <div className="flex items-start justify-between gap-2 border-b border-slate-100 pb-3">
+                <div>
+                  <h3 className="text-base font-bold text-slate-900">
+                    Xác nhận trước khi cấp số
+                  </h3>
+                  <p className="text-xs text-slate-500 mt-0.5">
+                    Kiểm tra lại thông tin hồ sơ trước khi chốt số chính thức
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setPreIssueModalData(null)}
+                  className="text-slate-400 hover:text-slate-700 p-1.5 min-w-[36px] min-h-[36px] flex items-center justify-center"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+
+              <dl className="grid grid-cols-1 sm:grid-cols-2 gap-3 bg-slate-50 border border-slate-200 rounded-xl p-3.5 text-xs">
+                <div>
+                  <dt className="text-slate-500">Sổ văn bản</dt>
+                  <dd className="font-bold text-slate-900 mt-0.5">{check.bookName}</dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Năm · Loại văn bản</dt>
+                  <dd className="font-bold text-slate-900 mt-0.5 tabular-nums">
+                    {check.year} · {selectedTypeObj?.name || typeCode} ({typeCode})
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Số dự kiến</dt>
+                  <dd className="font-mono font-extrabold text-base text-sky-800 mt-0.5 tabular-nums">
+                    {check.previewNumber}
+                  </dd>
+                </div>
+                <div>
+                  <dt className="text-slate-500">Người ký</dt>
+                  <dd className="font-bold text-slate-900 mt-0.5">
+                    {signer} ({signerRole})
+                  </dd>
+                </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-slate-500">Tên văn bản</dt>
+                  <dd className="font-semibold text-slate-900 mt-0.5 break-words">{docName.trim()}</dd>
+                </div>
+                <div className="sm:col-span-2">
+                  <dt className="text-slate-500">Tên tệp sẽ lưu</dt>
+                  <dd className="font-mono font-semibold text-slate-800 mt-0.5 break-all">
+                    {expectedWillSaveName}
+                    {selectedTplObj && !selectedFile && (
+                      <span className="ml-1.5 text-[11px] font-sans text-sky-700 font-semibold">
+                        (Tạo từ mẫu: {selectedTplObj.name})
+                      </span>
+                    )}
+                  </dd>
+                </div>
+              </dl>
+
+              {check.sameFileDocs.length > 0 && (
+                <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-xl space-y-2 text-xs text-rose-950">
+                  <div className="flex items-start gap-2 font-bold">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <span>Cảnh báo: Tệp đính kèm trùng nội dung (SHA-256) với hồ sơ đã có trong sổ</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {check.sameFileDocs.map((d) => (
+                      <div key={d.id} className="flex flex-wrap items-center justify-between gap-2 bg-white border border-rose-200 rounded-lg px-2.5 py-1.5">
+                        <span className="min-w-0">
+                          <strong className="font-mono">{d.fullDocNumber}</strong> · {d.docName} ({d.issueDate})
+                        </span>
+                        {d.canView && onOpenExistingDocument && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPreIssueModalData(null);
+                              onOpenExistingDocument(d.id);
+                            }}
+                            className="text-sky-700 font-semibold hover:underline shrink-0"
+                          >
+                            Mở hồ sơ
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {check.nearDuplicateDocs.length > 0 && (
+                <div className="p-3.5 bg-amber-50 border border-amber-200 rounded-xl space-y-2 text-xs text-amber-950">
+                  <div className="flex items-start gap-2 font-bold">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <span>Cảnh báo: Có hồ sơ gần giống tên văn bản trong sổ (chỉ để đối chiếu)</span>
+                  </div>
+                  <div className="space-y-1.5">
+                    {check.nearDuplicateDocs.map((d) => (
+                      <div key={d.id} className="flex flex-wrap items-center justify-between gap-2 bg-white border border-amber-200 rounded-lg px-2.5 py-1.5">
+                        <span className="min-w-0">
+                          <strong className="font-mono">{d.fullDocNumber}</strong> · {d.docName} ({d.issueDate})
+                        </span>
+                        {d.canView && onOpenExistingDocument && (
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setPreIssueModalData(null);
+                              onOpenExistingDocument(d.id);
+                            }}
+                            className="text-sky-700 font-semibold hover:underline shrink-0"
+                          >
+                            Mở hồ sơ
+                          </button>
+                        )}
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              <div className="flex flex-col-reverse sm:flex-row items-stretch sm:items-center justify-end gap-2 pt-2 border-t border-slate-100">
+                <button
+                  type="button"
+                  onClick={() => setPreIssueModalData(null)}
+                  className="min-h-[42px] px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-700 rounded-lg"
+                >
+                  Quay lại sửa
+                </button>
+                <button
+                  type="button"
+                  disabled={isSubmitting}
+                  onClick={async () => {
+                    const modalState = preIssueModalData;
+                    setPreIssueModalData(null);
+                    await performIssueSubmit(undefined, false, fileSha256, {
+                      expectedYear: modalState.check.year,
+                      expectedNextSeq: modalState.check.sequenceNumber,
+                    });
+                  }}
+                  className="min-h-[42px] px-5 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs inline-flex items-center justify-center gap-1.5"
+                >
+                  <CheckCircle2 className="w-4 h-4" />
+                  <span>Xác nhận cấp số {check.previewNumber}</span>
+                </button>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
     </div>
   );
 };

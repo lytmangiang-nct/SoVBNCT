@@ -240,11 +240,11 @@ export const StatisticsView: React.FC<StatisticsViewProps> = ({
               </div>
             </div>
 
-            {/* 4. Chờ đồng bộ Excel */}
+            {/* 4. Chờ đồng bộ Google Trang tính */}
             <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-xs">
               <div className="flex items-center justify-between text-slate-500 mb-2">
                 <span className="text-xs font-semibold uppercase tracking-wider text-slate-600">
-                  Chờ đồng bộ Excel
+                  Chờ đồng bộ Google Trang tính
                 </span>
                 <span className="p-2 bg-amber-50 text-amber-700 rounded-lg">
                   <TrendingUp className="w-4 h-4" />

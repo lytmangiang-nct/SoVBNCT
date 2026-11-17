@@ -198,7 +198,46 @@ export const DEFAULT_TYPE_COLORS: Record<string, string> = {
   HD: 'cyan',
   QC: 'orange',
   CTR: 'emerald',
+  VBD: 'purple',
 };
+
+export const SEMANTIC_STATUS_STYLES = {
+  outgoing: {
+    label: 'Văn bản đi',
+    badge: 'bg-blue-50 text-blue-800 border-blue-200',
+    strongBadge: 'bg-blue-100 text-blue-900 border-blue-300',
+    text: 'text-blue-800',
+    dot: 'bg-blue-600',
+  },
+  incoming: {
+    label: 'Văn bản đến',
+    badge: 'bg-purple-50 text-purple-800 border-purple-200',
+    strongBadge: 'bg-purple-100 text-purple-900 border-purple-300',
+    text: 'text-purple-800',
+    dot: 'bg-purple-600',
+  },
+  saved: {
+    label: 'Đã lưu lên Drive',
+    badge: 'bg-emerald-50 text-emerald-800 border-emerald-200',
+    strongBadge: 'bg-emerald-100 text-emerald-900 border-emerald-300',
+    text: 'text-emerald-800',
+    dot: 'bg-emerald-600',
+  },
+  pending: {
+    label: 'Cần kiểm tra / Đang chờ',
+    badge: 'bg-amber-50 text-amber-900 border-amber-300',
+    strongBadge: 'bg-amber-100 text-amber-900 border-amber-300',
+    text: 'text-amber-900',
+    dot: 'bg-amber-600',
+  },
+  danger: {
+    label: 'Lỗi / Đã hủy / Đã xóa',
+    badge: 'bg-rose-50 text-rose-800 border-rose-200',
+    strongBadge: 'bg-rose-100 text-rose-900 border-rose-300',
+    text: 'text-rose-800',
+    dot: 'bg-rose-600',
+  },
+} as const;
 
 const COLOR_KEYS = Object.keys(DOCUMENT_COLOR_PALETTE);
 

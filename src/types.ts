@@ -128,7 +128,219 @@ export type DocumentAuditAction =
   | 'import_pdf'
   | 'upload_pdf'
   | 'request_number'
-  | 'replace_file';
+  | 'replace_file'
+  | 'template_manage'
+  | 'word_generate'
+  | 'attachment_add'
+  | 'attachment_replace'
+  | 'attachment_set_official'
+  | 'task_create'
+  | 'task_update'
+  | 'reconcile_sync';
+
+export type AttachmentGroup = 'word_draft' | 'signed_pdf' | 'appendix';
+
+export interface DocumentAttachmentVersion {
+  version: number;
+  fileName: string;
+  originalFileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+  sha256?: string;
+  driveFileId?: string;
+  driveFileUrl?: string;
+  driveFolderId?: string;
+  driveFolderPath?: string;
+  driveStatus: DriveUploadStatus;
+  driveError?: string;
+  uploadedBy: string;
+  uploadedByUsername?: string;
+  uploadedAt: string;
+}
+
+export interface DocumentAttachment {
+  id: string;
+  group: AttachmentGroup;
+  label?: string;
+  isOfficial: boolean;
+  currentVersion: number;
+  fileName: string;
+  originalFileName?: string;
+  mimeType?: string;
+  fileSize?: number;
+  sha256?: string;
+  driveFileId?: string;
+  driveFileUrl?: string;
+  driveFolderId?: string;
+  driveFolderPath?: string;
+  driveStatus: DriveUploadStatus;
+  driveError?: string;
+  uploadedBy?: string;
+  uploadedByUsername?: string;
+  uploadedAt?: string;
+  versions: DocumentAttachmentVersion[];
+}
+
+export interface WordTemplate {
+  id: string;
+  bookId: string;
+  bookCode?: string;
+  typeCode: string;
+  name: string;
+  originalFileName: string;
+  fileSize: number;
+  base64Docx: string;
+  placeholders: string[];
+  createdBy: string;
+  createdByUserId: string;
+  createdAt: string;
+  updatedAt: string;
+  updatedBy?: string;
+}
+
+export interface PdfPageContent {
+  page: number;
+  text: string;
+}
+
+export interface PdfTaskSuggestion {
+  id: string;
+  taskTitle: string;
+  dueDate: string; // dd/MM/yyyy hoặc '' nếu là hạn tương đối cần xác nhận
+  rawDeadlineText?: string;
+  needsConfirmation: boolean;
+  recipient?: string;
+  sourceExcerpt: string;
+  page: number;
+}
+
+export type DocumentTaskStatus = 'pending' | 'in_progress' | 'done';
+
+export interface DocumentTask {
+  id: string;
+  bookId: string;
+  bookCode?: string;
+  bookName?: string;
+  docId: string;
+  fullDocNumber: string;
+  docName: string;
+  suggestionId?: string;
+  title: string;
+  dueDate: string;
+  rawDeadlineText?: string;
+  needsConfirmation: boolean;
+  recipient?: string;
+  sourceExcerpt?: string;
+  sourcePage?: number;
+  assigneeUserId: string;
+  assigneeName: string;
+  assigneeUsername: string;
+  status: DocumentTaskStatus;
+  createdByUserId: string;
+  createdByName: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface PdfContentSearchMatch {
+  docId: string;
+  bookId: string;
+  bookCode?: string;
+  bookName?: string;
+  fullDocNumber: string;
+  docName: string;
+  docCategory?: DocumentCategory;
+  issueDate?: string;
+  year: number;
+  typeCode: string;
+  status: DocumentStatus;
+  page: number;
+  snippet: string;
+  attachmentId?: string;
+  pdfTextStatus: 'indexed' | 'no_text';
+}
+
+export type DriveVerificationState =
+  | 'no_attachment'
+  | 'unsaved'
+  | 'not_found'
+  | 'access_denied'
+  | 'unverified'
+  | 'ok';
+
+export type ReconciliationIssueType =
+  | 'drive_failed'
+  | 'drive_link_issue'
+  | 'sheets_unsynced'
+  | 'duplicate_number';
+
+export interface ReconciliationItem {
+  id: string;
+  issueType: ReconciliationIssueType;
+  severity: 'error' | 'warning';
+  bookId: string;
+  bookCode: string;
+  bookName: string;
+  year: number;
+  docId: string;
+  fullDocNumber: string;
+  docName: string;
+  status: DocumentStatus;
+  driveState: DriveVerificationState;
+  driveStateLabel: string;
+  driveFileId?: string;
+  driveFileUrl?: string;
+  driveError?: string;
+  sheetsSyncState: string;
+  sheetsSyncError?: string;
+  duplicateDocIds?: string[];
+  detailMessage: string;
+  canRetry: boolean;
+  retryKind?: 'sheets' | 'word_drive';
+}
+
+export interface ReconciliationReport {
+  checkedAt: string;
+  bookId: string;
+  year: string;
+  driveChecked: boolean;
+  summary: {
+    totalDocumentsScanned: number;
+    totalIssues: number;
+    driveFailedCount: number;
+    driveLinkIssueCount: number;
+    sheetsUnsyncedCount: number;
+    duplicateNumberCount: number;
+  };
+  items: ReconciliationItem[];
+}
+
+export interface PreIssueCheckResult {
+  bookId: string;
+  bookName: string;
+  year: number;
+  formattedDate: string;
+  previewNumber: string;
+  sequenceNumber: number;
+  nearDuplicateDocs: Array<{
+    id: string;
+    fullDocNumber: string;
+    docName: string;
+    issueDate: string;
+    signer: string;
+    status: DocumentStatus;
+    canView: boolean;
+  }>;
+  sameFileDocs: Array<{
+    id: string;
+    fullDocNumber: string;
+    docName: string;
+    issueDate: string;
+    driveFileName?: string;
+    status: DocumentStatus;
+    canView: boolean;
+  }>;
+}
 
 export interface AuditLog {
   id?: string;
@@ -174,7 +386,9 @@ export interface SystemAuditLog {
     | 'user_update'
     | 'user_delete'
     | 'book_create'
-    | 'book_update';
+    | 'book_update'
+    | 'history_cleanup'
+    | 'deleted_list_archive';
   bookId?: string;
   bookCode?: string;
   targetUserId?: string;
@@ -193,6 +407,8 @@ export interface DocumentRecord {
   year: number;
   issueDate: string; // dd/mm/yyyy hoặc '' nếu văn bản đến không xác định được ngày ban hành
   signDate?: string; // Ngày ký riêng (nếu xác định được tách biệt với ngày ban hành)
+  receivedAt?: string; // ISO thời điểm tiếp nhận vào hệ thống
+  receivedDate?: string; // dd/mm/yyyy ngày tiếp nhận theo giờ Việt Nam
   createdAt: string; // ISO
   docCategory?: DocumentCategory; // 'outgoing' (Đoàn trường ban hành) | 'incoming' (Văn bản đến PDF)
   issuingAgency?: string; // Cơ quan ban hành gốc (đối với văn bản đến)
@@ -218,6 +434,10 @@ export interface DocumentRecord {
   deletedByUsername?: string;
   deletedByUserId?: string;
   deletedSnapshot?: Record<string, any>;
+  deletedListArchived?: boolean;
+  deletedArchivedAt?: string;
+  deletedArchivedBy?: string;
+  deletedArchivedByUserId?: string;
   excelDeleteSyncStatus?: ExcelDeleteSyncStatus;
   excelMovedToDeletedSheet?: boolean;
   excelRemovedFromMainSheet?: boolean;
@@ -257,6 +477,18 @@ export interface DocumentRecord {
   needsReview?: boolean;
   reviewReasons?: string[];
   relevantPages?: number[];
+  // Multi-attachment & versioning
+  attachments?: DocumentAttachment[];
+  // Auto Word generation from template
+  templateId?: string;
+  wordGenerationStatus?: 'none' | 'generated' | 'failed';
+  wordGenerationError?: string;
+  // Indexed PDF page contents & extracted task suggestions
+  pdfPageContents?: PdfPageContent[];
+  pdfContentVersion?: number;
+  pdfTextStatus?: 'indexed' | 'no_text';
+  pdfIndexedPagesCount?: number;
+  pdfTaskSuggestions?: PdfTaskSuggestion[];
 }
 
 export type NumberRequestStatus = 'pending' | 'issued' | 'rejected';
@@ -324,6 +556,8 @@ export interface PdfExtractionResult {
   pageCount: number;
   signerCandidates?: string[];
   fieldLocations?: Partial<Record<ExtractableFieldKey, FieldLocation>>;
+  taskSuggestions?: PdfTaskSuggestion[];
+  indexedPageCount?: number;
 }
 
 export interface PdfAnalyzeResponse {
@@ -344,6 +578,7 @@ export interface User {
   id: string;
   username: string;
   fullName: string;
+  displayName?: string;
   role: 'admin' | 'issuer';
   isActive: boolean;
   createdAt: string;
@@ -480,4 +715,57 @@ export interface StartSequenceSeriesConfig {
   legacyReconciliationWarnings?: string[];
   verifiedFromPrimary?: boolean;
 }
+
+export type HistoryCleanupScope = 'today' | 'last_10_days' | 'before_date' | 'all';
+
+export interface HistoryCleanupPreviewResponse {
+  bookId: string;
+  bookCode: string;
+  bookName: string;
+  scope: HistoryCleanupScope;
+  beforeDate?: string;
+  rangeLabel: string;
+  fromDateKey?: string | null;
+  toDateKey?: string | null;
+  matchCount: number;
+  requiresTypedConfirmation: boolean;
+  confirmationPhrase: string;
+}
+
+export interface HistoryCleanupResultResponse extends HistoryCleanupPreviewResponse {
+  success: boolean;
+  deletedCount: number;
+  remainingCount: number;
+  message: string;
+}
+
+export interface BulkSyncDeletedResult {
+  success: boolean;
+  bookId: string;
+  bookName: string;
+  totalTargeted: number;
+  succeededCount: number;
+  failedCount: number;
+  succeededIds: string[];
+  failedItems: Array<{
+    id: string;
+    fullDocNumber: string;
+    docName: string;
+    error: string;
+  }>;
+  documents: DocumentRecord[];
+  message: string;
+}
+
+export interface ArchiveDeletedResult {
+  success: boolean;
+  bookId: string;
+  bookName: string;
+  archivedCount: number;
+  skippedUnsyncedCount: number;
+  archivedIds: string[];
+  documents: DocumentRecord[];
+  message: string;
+}
+
 

@@ -1,15 +1,26 @@
 import type {
+  ArchiveDeletedResult,
+  AttachmentGroup,
   AuthResponse,
   BookPermission,
+  BulkSyncDeletedResult,
   DocumentHistoryEntry,
   DocumentRecord,
+  DocumentTask,
+  DocumentTaskStatus,
   DocumentTypeConfig,
   GoogleDriveConfig,
+  HistoryCleanupPreviewResponse,
+  HistoryCleanupResultResponse,
+  HistoryCleanupScope,
   LegacySnapshotSummary,
   NumberRequest,
   PdfAnalyzeResponse,
+  PdfContentSearchMatch,
   PersistenceStatus,
+  PreIssueCheckResult,
   PreviewNumberResponse,
+  ReconciliationReport,
   RegistryBook,
   SignerConfig,
   StartSequenceSeriesConfig,
@@ -18,6 +29,7 @@ import type {
   SystemAuditLog,
   SystemSettings,
   User,
+  WordTemplate,
 } from './types';
 
 const TOKEN_KEY = 'nct_doc_token';
@@ -55,6 +67,16 @@ export function saveAuth(response: AuthResponse) {
     localStorage.removeItem(USER_KEY);
     sessionStorage.setItem(TOKEN_KEY, response.token);
     sessionStorage.setItem(USER_KEY, JSON.stringify(response.user));
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export function updateStoredUser(user: User) {
+  try {
+    if (sessionStorage.getItem(TOKEN_KEY)) {
+      sessionStorage.setItem(USER_KEY, JSON.stringify(user));
+    }
   } catch {
     // ignore storage errors
   }
@@ -357,6 +379,7 @@ export const api = {
   createUser: async (payload: {
     username: string;
     fullName: string;
+    displayName?: string;
     password: string;
     role?: 'admin' | 'issuer';
     bookPermissions?: Record<string, BookPermission[]>;
@@ -371,6 +394,7 @@ export const api = {
     id: string,
     payload: Partial<{
       fullName: string;
+      displayName: string;
       role: string;
       isActive: boolean;
       password?: string;
@@ -668,6 +692,20 @@ export const api = {
     });
   },
 
+  // Pre-issue verification (fresh number + near-duplicate docName + SHA-256)
+  preIssueCheck: async (payload: {
+    bookId?: string;
+    typeCode: string;
+    docName: string;
+    title?: string;
+    fileSha256?: string;
+  }): Promise<PreIssueCheckResult> => {
+    return request<PreIssueCheckResult>('/api/documents/pre-issue-check', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
   // Issue Number (Quyền "Cấp số")
   issueDocument: async (payload: {
     bookId?: string;
@@ -681,17 +719,33 @@ export const api = {
     hasAttachment?: boolean;
     attachmentName?: string;
     attachmentSize?: number;
+    fileSha256?: string;
     conflictAction?: 'suffix' | 'overwrite';
     customFileName?: string;
     expectedYear?: number;
     expectedNextSeq?: number;
     confirmUpdatedSequence?: boolean;
+    templateId?: string;
+    templateCustomValues?: Record<string, string>;
   }): Promise<{ document: DocumentRecord; nextPreview?: PreviewNumberResponse; duplicatePrevented?: boolean }> => {
     return request<{ document: DocumentRecord; nextPreview?: PreviewNumberResponse; duplicatePrevented?: boolean }>(
       '/api/documents/issue',
       {
         method: 'POST',
         body: JSON.stringify(payload),
+      }
+    );
+  },
+
+  retryWordDrive: async (
+    docId: string,
+    templateId?: string
+  ): Promise<{ success: boolean; document: DocumentRecord; error?: string }> => {
+    return request<{ success: boolean; document: DocumentRecord; error?: string }>(
+      `/api/documents/${encodeURIComponent(docId)}/retry-word-drive`,
+      {
+        method: 'POST',
+        body: JSON.stringify(templateId ? { templateId } : {}),
       }
     );
   },
@@ -816,6 +870,7 @@ export const api = {
     category?: string;
     signer?: string;
     status?: string;
+    deletedArchive?: 'active' | 'archived' | 'all';
     driveStatus?: string;
     deletedBy?: string;
     fromDate?: string;
@@ -841,6 +896,8 @@ export const api = {
     docId?: string;
     action?: string;
     search?: string;
+    page?: number;
+    pageSize?: number;
   } = {}): Promise<{
     total: number;
     logs: DocumentHistoryEntry[];
@@ -860,13 +917,40 @@ export const api = {
     }>(`/api/document-history${qs ? `?${qs}` : ''}`);
   },
 
+  previewHistoryCleanup: async (payload: {
+    bookId: string;
+    scope: HistoryCleanupScope;
+    beforeDate?: string;
+  }): Promise<HistoryCleanupPreviewResponse> => {
+    return request<HistoryCleanupPreviewResponse>('/api/document-history/cleanup/preview', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  cleanupDocumentHistory: async (payload: {
+    bookId: string;
+    scope: HistoryCleanupScope;
+    beforeDate?: string;
+    confirmationText?: string;
+  }): Promise<HistoryCleanupResultResponse> => {
+    return request<HistoryCleanupResultResponse>('/api/document-history/cleanup', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
   getDocument: async (id: string): Promise<{ document: DocumentRecord }> => {
     return request<{ document: DocumentRecord }>(`/api/documents/${id}`);
   },
 
-  openDocumentFile: async (id: string): Promise<{ url: string; fileName: string; fileId: string }> => {
-    return request<{ url: string; fileName: string; fileId: string }>(
-      `/api/documents/${encodeURIComponent(id)}/open-file`
+  openDocumentFile: async (
+    id: string,
+    attachmentId?: string
+  ): Promise<{ url: string; fileName: string; fileId: string; attachmentId?: string }> => {
+    const q = attachmentId ? `?attachmentId=${encodeURIComponent(attachmentId)}` : '';
+    return request<{ url: string; fileName: string; fileId: string; attachmentId?: string }>(
+      `/api/documents/${encodeURIComponent(id)}/open-file${q}`
     );
   },
 
@@ -914,6 +998,29 @@ export const api = {
     );
   },
 
+  bulkSyncDeletedDocuments: async (payload: {
+    bookId?: string;
+    mode: 'selected' | 'pending';
+    docIds?: string[];
+  }): Promise<BulkSyncDeletedResult> => {
+    return request<BulkSyncDeletedResult>('/api/documents/deleted/bulk-sync', {
+      method: 'POST',
+      timeoutMs: 60000,
+      body: JSON.stringify(payload),
+    });
+  },
+
+  archiveDeletedDocuments: async (payload: {
+    bookId?: string;
+    mode: 'selected' | 'all_synced';
+    docIds?: string[];
+  }): Promise<ArchiveDeletedResult> => {
+    return request<ArchiveDeletedResult>('/api/documents/deleted/archive', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
   cancelDocument: async (id: string, reason: string): Promise<{ document: DocumentRecord }> => {
     return request<{ document: DocumentRecord }>(`/api/documents/${id}/cancel`, {
       method: 'POST',
@@ -952,8 +1059,13 @@ export const api = {
     }
 
     const blob = await res.blob();
-    const yearStr = params.year && params.year !== 'all' ? String(params.year) : new Date().getFullYear().toString();
-    const fileName = `SO_CAP_SO_VAN_BAN_DOAN_TRUONG_${yearStr}.xlsx`;
+    const yearStr =
+      params.year === 'unknown'
+        ? 'CHUA_XAC_DINH_NAM'
+        : params.year && params.year !== 'all'
+        ? String(params.year)
+        : 'TAT_CA';
+    const fileName = `SO_CAP_SO_VAN_BAN_${yearStr}.xlsx`;
 
     const downloadUrl = window.URL.createObjectURL(blob);
     const a = document.createElement('a');
@@ -1042,6 +1154,246 @@ export const api = {
     }>('/api/drive/test', {
       method: 'POST',
       body: JSON.stringify(payload || {}),
+    });
+  },
+
+  // Word Templates
+  getWordTemplates: async (bookId?: string): Promise<{
+    templates: WordTemplate[];
+    supportedPlaceholders: Array<{ key: string; label: string }>;
+  }> => {
+    const q = bookId ? `?bookId=${encodeURIComponent(bookId)}` : '';
+    return request(`/api/word-templates${q}`);
+  },
+
+  createWordTemplate: async (payload: {
+    bookId: string;
+    typeCode: string;
+    name: string;
+    file: File;
+  }): Promise<{ template: WordTemplate; placeholders: string[] }> => {
+    const formData = new FormData();
+    formData.append('bookId', payload.bookId);
+    formData.append('typeCode', payload.typeCode);
+    formData.append('name', payload.name);
+    formData.append('file', payload.file);
+    return request('/api/word-templates', {
+      method: 'POST',
+      body: formData,
+    });
+  },
+
+  deleteWordTemplate: async (id: string): Promise<{ success: boolean }> => {
+    return request(`/api/word-templates/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    });
+  },
+
+  checkWordTemplateDraft: async (
+    templateId: string,
+    payload: {
+      docName?: string;
+      title?: string;
+      signer?: string;
+      signerRole?: string;
+      issueDate?: string;
+      customValues?: Record<string, string>;
+    }
+  ): Promise<{
+    templateId: string;
+    placeholders: string[];
+    replacedPlaceholders: string[];
+    missingFields: string[];
+  }> => {
+    return request(`/api/word-templates/${encodeURIComponent(templateId)}/preview-draft`, {
+      method: 'POST',
+      body: JSON.stringify({ ...payload, download: false }),
+    });
+  },
+
+  downloadWordTemplateDraft: async (
+    templateId: string,
+    payload: {
+      docName?: string;
+      title?: string;
+      signer?: string;
+      signerRole?: string;
+      issueDate?: string;
+      customValues?: Record<string, string>;
+    }
+  ): Promise<void> => {
+    const token = getStoredToken();
+    const headers = new Headers({ 'Content-Type': 'application/json' });
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    const res = await fetch(buildApiUrl(`/api/word-templates/${encodeURIComponent(templateId)}/preview-draft`), {
+      method: 'POST',
+      headers,
+      credentials: 'include',
+      body: JSON.stringify({ ...payload, download: true }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Không thể tải bản nháp Word.');
+    }
+    const blob = await res.blob();
+    const cleanTitle = (payload.docName || 'du-thao').replace(/[\\/:*?"<>|]+/g, '-').slice(0, 60);
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `DU-THAO - ${cleanTitle}.docx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => window.URL.revokeObjectURL(url), 5000);
+  },
+
+  // Tasks & "Việc của tôi"
+  getTasks: async (params: {
+    scope?: 'mine' | 'all';
+    docId?: string;
+    bookId?: string;
+    status?: DocumentTaskStatus | 'all';
+  } = {}): Promise<{ total: number; tasks: DocumentTask[] }> => {
+    const q = new URLSearchParams();
+    if (params.scope) q.append('scope', params.scope);
+    if (params.docId) q.append('docId', params.docId);
+    if (params.bookId) q.append('bookId', params.bookId);
+    if (params.status) q.append('status', params.status);
+    const qs = q.toString();
+    return request(`/api/tasks${qs ? `?${qs}` : ''}`);
+  },
+
+  getTaskAssignees: async (bookId?: string): Promise<{
+    assignees: Array<{ id: string; username: string; fullName: string; displayName: string; role: string }>;
+  }> => {
+    const q = bookId ? `?bookId=${encodeURIComponent(bookId)}` : '';
+    return request(`/api/tasks/assignees${q}`);
+  },
+
+  createTask: async (payload: {
+    docId: string;
+    suggestionId?: string;
+    title: string;
+    dueDate?: string;
+    rawDeadlineText?: string;
+    needsConfirmation?: boolean;
+    recipient?: string;
+    sourceExcerpt?: string;
+    sourcePage?: number;
+    assigneeUserId?: string;
+  }): Promise<{ task: DocumentTask; deduplicated?: boolean }> => {
+    return request('/api/tasks', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  updateTask: async (
+    taskId: string,
+    payload: Partial<{
+      status: DocumentTaskStatus;
+      title: string;
+      dueDate: string;
+      assigneeUserId: string;
+      needsConfirmation: boolean;
+    }>
+  ): Promise<{ task: DocumentTask }> => {
+    return request(`/api/tasks/${encodeURIComponent(taskId)}`, {
+      method: 'PUT',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  // Multi-attachment & versioning
+  uploadDocumentAttachment: async (
+    docId: string,
+    payload: {
+      file: File;
+      group: AttachmentGroup;
+      attachmentId?: string;
+      label?: string;
+      fileName?: string;
+      setAsOfficial?: boolean;
+    }
+  ): Promise<{ success: boolean; document: DocumentRecord }> => {
+    const formData = new FormData();
+    formData.append('file', payload.file);
+    formData.append('group', payload.group);
+    if (payload.attachmentId) formData.append('attachmentId', payload.attachmentId);
+    if (payload.label) formData.append('label', payload.label);
+    if (payload.fileName) formData.append('fileName', payload.fileName);
+    if (payload.setAsOfficial) formData.append('setAsOfficial', 'true');
+    return request(`/api/documents/${encodeURIComponent(docId)}/attachments`, {
+      method: 'POST',
+      body: formData,
+    });
+  },
+
+  setOfficialAttachment: async (
+    docId: string,
+    attachmentId: string
+  ): Promise<{ success: boolean; document: DocumentRecord }> => {
+    return request(
+      `/api/documents/${encodeURIComponent(docId)}/attachments/${encodeURIComponent(attachmentId)}/set-official`,
+      { method: 'POST' }
+    );
+  },
+
+  // PDF Content Search
+  searchPdfContent: async (params: {
+    q: string;
+    bookId?: string;
+    year?: string | number;
+    includeDeleted?: boolean;
+  }): Promise<{
+    total: number;
+    matches: PdfContentSearchMatch[];
+    indexedCount: number;
+    unindexedCount: number;
+  }> => {
+    const sp = new URLSearchParams();
+    sp.append('q', params.q);
+    if (params.bookId) sp.append('bookId', params.bookId);
+    if (params.year) sp.append('year', String(params.year));
+    if (params.includeDeleted) sp.append('includeDeleted', 'true');
+    return request(`/api/documents/search-pdf?${sp.toString()}`);
+  },
+
+  // Reconciliation
+  getReconciliationReport: async (params: {
+    bookId?: string;
+    year?: string | number;
+    verifyDrive?: boolean;
+  } = {}): Promise<ReconciliationReport> => {
+    const sp = new URLSearchParams();
+    if (params.bookId) sp.append('bookId', params.bookId);
+    if (params.year) sp.append('year', String(params.year));
+    if (params.verifyDrive) sp.append('verifyDrive', 'true');
+    const qs = sp.toString();
+    return request(`/api/reconciliation${qs ? `?${qs}` : ''}`, {
+      timeoutMs: params.verifyDrive ? 45000 : 15000,
+    });
+  },
+
+  retryReconciliationItem: async (payload: {
+    docId: string;
+    retryKind?: 'sheets' | 'word_drive';
+  }): Promise<{ success: boolean; document: DocumentRecord }> => {
+    return request('/api/reconciliation/retry-item', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  bulkSyncReconciliation: async (docIds: string[]): Promise<{
+    total: number;
+    succeeded: number;
+    failed: number;
+  }> => {
+    return request('/api/reconciliation/bulk-sync', {
+      method: 'POST',
+      timeoutMs: 60000,
+      body: JSON.stringify({ docIds }),
     });
   },
 };

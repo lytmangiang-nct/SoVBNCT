@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
-import { AlertTriangle, Lock, Save, Trash2, Unlock, X } from 'lucide-react';
+import { AlertTriangle, Lock, Pencil, Save, Trash2, Unlock, X } from 'lucide-react';
 import type { RegistryBook, User } from '../../types';
+import { getUserDisplayName } from '../../utils/permissions';
 
 interface PendingBookSwitchModalProps {
   pendingSwitch: {
@@ -276,7 +277,7 @@ export const ResetPasswordModal: React.FC<ResetPasswordModalProps> = ({
             <h3 className="text-sm font-bold text-slate-900">
               Đổi mật khẩu tài khoản @{user.username}
             </h3>
-            <p className="text-xs text-slate-500 mt-0.5 truncate">{user.fullName}</p>
+            <p className="text-xs text-slate-500 mt-0.5 truncate">{getUserDisplayName(user)}</p>
           </div>
           <button
             type="button"
@@ -320,6 +321,148 @@ export const ResetPasswordModal: React.FC<ResetPasswordModalProps> = ({
             className="w-full sm:w-auto min-h-[40px] px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg text-xs disabled:opacity-50"
           >
             {saving ? 'Đang cập nhật...' : 'Cập nhật mật khẩu'}
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+};
+
+interface EditDisplayNameModalProps {
+  user: User | null;
+  saving: boolean;
+  onSubmit: (displayName: string) => Promise<void>;
+  onClose: () => void;
+}
+
+export const EditDisplayNameModal: React.FC<EditDisplayNameModalProps> = ({
+  user,
+  saving,
+  onSubmit,
+  onClose,
+}) => {
+  const [displayName, setDisplayName] = useState('');
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (user) {
+      setDisplayName(user.displayName || '');
+      setError(null);
+    }
+  }, [user]);
+
+  if (!user) return null;
+
+  const fallbackLabel = user.fullName?.trim() || user.username;
+  const fallbackDesc = user.fullName?.trim()
+    ? `Họ và tên (${user.fullName.trim()})`
+    : `tên đăng nhập (@${user.username})`;
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const trimmed = displayName.trim();
+    if (trimmed.length > 80) {
+      setError('Tên hiển thị tối đa 80 ký tự.');
+      return;
+    }
+    setError(null);
+    await onSubmit(trimmed);
+  };
+
+  return (
+    <div
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-900/50 backdrop-blur-[1px]"
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="edit-display-name-title"
+    >
+      <form
+        onSubmit={handleSubmit}
+        noValidate
+        className="w-full max-w-md bg-white rounded-2xl border border-slate-200 shadow-xl overflow-hidden"
+      >
+        <div className="px-4 sm:px-5 py-4 border-b border-slate-100 flex items-start justify-between gap-2">
+          <div className="flex items-start gap-2.5 min-w-0">
+            <div className="w-9 h-9 rounded-lg bg-sky-50 text-sky-700 border border-sky-200 flex items-center justify-center shrink-0">
+              <Pencil className="w-4 h-4" />
+            </div>
+            <div className="min-w-0">
+              <h3 id="edit-display-name-title" className="text-sm font-bold text-slate-900">
+                Sửa tên hiển thị tài khoản @{user.username}
+              </h3>
+              <p className="text-xs text-slate-500 mt-0.5 break-words">
+                {user.fullName?.trim()
+                  ? `Họ và tên gốc: ${user.fullName.trim()}`
+                  : `Tài khoản chưa có họ tên (mặc định dùng @${user.username})`}
+              </p>
+            </div>
+          </div>
+          <button
+            type="button"
+            disabled={saving}
+            onClick={onClose}
+            className="p-1.5 rounded-lg text-slate-400 hover:text-slate-700 hover:bg-slate-100 shrink-0"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+
+        <div className="px-4 sm:px-5 py-4 space-y-2.5 text-xs">
+          <div className="flex items-center justify-between gap-2">
+            <label htmlFor="edit-user-display-name-input" className="font-bold text-slate-700">
+              Tên hiển thị
+            </label>
+            {displayName.trim() && (
+              <button
+                type="button"
+                disabled={saving}
+                onClick={() => {
+                  setDisplayName('');
+                  if (error) setError(null);
+                }}
+                className="text-[11px] font-semibold text-sky-700 hover:underline"
+              >
+                Xóa để dùng {user.fullName?.trim() ? 'Họ và tên' : 'tên đăng nhập'}
+              </button>
+            )}
+          </div>
+          <input
+            id="edit-user-display-name-input"
+            type="text"
+            maxLength={80}
+            value={displayName}
+            onChange={(e) => {
+              setDisplayName(e.target.value);
+              if (error) setError(null);
+            }}
+            placeholder="Ví dụ: Hiệu trưởng, Phó Bí thư ĐT hoặc Nguyễn Văn A"
+            className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
+          />
+          <p className="text-[11px] text-slate-500 leading-relaxed">
+            Gợi ý dùng chức vụ hoặc họ tên tùy mục đích. Để trống sẽ hiển thị theo{' '}
+            <strong className="text-slate-700">{fallbackDesc}</strong> (hiển thị:{' '}
+            <span className="font-semibold text-slate-700">{fallbackLabel}</span>). Tên hiển thị chỉ
+            là nhãn nhận diện, không làm thay đổi tên đăng nhập hoặc quyền tài khoản.
+          </p>
+          {error && <p className="text-[11px] font-medium text-rose-600">{error}</p>}
+        </div>
+
+        <div className="px-4 sm:px-5 py-3.5 bg-slate-50 border-t border-slate-100 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+          <button
+            type="button"
+            disabled={saving}
+            onClick={onClose}
+            className="w-full sm:w-auto min-h-[40px] px-4 py-2 bg-white hover:bg-slate-100 text-slate-700 border border-slate-300 font-semibold rounded-lg text-xs"
+          >
+            Hủy
+          </button>
+          <button
+            type="submit"
+            disabled={saving}
+            className="w-full sm:w-auto min-h-[40px] px-4 py-2 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-lg text-xs disabled:opacity-50 inline-flex items-center justify-center gap-1.5"
+          >
+            <Save className="w-3.5 h-3.5" />
+            <span>{saving ? 'Đang lưu...' : 'Lưu tên hiển thị'}</span>
           </button>
         </div>
       </form>

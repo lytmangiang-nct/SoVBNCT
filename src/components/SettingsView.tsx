@@ -24,6 +24,8 @@ import {
   ChevronDown,
   ChevronRight,
   Menu,
+  MoreHorizontal,
+  Pencil,
   X,
 } from 'lucide-react';
 import { api } from '../api';
@@ -39,13 +41,15 @@ import type {
   SystemSettings,
   User,
 } from '../types';
-import { getTypeColorStyle, DOCUMENT_COLOR_PALETTE } from '../utils/documentColors';
+import { getTypeColorStyle, DOCUMENT_COLOR_PALETTE, SEMANTIC_STATUS_STYLES } from '../utils/documentColors';
 import { DEFAULT_MAX_WORD_MB, extractGoogleDriveFolderId } from '../utils/fileNaming';
 import {
   ALL_BOOK_PERMISSIONS,
   BOOK_PERMISSION_META,
   DEFAULT_BOOK_ID,
   getBookEnabledTypes,
+  getUserDisplayName,
+  getUserSystemRoleLabel,
   hasBookPermission,
   isSystemAdmin,
   normalizeBookPermissionList,
@@ -61,8 +65,10 @@ import {
 import { BooksListSection } from './settings/BooksListSection';
 import { CreateBookDrawer, type CreateBookFormValues } from './settings/CreateBookDrawer';
 import { RedisStorageSection } from './settings/RedisStorageSection';
+import { WordTemplatesSection } from './settings/WordTemplatesSection';
 import {
   ConfirmDeleteModal,
+  EditDisplayNameModal,
   PendingBookSwitchModal,
   ResetPasswordModal,
   ToggleBookLockModal,
@@ -87,6 +93,7 @@ interface SettingsViewProps {
   onSettingsUpdated: (newSettings: SystemSettings) => void;
   onBooksUpdated?: () => void;
   onRefreshData: () => void;
+  onCurrentUserUpdated?: (updatedUser: User) => void;
 }
 
 export const SettingsView: React.FC<SettingsViewProps> = ({
@@ -108,6 +115,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   onSettingsUpdated,
   onBooksUpdated,
   onRefreshData,
+  onCurrentUserUpdated,
 }) => {
   const isAdmin = isSystemAdmin(currentUser);
   const currentYear =
@@ -202,6 +210,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [confirmDeleteBusy, setConfirmDeleteBusy] = useState(false);
   const [resetPassUser, setResetPassUser] = useState<User | null>(null);
   const [resetPassSaving, setResetPassSaving] = useState(false);
+  const [editDisplayNameUser, setEditDisplayNameUser] = useState<User | null>(null);
+  const [editDisplayNameSaving, setEditDisplayNameSaving] = useState(false);
+  const [openUserActionMenuId, setOpenUserActionMenuId] = useState<string | null>(null);
 
   // Unsaved-changes book switch guard
   const [pendingBookSwitch, setPendingBookSwitch] = useState<{
@@ -250,6 +261,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   } | null>(null);
   const [seriesPersistenceStatus, setSeriesPersistenceStatus] = useState<PersistenceStatus | null>(null);
   const [seriesReconciliationWarnings, setSeriesReconciliationWarnings] = useState<string[]>([]);
+  const [showStartSeqDetails, setShowStartSeqDetails] = useState(false);
 
   // Doc Type Modal / Form
   const [newTypeName, setNewTypeName] = useState('');
@@ -596,12 +608,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const [loadingUsers, setLoadingUsers] = useState(false);
   const [newUsername, setNewUsername] = useState('');
   const [newFullName, setNewFullName] = useState('');
+  const [newDisplayName, setNewDisplayName] = useState('');
   const [newUserPass, setNewUserPass] = useState('');
   const [newBookPermissions, setNewBookPermissions] = useState<Record<string, BookPermission[]>>({
     [DEFAULT_BOOK_ID]: ['view', 'request_number'],
   });
   const [userSaving, setUserSaving] = useState(false);
   const [userError, setUserError] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!openUserActionMenuId) return;
+    const handleOutsideClick = (event: MouseEvent) => {
+      const target = event.target as HTMLElement | null;
+      if (target && target.closest('[data-user-action-menu="true"]')) return;
+      setOpenUserActionMenuId(null);
+    };
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setOpenUserActionMenuId(null);
+      }
+    };
+    document.addEventListener('mousedown', handleOutsideClick);
+    document.addEventListener('keydown', handleKeyDown);
+    return () => {
+      document.removeEventListener('mousedown', handleOutsideClick);
+      document.removeEventListener('keydown', handleKeyDown);
+    };
+  }, [openUserActionMenuId]);
 
   const [editingPermUserId, setEditingPermUserId] = useState<string | null>(null);
   const [editingBookPermissions, setEditingBookPermissions] = useState<Record<string, BookPermission[]>>({});
@@ -1501,9 +1534,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     setUserError(null);
     setUserFeedback(null);
     try {
+      const trimmedDisplayName = newDisplayName.trim();
       await api.createUser({
         username: newUsername.trim(),
         fullName: newFullName.trim(),
+        ...(trimmedDisplayName ? { displayName: trimmedDisplayName } : {}),
         password: newUserPass.trim(),
         role: 'issuer',
         bookPermissions: newBookPermissions,
@@ -1511,6 +1546,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
       const createdUsername = newUsername.trim();
       setNewUsername('');
       setNewFullName('');
+      setNewDisplayName('');
       setNewUserPass('');
       setNewBookPermissions({ [DEFAULT_BOOK_ID]: ['view', 'request_number'] });
       setUserFeedback({
@@ -1618,7 +1654,42 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   };
 
   const handleResetUserPass = (u: User) => {
+    setOpenUserActionMenuId(null);
     setResetPassUser(u);
+  };
+
+  const handleStartEditDisplayName = (u: User) => {
+    setOpenUserActionMenuId(null);
+    setEditDisplayNameUser(u);
+  };
+
+  const handleConfirmEditDisplayName = async (nextDisplayName: string) => {
+    if (!editDisplayNameUser) return;
+    setEditDisplayNameSaving(true);
+    setUserFeedback(null);
+    try {
+      const target = editDisplayNameUser;
+      const res = await api.updateUser(target.id, { displayName: nextDisplayName });
+      setUsersList((prev) => prev.map((item) => (item.id === res.user.id ? res.user : item)));
+      if (res.user.id === currentUser.id) {
+        onCurrentUserUpdated?.(res.user);
+      }
+      setEditDisplayNameUser(null);
+      setUserFeedback({
+        success: true,
+        message: nextDisplayName
+          ? `Đã cập nhật tên hiển thị cho @${target.username} thành "${nextDisplayName}".`
+          : `Đã đặt lại tên hiển thị của @${target.username} theo ${target.fullName?.trim() ? `Họ và tên (${target.fullName})` : 'tên đăng nhập'}.`,
+      });
+      handleOpenUsersTab();
+    } catch (err: any) {
+      setUserFeedback({
+        success: false,
+        message: err.message || 'Lỗi khi cập nhật tên hiển thị',
+      });
+    } finally {
+      setEditDisplayNameSaving(false);
+    }
   };
 
   const handleConfirmResetPassword = async (newPassword: string) => {
@@ -2369,36 +2440,33 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-4">
-            <div className="flex flex-col sm:flex-row sm:items-start justify-between gap-2">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
               <div className="min-w-0">
                 <h2 className="text-base font-bold text-slate-900">
-                  Thiết Lập Số Bắt Đầu — {selectedBook.name}
+                  Thiết lập số bắt đầu — {selectedBook.name}
                 </h2>
-                <p className="text-xs text-slate-600 mt-1 break-words">
-                  Mỗi loại văn bản có mốc bắt đầu và dãy số riêng theo từng sổ, từng năm. Khóa dãy đang chọn:{' '}
-                  <code className="font-mono font-bold text-sky-800 bg-sky-50 px-1.5 py-0.5 rounded border border-sky-200 break-all">
-                    {activeSeriesKeyDisplay}
-                  </code>
+                <p className="text-xs text-slate-600 mt-0.5">
+                  Chọn nhanh năm hiện tại và 2 năm kế tiếp để cài sẵn mốc, hoặc mở <strong>Năm trước</strong> để xem mốc cũ.
                 </p>
               </div>
 
               <div className="flex flex-wrap items-center gap-1.5 shrink-0">
                 {effectiveSeriesLoadError ? (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-rose-50 text-rose-800 border border-rose-200">
+                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold border ${SEMANTIC_STATUS_STYLES.danger.badge}`}>
                     <AlertTriangle className="w-3 h-3" />
                     <span>Chưa tải được cấu hình số</span>
                   </span>
                 ) : isSeriesWaiting ? (
-                  <span className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-sky-50 text-sky-800 border border-sky-200">
+                  <span className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-md text-[11px] font-semibold border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
                     <RotateCw className="w-3 h-3 animate-spin" />
                     <span>Đang tải mốc số đã cài…</span>
                   </span>
                 ) : isSeriesDirty ? (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-bold bg-amber-100 text-amber-900 border border-amber-300">
+                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-bold border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
                     <span>Chưa lưu</span>
                   </span>
                 ) : activeSavedConfig?.isConfigured ? (
-                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold bg-emerald-50 text-emerald-800 border border-emerald-200">
+                  <span className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-md text-[11px] font-semibold border ${SEMANTIC_STATUS_STYLES.saved.badge}`}>
                     <CheckCircle2 className="w-3 h-3" />
                     <span>Đã thiết lập mốc riêng</span>
                   </span>
@@ -2483,37 +2551,71 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             )}
 
             <form onSubmit={handleSetStartSequence} className="space-y-4 text-xs">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Năm áp dụng</label>
-                  <select
-                    aria-label="Năm áp dụng số bắt đầu"
-                    value={seqYear}
-                    onChange={(e) => setSeqYear(parseInt(e.target.value, 10))}
-                    disabled={!canManageSelectedBook || !configLoaded || Boolean(syncError)}
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
-                  >
-                    {Array.from(
-                      new Set([
-                        currentYear + 1,
-                        currentYear,
-                        currentYear - 1,
-                        ...Object.keys(selectedBook.customStartSequences || {})
-                          .map((k) => parseInt(k.split('_')[0], 10))
-                          .filter((y) => !Number.isNaN(y)),
-                      ])
-                    )
-                      .sort((a, b) => b - a)
-                      .map((y) => (
-                        <option key={y} value={y}>
-                          Năm {y}
-                        </option>
-                      ))}
-                  </select>
-                </div>
+              {/* Năm áp dụng: gợi ý năm hiện tại + 2 năm kế tiếp & Năm trước */}
+              {(() => {
+                const suggestedYears = [currentYear, currentYear + 1, currentYear + 2];
+                const savedPastYears = Object.keys(selectedBook.customStartSequences || {})
+                  .map((k) => parseInt(k.split('_')[0], 10))
+                  .filter((y) => !Number.isNaN(y) && y < currentYear);
+                const pastYears = Array.from(
+                  new Set([currentYear - 1, currentYear - 2, currentYear - 3, ...savedPastYears])
+                ).sort((a, b) => b - a);
+                const isPastYearSelected = seqYear < currentYear;
 
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Loại văn bản</label>
+                return (
+                  <div className="space-y-1.5">
+                    <label className="font-bold text-slate-700 block">Năm áp dụng</label>
+                    <div className="flex flex-wrap items-center gap-2">
+                      {suggestedYears.map((y) => {
+                        const active = seqYear === y;
+                        return (
+                          <button
+                            key={y}
+                            type="button"
+                            onClick={() => setSeqYear(y)}
+                            disabled={!canManageSelectedBook || !configLoaded || Boolean(syncError)}
+                            className={`px-3.5 py-2 min-h-[40px] rounded-lg border font-bold transition-colors tabular-nums ${
+                              active
+                                ? 'bg-blue-700 text-white border-blue-700 shadow-2xs'
+                                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
+                            }`}
+                          >
+                            {y === currentYear ? `${y} (Hiện tại)` : `${y}`}
+                          </button>
+                        );
+                      })}
+
+                      <div className="inline-flex items-center gap-1.5">
+                        <select
+                          aria-label="Năm trước"
+                          value={isPastYearSelected ? String(seqYear) : ''}
+                          onChange={(e) => {
+                            if (e.target.value) setSeqYear(parseInt(e.target.value, 10));
+                          }}
+                          disabled={!canManageSelectedBook || !configLoaded || Boolean(syncError)}
+                          className={`min-h-[40px] px-3 py-2 rounded-lg border text-base sm:text-xs font-semibold cursor-pointer ${
+                            isPastYearSelected
+                              ? 'bg-blue-50 text-blue-900 border-blue-400'
+                              : 'bg-slate-50 text-slate-700 border-slate-300'
+                          }`}
+                        >
+                          <option value="">Năm trước...</option>
+                          {pastYears.map((y) => (
+                            <option key={y} value={String(y)}>
+                              Năm {y}
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
+              {/* Hàng điều khiển chính gọn: Loại văn bản, Mốc đã cài, Số tiếp theo dự kiến, Lưu */}
+              <div className="grid grid-cols-1 md:grid-cols-12 gap-3 items-end">
+                <div className="md:col-span-4 space-y-1 min-w-0">
+                  <label className="font-bold text-slate-700 block">Loại văn bản</label>
                   <select
                     aria-label="Loại văn bản thiết lập số bắt đầu"
                     value={effectiveSeqTypeCode}
@@ -2533,37 +2635,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                   </select>
                 </div>
 
-                <div className="space-y-1 min-w-0">
+                <div className="md:col-span-3 space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-2">
                     <label htmlFor="start-sequence-input" className="font-bold text-slate-700">
-                      Số bắt đầu đã cài
+                      Mốc đã cài
                     </label>
-                    <div className="flex items-center gap-1.5">
-                      {isSeriesDirty && (
-                        <>
-                          <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 text-[10px] font-bold">
-                            Chưa lưu
-                          </span>
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setDraftStartInputBySeries((prev) => {
-                                const next = { ...prev };
-                                delete next[activeSeriesId];
-                                return next;
-                              });
-                              setSeqSaveErrorBySeries((prev) => ({
-                                ...prev,
-                                [activeSeriesId]: null,
-                              }));
-                            }}
-                            className="text-[11px] font-semibold text-slate-500 hover:text-slate-800 underline"
-                          >
-                            Hoàn tác
-                          </button>
-                        </>
-                      )}
-                    </div>
+                    {isSeriesDirty && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setDraftStartInputBySeries((prev) => {
+                            const next = { ...prev };
+                            delete next[activeSeriesId];
+                            return next;
+                          });
+                          setSeqSaveErrorBySeries((prev) => ({
+                            ...prev,
+                            [activeSeriesId]: null,
+                          }));
+                        }}
+                        className="text-[11px] font-semibold text-slate-500 hover:text-slate-800 underline"
+                      >
+                        Hoàn tác
+                      </button>
+                    )}
                   </div>
                   <input
                     id="start-sequence-input"
@@ -2573,10 +2668,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     value={isSeriesWaiting || Boolean(effectiveSeriesLoadError) ? '' : currentStartInputValue}
                     placeholder={
                       effectiveSeriesLoadError
-                        ? 'Chưa tải được cấu hình số'
+                        ? 'Lỗi kết nối'
                         : isSeriesWaiting
-                        ? 'Đang tải mốc số đã cài…'
-                        : 'Chưa thiết lập · Mặc định 01'
+                        ? 'Đang tải...'
+                        : 'Mặc định 01'
                     }
                     onChange={(e) => {
                       const raw = e.target.value;
@@ -2600,85 +2695,35 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                     }`}
                   />
                 </div>
-              </div>
 
-              {/* Explicit side-by-side summary: Số bắt đầu đã cài vs Số tiếp theo dự kiến */}
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div className="p-3 bg-sky-50 border border-sky-200 rounded-lg space-y-1 min-w-0">
-                  <span className="text-[11px] font-semibold text-sky-800 block">
-                    Số bắt đầu đã cài ({activeSeriesKeyDisplay})
-                  </span>
-                  <div className="font-mono text-base font-bold text-sky-950 break-words">
+                <div className="md:col-span-3 space-y-1 min-w-0">
+                  <span className="font-bold text-slate-700 block">Số tiếp theo dự kiến</span>
+                  <div className="min-h-[44px] h-11 sm:h-10 px-3 bg-emerald-50 border border-emerald-200 rounded-lg flex items-center font-mono font-bold text-emerald-900 truncate">
                     {effectiveSeriesLoadError
-                      ? 'Chưa tải được cấu hình số'
+                      ? 'Chưa tải được'
                       : isSeriesWaiting
-                      ? 'Đang tải mốc số đã cài…'
-                      : activeSavedConfig?.isConfigured && activeSavedConfig.customStartSequence != null
-                      ? `${String(activeSavedConfig.customStartSequence).padStart(2, '0')} (${activeSavedConfig.customStartSequence})`
-                      : 'Chưa thiết lập · Mặc định 01'}
-                  </div>
-                  <span className="text-[11px] text-sky-700 block">
-                    {effectiveSeriesLoadError
-                      ? 'Không hiển thị mặc định 01 khi kết nối máy chủ chưa hoàn tất.'
-                      : isSeriesWaiting
-                      ? 'Đang đối chiếu mốc số trực tiếp từ nguồn dữ liệu chính trên máy chủ…'
-                      : isSeriesDirty
-                      ? `Bản nháp đang nhập: "${currentStartInputValue.trim() || 'trống'}" (Chưa lưu — bấm Lưu số bắt đầu để áp dụng).`
-                      : 'Mốc đã lưu giữ cố định theo sổ, năm và loại văn bản; không tự thay đổi khi cấp số mới.'}
-                  </span>
-                </div>
-
-                <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-lg space-y-1 min-w-0">
-                  <span className="text-[11px] font-semibold text-emerald-800 block">
-                    Số tiếp theo dự kiến ({selectedBook.name} · Năm {seqYear} · {effectiveSeqTypeCode})
-                  </span>
-                  <div className="font-mono text-base font-bold text-emerald-950 break-words">
-                    {effectiveSeriesLoadError
-                      ? 'Chưa tải được cấu hình số'
-                      : isSeriesWaiting
-                      ? 'Đang tải mốc số đã cài…'
+                      ? 'Đang kiểm tra…'
                       : `${String(activeSavedConfig!.nextExpectedSeq).padStart(2, '0')} → ${activeSavedConfig!.previewNumber}`}
                   </div>
-                  <span className="text-[11px] text-emerald-800 block">
-                    {!isSeriesWaiting && !effectiveSeriesLoadError && activeSavedConfig
-                      ? `= max(Mốc đã cài, Số lớn nhất đã cấp/hủy: ${activeSavedConfig.maxIssuedSequence} + 1). Mức đặt tối thiểu: ${activeSavedConfig.minAllowedStartSequence}.`
-                      : 'Tính từ max(Mốc đã cài, Số lớn nhất đã cấp/hủy trong cùng dãy + 1).'}
-                  </span>
                 </div>
-              </div>
 
-              {hasMatchingSavedConfig && Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
-                <div className="p-3 bg-sky-50/70 border border-sky-200 rounded-lg text-[11px] text-sky-900">
-                  <strong className="block mb-1">
-                    Các mốc Số bắt đầu đã cài trên sổ "{selectedBook.name}":
-                  </strong>
-                  <div className="flex flex-wrap gap-2">
-                    {Object.entries(selectedBook.customStartSequences)
-                      .sort(([a], [b]) => a.localeCompare(b))
-                      .map(([k, val]) => {
-                        const [yr, ...rest] = k.split('_');
-                        const tCode = rest.join('_');
-                        const isActiveRow =
-                          String(seqYear) === yr && tCode === effectiveSeqTypeCode;
-                        return (
-                          <span
-                            key={k}
-                            className={`px-2 py-0.5 rounded font-mono border ${
-                              isActiveRow
-                                ? 'bg-sky-700 text-white border-sky-700'
-                                : 'bg-white border-sky-200 text-sky-900'
-                            }`}
-                          >
-                            {selectedBook.code}:{yr}:{tCode} = <strong>{val}</strong>
-                          </span>
-                        );
-                      })}
+                {canManageSelectedBook && (
+                  <div className="md:col-span-2">
+                    <button
+                      type="submit"
+                      disabled={
+                        isActiveSeriesSaving ||
+                        isSeriesWaiting ||
+                        Boolean(effectiveSeriesLoadError) ||
+                        !hasMatchingSavedConfig ||
+                        !isStartInputValid
+                      }
+                      className="w-full min-h-[44px] h-11 sm:h-10 px-4 bg-blue-700 hover:bg-blue-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors whitespace-nowrap"
+                    >
+                      {isActiveSeriesSaving ? 'Đang lưu...' : 'Lưu'}
+                    </button>
                   </div>
-                </div>
-              )}
-
-              <div className="p-3 bg-slate-50 border border-slate-200 rounded-lg text-[11px] text-slate-600">
-                <strong>Quy tắc bảo vệ:</strong> Số bắt đầu của từng dãy không được nhỏ hơn hoặc bằng số lớn nhất từng cấp (bao gồm số đã hủy) trong chính sổ, năm và loại văn bản đó.
+                )}
               </div>
 
               {activeSeriesSaveError && (
@@ -2694,21 +2739,105 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               )}
 
-              {canManageSelectedBook && (
+              {/* Chi tiết có thể mở rộng (khóa kỹ thuật, công thức, danh sách mốc đã cài) */}
+              <div className="pt-1 border-t border-slate-100">
                 <button
-                  type="submit"
-                  disabled={
-                    isActiveSeriesSaving ||
-                    isSeriesWaiting ||
-                    Boolean(effectiveSeriesLoadError) ||
-                    !hasMatchingSavedConfig ||
-                    !isStartInputValid
-                  }
-                  className="w-full sm:w-auto min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
+                  type="button"
+                  onClick={() => setShowStartSeqDetails((prev) => !prev)}
+                  className="inline-flex items-center gap-1.5 text-xs font-semibold text-slate-600 hover:text-slate-900 py-1.5"
                 >
-                  {isActiveSeriesSaving ? 'Đang lưu & xác nhận...' : 'Lưu số bắt đầu'}
+                  {showStartSeqDetails ? (
+                    <ChevronDown className="w-4 h-4 shrink-0" />
+                  ) : (
+                    <ChevronRight className="w-4 h-4 shrink-0" />
+                  )}
+                  <span>Chi tiết</span>
+                  {Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
+                    <span className="text-[11px] font-normal text-slate-500">
+                      ({Object.keys(selectedBook.customStartSequences || {}).length} mốc đã lưu)
+                    </span>
+                  )}
                 </button>
-              )}
+
+                {showStartSeqDetails && (
+                  <div className="mt-2.5 space-y-3 p-3.5 bg-slate-50 border border-slate-200 rounded-lg text-xs">
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1 min-w-0">
+                        <span className="text-[11px] font-semibold text-slate-600 block">
+                          Khóa dãy số &amp; Mốc đã lưu tại máy chủ:
+                        </span>
+                        <div className="flex flex-wrap items-center gap-2">
+                          <code className="font-mono font-bold text-blue-900 bg-blue-50 px-1.5 py-0.5 rounded border border-blue-200 break-all">
+                            {activeSeriesKeyDisplay}
+                          </code>
+                          <span className="font-mono font-bold text-slate-800">
+                            {effectiveSeriesLoadError
+                              ? 'Lỗi kết nối'
+                              : isSeriesWaiting
+                              ? 'Đang tải…'
+                              : activeSavedConfig?.isConfigured && activeSavedConfig.customStartSequence != null
+                              ? `${String(activeSavedConfig.customStartSequence).padStart(2, '0')} (${activeSavedConfig.customStartSequence})`
+                              : 'Chưa thiết lập (mặc định 01)'}
+                          </span>
+                        </div>
+                      </div>
+
+                      <div className="space-y-1 min-w-0">
+                        <span className="text-[11px] font-semibold text-slate-600 block">
+                          Công thức tính số tiếp theo:
+                        </span>
+                        <p className="text-[11px] text-slate-700 leading-relaxed">
+                          {!isSeriesWaiting && !effectiveSeriesLoadError && activeSavedConfig
+                            ? `= max(Mốc đã cài, Số lớn nhất đã cấp/hủy: ${activeSavedConfig.maxIssuedSequence} + 1). Mức đặt tối thiểu hợp lệ: ${activeSavedConfig.minAllowedStartSequence}.`
+                            : '= max(Mốc đã cài, Số lớn nhất đã cấp/hủy trong cùng dãy + 1).'}
+                        </p>
+                      </div>
+                    </div>
+
+                    {hasMatchingSavedConfig && Object.keys(selectedBook.customStartSequences || {}).length > 0 && (
+                      <div className="pt-2 border-t border-slate-200">
+                        <span className="text-[11px] font-semibold text-slate-700 block mb-1.5">
+                          Danh sách mốc đã cài trên "{selectedBook.name}" (bấm để xem nhanh):
+                        </span>
+                        <div className="flex flex-wrap gap-1.5">
+                          {Object.entries(selectedBook.customStartSequences)
+                            .sort(([a], [b]) => a.localeCompare(b))
+                            .map(([k, val]) => {
+                              const [yr, ...rest] = k.split('_');
+                              const tCode = rest.join('_');
+                              const parsedYr = parseInt(yr, 10);
+                              const isActiveRow =
+                                String(seqYear) === yr && tCode === effectiveSeqTypeCode;
+                              return (
+                                <button
+                                  key={k}
+                                  type="button"
+                                  onClick={() => {
+                                    if (!Number.isNaN(parsedYr)) setSeqYear(parsedYr);
+                                    if (tCode && selectedBook.numberMode !== 'shared') {
+                                      setSeqTypeCode(tCode);
+                                    }
+                                  }}
+                                  className={`px-2 py-1 rounded font-mono text-[11px] border transition-colors ${
+                                    isActiveRow
+                                      ? 'bg-blue-700 text-white border-blue-700'
+                                      : 'bg-white border-slate-300 text-slate-800 hover:bg-slate-100'
+                                  }`}
+                                >
+                                  {selectedBook.code}:{yr}:{tCode} = <strong>{val}</strong>
+                                </button>
+                              );
+                            })}
+                        </div>
+                      </div>
+                    )}
+
+                    <p className="text-[11px] text-slate-600 pt-1 border-t border-slate-200">
+                      <strong>Quy tắc bảo vệ:</strong> Mốc bắt đầu không được nhỏ hơn hoặc bằng số lớn nhất từng cấp (bao gồm số đã hủy) trong chính sổ, năm và loại văn bản đó. Khi sang 00:00 ngày 01/01 giờ Việt Nam, dãy năm mới tự động dùng <strong>01</strong> hoặc mốc bạn đã cài sẵn cho năm mới.
+                    </p>
+                  </div>
+                )}
+              </div>
             </form>
           </div>
         </div>
@@ -2940,6 +3069,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
         </div>
+      )}
+
+      {/* SUB-TAB: MẪU WORD (.docx) */}
+      {activeSubTab === 'wordTemplates' && (
+        <WordTemplatesSection
+          selectedBook={selectedBook}
+          enabledTypes={enabledTypesForSelectedBook}
+          canManage={canManageSelectedBook}
+          isBlocked={isConfigBlocked}
+          onRequestConfirmDelete={setConfirmDeleteRequest}
+        />
       )}
 
       {/* SUB-TAB: UPSTASH REDIS & LƯU TRỮ CHÍNH */}
@@ -3583,7 +3723,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 Mặc định <strong>01 tài khoản Quản trị viên (admin)</strong> cố định toàn quyền quản lý hệ thống.
               </li>
               <li>
-                Quản trị viên gán <strong>Họ và tên cố định</strong> cho từng tài khoản tạo mới; người dùng không thể tự thay đổi tên này.
+                Quản trị viên gán <strong>Họ và tên</strong> và tùy chọn <strong>Tên hiển thị</strong> (chức vụ hoặc họ tên) cho từng tài khoản; có thể chỉnh sửa tên hiển thị bất cứ lúc nào mà không làm đổi tên đăng nhập hay quyền hạn.
               </li>
               <li>
                 Mỗi tài khoản có thể được phân chi tiết <strong>9 nhóm quyền theo từng sổ văn bản</strong>:{' '}
@@ -3594,13 +3734,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
 
           {/* Account List */}
-          <div className="bg-white border border-slate-200 rounded-xl overflow-hidden shadow-xs">
-            <div className="p-4 border-b border-slate-100">
+          <div className="bg-white border border-slate-200 rounded-xl shadow-xs">
+            <div className="p-4 border-b border-slate-100 rounded-t-xl">
               <h2 className="text-base font-bold text-slate-900">
                 Danh Sách Tài Khoản Hệ Thống
               </h2>
               <p className="text-xs text-slate-500 mt-0.5">
-                Bấm <strong>Phân quyền sổ</strong> để điều chỉnh 9 quyền chi tiết trên từng sổ văn bản cho mỗi tài khoản.
+                Bấm <strong>Phân quyền sổ</strong> để điều chỉnh quyền trên từng sổ, hoặc mở menu{' '}
+                <strong>⋯</strong> để sửa tên hiển thị và quản lý tài khoản.
               </p>
             </div>
 
@@ -3611,26 +3752,41 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 usersList.map((u) => {
                   const isMainAdmin = isSystemAdmin(u);
                   const isEditingPerms = editingPermUserId === u.id;
+                  const effectiveName = getUserDisplayName(u);
+                  const systemRole = getUserSystemRoleLabel(u);
+                  const hasCustomDisplayName = Boolean(u.displayName && u.displayName.trim());
+                  const actionMenuOpen = openUserActionMenuId === u.id;
                   return (
                     <div key={u.id} className="p-4 space-y-3">
                       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div className="space-y-1.5">
+                        <div className="space-y-1.5 min-w-0">
                           <div className="flex items-center gap-2 flex-wrap">
-                            <strong className="text-slate-900 font-bold text-sm">{u.fullName}</strong>
-                            <span className="font-mono text-slate-500 bg-slate-100 px-2 py-0.5 rounded text-[11px]">
+                            <strong className="text-slate-900 font-bold text-sm break-words">
+                              {effectiveName}
+                            </strong>
+                            <span className="font-mono text-slate-600 bg-slate-100 px-2 py-0.5 rounded text-[11px]">
                               @{u.username}
                             </span>
                             {isMainAdmin ? (
-                              <span className="bg-amber-100 text-amber-900 font-bold px-2 py-0.5 rounded text-[10px] flex items-center gap-1">
+                              <span className="bg-amber-100 text-amber-900 font-bold px-2 py-0.5 rounded text-[10px] inline-flex items-center gap-1">
                                 <Shield className="w-3 h-3 text-amber-700" />
-                                Quản trị viên cố định (Toàn quyền)
+                                {systemRole} (Toàn quyền)
                               </span>
                             ) : (
-                              <span className="bg-sky-100 text-sky-900 font-medium px-2 py-0.5 rounded text-[10px]">
-                                Tên gán cố định
+                              <span className="bg-sky-50 text-sky-900 border border-sky-200 font-medium px-2 py-0.5 rounded text-[10px]">
+                                {systemRole}
                               </span>
                             )}
                           </div>
+
+                          {hasCustomDisplayName && (
+                            <div className="text-[11px] text-slate-600">
+                              Họ và tên:{' '}
+                              <span className="font-medium text-slate-800">
+                                {u.fullName?.trim() || '(Chưa có — dự phòng tên đăng nhập)'}
+                              </span>
+                            </div>
+                          )}
 
                           {!isMainAdmin && (
                             <div className="flex flex-wrap gap-1.5">
@@ -3685,40 +3841,94 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             </button>
                           )}
 
-                          <button
-                            type="button"
-                            onClick={() => handleResetUserPass(u)}
-                            className="px-2.5 py-1.5 min-h-[36px] bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-md font-medium text-[11px] transition-colors flex items-center gap-1"
-                          >
-                            <Lock className="w-3 h-3 text-slate-500" />
-                            <span>Đổi MK</span>
-                          </button>
+                          <div className="relative" data-user-action-menu="true">
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setOpenUserActionMenuId((prev) => (prev === u.id ? null : u.id))
+                              }
+                              aria-haspopup="menu"
+                              aria-expanded={actionMenuOpen}
+                              aria-label={`Thao tác tài khoản @${u.username}`}
+                              title="Thao tác tài khoản"
+                              className={`inline-flex items-center justify-center min-w-[36px] min-h-[36px] px-2 rounded-md border transition-colors ${
+                                actionMenuOpen
+                                  ? 'bg-slate-200 text-slate-900 border-slate-300'
+                                  : 'bg-slate-100 hover:bg-slate-200 text-slate-700 border-slate-200'
+                              }`}
+                            >
+                              <MoreHorizontal className="w-4 h-4" />
+                            </button>
 
-                          {!isMainAdmin && (
-                            <>
-                              <button
-                                type="button"
-                                onClick={() => handleToggleUserStatus(u)}
-                                className={`px-2.5 py-1.5 min-h-[36px] rounded-md font-medium text-[11px] transition-colors flex items-center gap-1 ${
-                                  u.isActive
-                                    ? 'bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200'
-                                    : 'bg-emerald-50 hover:bg-emerald-100 text-emerald-800 border border-emerald-200'
-                                }`}
+                            {actionMenuOpen && (
+                              <div
+                                role="menu"
+                                aria-label={`Thao tác cho @${u.username}`}
+                                className="absolute right-0 mt-1.5 w-52 bg-white border border-slate-200 rounded-xl shadow-xl py-1.5 z-40"
                               >
-                                {u.isActive ? <UserX className="w-3 h-3" /> : <UserCheck className="w-3 h-3" />}
-                                <span>{u.isActive ? 'Khóa' : 'Mở'}</span>
-                              </button>
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => handleStartEditDisplayName(u)}
+                                  className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+                                >
+                                  <Pencil className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+                                  <span>Sửa tên hiển thị</span>
+                                </button>
 
-                              <button
-                                type="button"
-                                onClick={() => handleDeleteUser(u)}
-                                className="p-2 min-w-[36px] min-h-[36px] inline-flex items-center justify-center text-slate-400 hover:text-rose-700 hover:bg-rose-50 rounded-md transition-colors"
-                                title="Xóa tài khoản này khỏi hệ thống"
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
-                            </>
-                          )}
+                                <button
+                                  type="button"
+                                  role="menuitem"
+                                  onClick={() => handleResetUserPass(u)}
+                                  className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+                                >
+                                  <Lock className="w-3.5 h-3.5 text-slate-500 shrink-0" />
+                                  <span>Đổi mật khẩu</span>
+                                </button>
+
+                                {!isMainAdmin && (
+                                  <>
+                                    <button
+                                      type="button"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setOpenUserActionMenuId(null);
+                                        handleToggleUserStatus(u);
+                                      }}
+                                      className="w-full px-3.5 py-2 text-left text-xs font-medium text-slate-700 hover:bg-slate-50 flex items-center gap-2"
+                                    >
+                                      {u.isActive ? (
+                                        <>
+                                          <UserX className="w-3.5 h-3.5 text-amber-700 shrink-0" />
+                                          <span>Tạm khóa tài khoản</span>
+                                        </>
+                                      ) : (
+                                        <>
+                                          <UserCheck className="w-3.5 h-3.5 text-emerald-700 shrink-0" />
+                                          <span>Mở khóa tài khoản</span>
+                                        </>
+                                      )}
+                                    </button>
+
+                                    <div className="my-1 border-t border-slate-100" />
+
+                                    <button
+                                      type="button"
+                                      role="menuitem"
+                                      onClick={() => {
+                                        setOpenUserActionMenuId(null);
+                                        handleDeleteUser(u);
+                                      }}
+                                      className="w-full px-3.5 py-2 text-left text-xs font-medium text-rose-700 hover:bg-rose-50 flex items-center gap-2"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5 shrink-0" />
+                                      <span>Xóa tài khoản</span>
+                                    </button>
+                                  </>
+                                )}
+                              </div>
+                            )}
+                          </div>
                         </div>
                       </div>
 
@@ -3759,14 +3969,17 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
               <span>Thêm tài khoản mới và phân quyền theo từng sổ</span>
             </h3>
             <p className="text-xs text-slate-500 mb-4">
-              Họ và tên được gán cố định cho tài khoản. Chọn rõ các quyền trên từng sổ (Xin số tách biệt với Cấp số).
+              Điền thông tin định danh và chọn quyền trên từng sổ (Xin số tách biệt với Cấp số).
             </p>
 
             <form onSubmit={handleCreateUser} className="space-y-4 text-xs">
-              <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                 <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Tên đăng nhập *</label>
+                  <label htmlFor="new-user-username" className="font-bold text-slate-700">
+                    Tên đăng nhập *
+                  </label>
                   <input
+                    id="new-user-username"
                     type="text"
                     value={newUsername}
                     onChange={(e) => setNewUsername(e.target.value)}
@@ -3777,8 +3990,11 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
 
                 <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Họ và tên (Gán cố định) *</label>
+                  <label htmlFor="new-user-fullname" className="font-bold text-slate-700">
+                    Họ và tên *
+                  </label>
                   <input
+                    id="new-user-fullname"
                     type="text"
                     value={newFullName}
                     onChange={(e) => setNewFullName(e.target.value)}
@@ -3789,8 +4005,29 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
 
                 <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Mật khẩu khởi tạo *</label>
+                  <label htmlFor="new-user-displayname" className="font-bold text-slate-700">
+                    Tên hiển thị (tùy chọn)
+                  </label>
                   <input
+                    id="new-user-displayname"
+                    type="text"
+                    maxLength={80}
+                    value={newDisplayName}
+                    onChange={(e) => setNewDisplayName(e.target.value)}
+                    placeholder="Ví dụ: Hiệu trưởng, Phó Bí thư ĐT hoặc Nguyễn Văn A"
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm"
+                  />
+                  <p className="text-[11px] text-slate-500">
+                    Gợi ý dùng chức vụ hoặc họ tên tùy mục đích. Nếu để trống sẽ hiển thị theo Họ và tên.
+                  </p>
+                </div>
+
+                <div className="space-y-1 min-w-0">
+                  <label htmlFor="new-user-password" className="font-bold text-slate-700">
+                    Mật khẩu khởi tạo *
+                  </label>
+                  <input
+                    id="new-user-password"
                     type="password"
                     value={newUserPass}
                     onChange={(e) => setNewUserPass(e.target.value)}
@@ -3933,6 +4170,14 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
         saving={resetPassSaving}
         onSubmit={handleConfirmResetPassword}
         onClose={() => !resetPassSaving && setResetPassUser(null)}
+      />
+
+      {/* Display name edit modal */}
+      <EditDisplayNameModal
+        user={editDisplayNameUser}
+        saving={editDisplayNameSaving}
+        onSubmit={handleConfirmEditDisplayName}
+        onClose={() => !editDisplayNameSaving && setEditDisplayNameUser(null)}
       />
     </div>
   );
