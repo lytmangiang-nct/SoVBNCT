@@ -13,6 +13,7 @@ import type {
   DocumentHistoryEntry,
   DocumentRecord,
   ExcelDeleteSyncStatus,
+  LegacySnapshotSummary,
   SystemSettings,
   DocumentTypeConfig,
   SignerConfig,
@@ -26,7 +27,9 @@ import type {
   RegistryBook,
   NumberRequest,
   StartSequenceSeriesConfig,
+  StorageConnectionState,
   StorageMode,
+  StorageTestResult,
   SystemAuditLog,
 } from './src/types.js';
 import {
@@ -83,7 +86,14 @@ app.use('/api', async (req, res, next) => {
     res.setHeader('Pragma', 'no-cache');
     res.setHeader('Expires', '0');
   }
-  if (req.path === '/events' || req.path === '/health') {
+  if (
+    req.path === '/events' ||
+    req.path === '/health' ||
+    req.path === '/auth/login' ||
+    req.path === '/auth/logout' ||
+    req.path === '/auth/me' ||
+    req.path.startsWith('/storage/')
+  ) {
     return next();
   }
   try {
@@ -91,16 +101,16 @@ app.use('/api', async (req, res, next) => {
       req.path.startsWith('/settings/start-sequence') ||
       req.path.startsWith('/documents/preview') ||
       req.path === '/settings' ||
-      req.path === '/books' ||
-      req.path === '/auth/login' ||
-      req.path === '/auth/me';
+      req.path === '/books';
     await ensureLatestDb({ maxAgeMs: forceFresh ? 0 : 500 });
     next();
   } catch (err: any) {
-    console.error('[Primary Storage Error]:', err);
-    return res.status(503).json({
-      code: 'PRIMARY_STORAGE_UNAVAILABLE',
-      error: `Không thể đọc dữ liệu mới nhất từ nguồn lưu trữ chính: ${err?.message || 'Lỗi kết nối lưu trữ'}`,
+    console.error('[Primary Storage Error]:', sanitizeErrorForLog(err));
+    const statusCode = err?.statusCode || 503;
+    const code = err?.code || 'PRIMARY_STORAGE_UNAVAILABLE';
+    return res.status(statusCode).json({
+      code,
+      error: err?.message || 'Không thể đọc dữ liệu mới nhất từ nguồn lưu trữ chính.',
       persistenceStatus: getPersistenceStatus(),
     });
   }
@@ -170,6 +180,7 @@ interface DatabaseSchema {
   meta?: {
     revision: string;
     updatedAt: string;
+    schemaVersion?: number;
   };
   settings: SystemSettings;
   documentTypes: DocumentTypeConfig[];
@@ -191,15 +202,6 @@ const DEFAULT_SETTINGS: SystemSettings = {
   numberMode: 'separate', // 'separate' or 'shared'
   numberFormat: '{so}-{loai}/{don_vi}',
   customStartSequences: {},
-  msGraphConfig: {
-    enabled: false,
-    tenantId: '',
-    clientId: '',
-    clientSecret: '',
-    driveId: '',
-    filePath: '',
-    tableName: 'SoCapSoVanBan',
-  },
   googleSheetsConfig: {
     enabled: false,
     webhookUrl: '',
@@ -448,7 +450,6 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
   const settings: SystemSettings = {
     ...DEFAULT_SETTINGS,
     ...(loaded.settings || {}),
-    msGraphConfig: { ...DEFAULT_SETTINGS.msGraphConfig, ...(loaded.settings?.msGraphConfig || {}) },
     googleSheetsConfig: {
       enabled: false,
       webhookUrl: '',
@@ -691,17 +692,56 @@ export function migrateDatabaseIdempotent(loaded: Partial<DatabaseSchema>): Data
   };
 }
 
+const CURRENT_SCHEMA_VERSION = 2;
+
 let lastDbMtimeMs = 0;
 let remoteHydrated = false;
 let lastRemoteSyncMs = 0;
+let lastRemoteRawPayload: string | null = null;
 let lastPersistedAt = '';
 let lastVerifiedAt = '';
 let inFlightRemoteLoad: Promise<void> | null = null;
+let lastStorageDiagnostic: {
+  state: StorageConnectionState;
+  error?: string;
+} = { state: 'connected' };
+
+class StorageError extends Error {
+  constructor(
+    public code:
+      | 'DURABLE_STORAGE_NOT_CONFIGURED'
+      | 'STORAGE_CONFIG_CONFLICT'
+      | 'PRIMARY_STORAGE_UNAVAILABLE'
+      | 'STORAGE_AWAITING_INITIALIZATION'
+      | 'STORAGE_CORRUPT_DATA'
+      | 'REVISION_CONFLICT',
+    public statusCode: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'StorageError';
+  }
+}
+
+function sanitizeErrorForLog(err: any): string {
+  const raw = typeof err === 'string' ? err : err?.message || 'Lỗi không xác định';
+  return raw.replace(/Bearer\s+[^\s"']+/gi, 'Bearer [REDACTED]');
+}
+
+function maskUrlHostname(rawUrl?: string): string | undefined {
+  if (!rawUrl) return undefined;
+  try {
+    return new URL(rawUrl).hostname;
+  } catch {
+    return undefined;
+  }
+}
 
 interface StorageAdapterConfig {
   mode: StorageMode;
   durable: boolean;
   label: string;
+  envPairUsed: NonNullable<PersistenceStatus['envPairUsed']>;
   kvUrl?: string;
   kvToken?: string;
   kvKey: string;
@@ -709,83 +749,246 @@ interface StorageAdapterConfig {
   blobPathname: string;
   webhookUrl?: string;
   webhookSecret?: string;
+  configConflictError?: string;
+  missingConfigError?: string;
+}
+
+function normalizeRestUrl(raw?: string): string {
+  return (raw || '').trim().replace(/\/+$/, '');
 }
 
 function getStorageAdapterConfig(): StorageAdapterConfig {
-  const kvUrl = (process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL || '')
-    .trim()
-    .replace(/\/+$/, '');
-  const kvToken = (process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
-  const kvKey = (process.env.PERSISTENT_DB_KEY || 'nct_vanban_registry_db_v1').trim();
+  const upstashUrl = normalizeRestUrl(process.env.UPSTASH_REDIS_REST_URL);
+  const upstashToken = (process.env.UPSTASH_REDIS_REST_TOKEN || '').trim();
+  const kvUrl = normalizeRestUrl(process.env.KV_REST_API_URL);
+  const kvToken = (process.env.KV_REST_API_TOKEN || '').trim();
+
+  const kvKey = (process.env.PERSISTENT_DB_KEY || 'nct_vanban_registry_db_v1').trim() || 'nct_vanban_registry_db_v1';
   const blobToken = (process.env.BLOB_READ_WRITE_TOKEN || '').trim();
-  const blobPathname = (process.env.PERSISTENT_BLOB_PATHNAME || 'nct-registry/db.json')
-    .trim()
-    .replace(/^\/+/, '');
-  const webhookUrl = (process.env.PERSISTENT_DB_WEBHOOK_URL || '').trim();
+  const blobPathname =
+    (process.env.PERSISTENT_BLOB_PATHNAME || 'nct-registry/db.json').trim().replace(/^\/+/, '') ||
+    'nct-registry/db.json';
+  const webhookUrl = normalizeRestUrl(process.env.PERSISTENT_DB_WEBHOOK_URL);
   const webhookSecret = (process.env.PERSISTENT_DB_SECRET || '').trim();
 
-  if (kvUrl && kvToken) {
+  const hasUpstashComplete = Boolean(upstashUrl && upstashToken);
+  const hasUpstashPartial = Boolean(upstashUrl) !== Boolean(upstashToken);
+  const hasKvComplete = Boolean(kvUrl && kvToken);
+  const hasKvPartial = Boolean(kvUrl) !== Boolean(kvToken);
+
+  if (hasUpstashComplete && hasKvComplete) {
+    const sameEndpoint = upstashUrl.toLowerCase() === kvUrl.toLowerCase() && upstashToken === kvToken;
+    if (!sameEndpoint) {
+      return {
+        mode: 'ephemeral_tmp',
+        durable: false,
+        label: 'Cấu hình Redis mâu thuẫn giữa UPSTASH_REDIS_REST_* và KV_REST_API_*',
+        envPairUsed: 'NONE',
+        kvKey,
+        blobPathname,
+        configConflictError:
+          'Phát hiện cấu hình Redis bị mâu thuẫn: UPSTASH_REDIS_REST_* và KV_REST_API_* đang trỏ tới hai database hoặc token khác nhau. Vui lòng giữ lại đúng 1 cặp biến cho database chính trên Vercel Environment Variables rồi Redeploy.',
+      };
+    }
     return {
       mode: 'upstash_kv',
       durable: true,
-      label: 'Upstash Redis / Vercel KV (Bền vững dùng chung)',
+      label: 'Upstash Redis (Bền vững dùng chung)',
+      envPairUsed: 'UPSTASH_REDIS_REST',
+      kvUrl: upstashUrl,
+      kvToken: upstashToken,
+      kvKey,
+      blobPathname,
+    };
+  }
+
+  if (hasUpstashComplete) {
+    return {
+      mode: 'upstash_kv',
+      durable: true,
+      label: 'Upstash Redis (Bền vững dùng chung)',
+      envPairUsed: 'UPSTASH_REDIS_REST',
+      kvUrl: upstashUrl,
+      kvToken: upstashToken,
+      kvKey,
+      blobPathname,
+    };
+  }
+
+  if (hasKvComplete) {
+    return {
+      mode: 'upstash_kv',
+      durable: true,
+      label: 'Vercel KV / Upstash Redis (Bền vững dùng chung)',
+      envPairUsed: 'KV_REST_API',
       kvUrl,
       kvToken,
       kvKey,
       blobPathname,
     };
   }
+
   if (blobToken) {
     return {
       mode: 'vercel_blob',
       durable: true,
       label: 'Vercel Blob Store (Bền vững dùng chung)',
+      envPairUsed: 'VERCEL_BLOB',
       kvKey,
       blobToken,
       blobPathname,
     };
   }
+
   if (webhookUrl) {
     return {
       mode: 'remote_webhook',
       durable: true,
       label: 'Remote Storage Webhook (Bền vững dùng chung)',
+      envPairUsed: 'REMOTE_WEBHOOK',
       kvKey,
       blobPathname,
       webhookUrl,
       webhookSecret,
     };
   }
+
+  const partialHint =
+    hasUpstashPartial || hasKvPartial
+      ? 'Phát hiện cặp biến Redis bị thiếu một nửa (cần khai báo đủ cả *_URL và *_TOKEN trong cùng một cặp UPSTASH_REDIS_REST_* hoặc KV_REST_API_*).'
+      : undefined;
+
   if (!IS_SERVERLESS || Boolean(process.env.DATA_DIR)) {
     return {
       mode: 'local_disk',
       durable: true,
       label: 'Ổ đĩa máy chủ (data/db.json)',
+      envPairUsed: 'LOCAL_DISK',
       kvKey,
       blobPathname,
+      missingConfigError: partialHint,
     };
   }
+
   return {
     mode: 'ephemeral_tmp',
     durable: false,
-    label: 'Bộ nhớ tạm Serverless (/tmp — mất dữ liệu khi tải lại hoặc đổi phiên)',
+    label: 'Chưa gắn lưu trữ bền vững cho Vercel Production',
+    envPairUsed: 'NONE',
     kvKey,
     blobPathname,
+    missingConfigError:
+      partialHint ||
+      'Thiếu cặp biến UPSTASH_REDIS_REST_URL + UPSTASH_REDIS_REST_TOKEN (hoặc KV_REST_API_URL + KV_REST_API_TOKEN) trên Vercel Production.',
   };
 }
 
+function summarizeDatabaseObject(candidate: Partial<DatabaseSchema>): LegacySnapshotSummary {
+  const docs = Array.isArray(candidate.documents) ? candidate.documents : [];
+  const books = Array.isArray(candidate.books) ? candidate.books : [];
+  const users = Array.isArray(candidate.users) ? candidate.users : [];
+  let startMilestonesCount = 0;
+  for (const b of books) {
+    if (b?.customStartSequences && typeof b.customStartSequences === 'object') {
+      startMilestonesCount += Object.keys(b.customStartSequences).length;
+    }
+  }
+  if (
+    startMilestonesCount === 0 &&
+    candidate.settings?.customStartSequences &&
+    typeof candidate.settings.customStartSequences === 'object'
+  ) {
+    startMilestonesCount = Object.keys(candidate.settings.customStartSequences).length;
+  }
+  return {
+    usersCount: users.length,
+    booksCount: books.length,
+    documentsCount: docs.filter((d) => d?.status !== 'deleted').length,
+    deletedDocumentsCount: docs.filter((d) => d?.status === 'deleted').length,
+    startMilestonesCount,
+    driveLinkedCount: docs.filter((d) => Boolean(d?.driveFileId || d?.driveFileUrl)).length,
+    bookNames: books.map((b) => String(b?.name || b?.code || '')).filter(Boolean),
+  };
+}
+
+function getBundledLegacySnapshot(): Partial<DatabaseSchema> | null {
+  try {
+    if (!fs.existsSync(BUNDLED_DB_FILE)) return null;
+    const raw = fs.readFileSync(BUNDLED_DB_FILE, 'utf-8');
+    const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+    if (!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function validateRegistryPayloadShape(parsed: any): parsed is Partial<DatabaseSchema> {
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return false;
+  const hasAnyCoreCollection =
+    Array.isArray(parsed.books) ||
+    Array.isArray(parsed.users) ||
+    Array.isArray(parsed.documents) ||
+    (parsed.settings && typeof parsed.settings === 'object');
+  return Boolean(hasAnyCoreCollection);
+}
+
+const CONNECTION_LABELS: Record<StorageConnectionState, string> = {
+  connected: 'Đã kết nối',
+  missing_config: 'Thiếu cấu hình',
+  conflict: 'Cấu hình mâu thuẫn',
+  connection_error: 'Lỗi kết nối',
+  awaiting_migration: 'Chờ chuyển dữ liệu',
+  corrupt_data: 'Dữ liệu cần kiểm tra',
+};
+
 function getPersistenceStatus(): PersistenceStatus {
   const cfg = getStorageAdapterConfig();
+  const bundledLegacy = getBundledLegacySnapshot();
+  const hasBundled = Boolean(bundledLegacy);
+  const legacySummary = bundledLegacy ? summarizeDatabaseObject(bundledLegacy) : undefined;
+  const sessionSecretConfigured = Boolean((process.env.SESSION_SECRET || process.env.AUTH_SECRET || '').trim());
+
+  let connectionState: StorageConnectionState = 'connected';
+  let errorDetail: string | undefined;
+
+  if (cfg.configConflictError) {
+    connectionState = 'conflict';
+    errorDetail = cfg.configConflictError;
+  } else if (cfg.mode === 'ephemeral_tmp') {
+    connectionState = 'missing_config';
+    errorDetail = cfg.missingConfigError;
+  } else if (cfg.mode === 'upstash_kv' || cfg.mode === 'vercel_blob' || cfg.mode === 'remote_webhook') {
+    connectionState = lastStorageDiagnostic.state;
+    errorDetail = lastStorageDiagnostic.error;
+  } else {
+    connectionState = 'connected';
+  }
+
+  const isOperationallyDurable =
+    cfg.durable && !cfg.configConflictError && connectionState === 'connected';
+
   return {
-    durable: cfg.durable,
+    durable: isOperationallyDurable,
     storageMode: cfg.mode,
     storageLabel: cfg.label,
-    requiresRemoteEnvOnVercel: IS_SERVERLESS && !cfg.durable,
+    connectionState,
+    connectionLabel: CONNECTION_LABELS[connectionState],
+    envPairUsed: cfg.envPairUsed,
+    dbKey: cfg.mode === 'upstash_kv' || cfg.mode === 'remote_webhook' ? cfg.kvKey : undefined,
+    maskedHost: maskUrlHostname(cfg.kvUrl || cfg.webhookUrl),
+    schemaVersion: db?.meta?.schemaVersion || CURRENT_SCHEMA_VERSION,
+    hasLegacyBundledSnapshot: hasBundled,
+    legacySnapshotSummary: legacySummary,
+    sessionSecretConfigured,
+    requiresRemoteEnvOnVercel: IS_SERVERLESS && (!cfg.durable || Boolean(cfg.configConflictError)),
     lastSavedAt: lastPersistedAt || db?.meta?.updatedAt || undefined,
     lastVerifiedAt: lastVerifiedAt || undefined,
-    warning: !cfg.durable
-      ? 'Môi trường Serverless đang chạy ở chế độ /tmp tạm thời nên cấu hình số bắt đầu sẽ không được lưu giữ qua các lần tải lại hoặc đổi phiên.'
-      : undefined,
+    warning: !isOperationallyDurable
+      ? errorDetail ||
+        'Hệ thống chưa sẵn sàng lưu bền vững lên Redis/Remote Storage; thao tác cấp số và lưu mốc bị khóa để bảo vệ dữ liệu.'
+      : cfg.missingConfigError,
+    errorDetail,
   };
 }
 
@@ -794,123 +997,291 @@ async function fetchRemoteWithTimeout(url: string, init: RequestInit, timeoutMs 
   const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
     return await fetch(url, { ...init, signal: controller.signal });
+  } catch (err: any) {
+    if (err?.name === 'AbortError') {
+      throw new Error('Kết nối tới dịch vụ lưu trữ từ xa bị quá thời gian chờ.');
+    }
+    throw err;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function readFromPrimaryRemote(cfg: StorageAdapterConfig): Promise<Partial<DatabaseSchema> | null> {
-  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
-    const res = await fetchRemoteWithTimeout(cfg.kvUrl, {
+async function executeUpstashCommand<T = any>(
+  cfg: StorageAdapterConfig,
+  command: any[],
+  timeoutMs = 10000
+): Promise<T> {
+  if (!cfg.kvUrl || !cfg.kvToken) {
+    throw new StorageError(
+      'DURABLE_STORAGE_NOT_CONFIGURED',
+      503,
+      'Chưa cấu hình đầy đủ cặp biến kết nối Upstash Redis.'
+    );
+  }
+  const res = await fetchRemoteWithTimeout(
+    cfg.kvUrl,
+    {
       method: 'POST',
       headers: {
         Authorization: `Bearer ${cfg.kvToken}`,
         'Content-Type': 'application/json',
       },
-      body: JSON.stringify(['GET', cfg.kvKey]),
-    });
-    if (!res.ok) {
-      throw new Error(`Upstash/Vercel KV trả về HTTP ${res.status}`);
+      body: JSON.stringify(command),
+    },
+    timeoutMs
+  );
+  if (res.status === 401 || res.status === 403) {
+    throw new StorageError(
+      'PRIMARY_STORAGE_UNAVAILABLE',
+      503,
+      'Token Upstash Redis không hợp lệ hoặc không có quyền thực hiện thao tác.'
+    );
+  }
+  if (!res.ok) {
+    throw new StorageError(
+      'PRIMARY_STORAGE_UNAVAILABLE',
+      503,
+      `Upstash Redis trả về lỗi HTTP ${res.status}.`
+    );
+  }
+  const payload = (await res.json()) as { result?: T; error?: string };
+  if (payload?.error) {
+    const errLower = String(payload.error).toLowerCase();
+    if (errLower.includes('noperm') || errLower.includes('readonly') || errLower.includes('auth')) {
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        'Token Upstash Redis bị giới hạn quyền (chỉ đọc hoặc sai quyền ghi).'
+      );
     }
-    const payload = (await res.json()) as { result?: any; error?: string };
-    if (payload?.error) {
-      throw new Error(`Upstash/Vercel KV báo lỗi: ${payload.error}`);
+    throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Upstash Redis báo lỗi: ${payload.error}`);
+  }
+  return payload.result as T;
+}
+
+const LUA_COMPARE_AND_SWAP = `
+local cur = redis.call('GET', KEYS[1])
+if not cur then
+  return 'ERR_KEY_MISSING'
+end
+if cur ~= ARGV[1] then
+  return 'ERR_CONFLICT'
+end
+redis.call('SET', KEYS[1], ARGV[2])
+return 'OK'
+`;
+
+async function readRawFromPrimaryRemote(
+  cfg: StorageAdapterConfig,
+  timeoutMs = 10000
+): Promise<{ raw: string | null; parsed: Partial<DatabaseSchema> | null }> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    const result = await executeUpstashCommand<any>(cfg, ['GET', cfg.kvKey], timeoutMs);
+    if (result === null || result === undefined || result === '') {
+      return { raw: null, parsed: null };
     }
-    if (payload.result === null || payload.result === undefined || payload.result === '') {
-      return null;
+    const rawStr = typeof result === 'string' ? result : JSON.stringify(result);
+    let parsed: any;
+    try {
+      parsed = typeof result === 'string' ? JSON.parse(result) : result;
+    } catch {
+      throw new StorageError(
+        'STORAGE_CORRUPT_DATA',
+        503,
+        `Dữ liệu tại khóa "${cfg.kvKey}" trên Upstash Redis không phải JSON hợp lệ. Hệ thống giữ nguyên khóa và tạm khóa cấp số để kiểm tra.`
+      );
     }
-    const parsed = typeof payload.result === 'string' ? JSON.parse(payload.result) : payload.result;
-    return parsed as Partial<DatabaseSchema>;
+    if (!validateRegistryPayloadShape(parsed)) {
+      throw new StorageError(
+        'STORAGE_CORRUPT_DATA',
+        503,
+        `Cấu trúc dữ liệu tại khóa "${cfg.kvKey}" trên Upstash Redis không khớp định dạng sổ văn bản. Vui lòng kiểm tra trước khi ghi đè.`
+      );
+    }
+    return { raw: rawStr, parsed };
   }
 
   if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
     const listUrl = `https://blob.vercel-storage.com?prefix=${encodeURIComponent(cfg.blobPathname)}&limit=10`;
-    const listRes = await fetchRemoteWithTimeout(listUrl, {
-      method: 'GET',
-      headers: {
-        Authorization: `Bearer ${cfg.blobToken}`,
-        'x-api-version': '7',
+    const listRes = await fetchRemoteWithTimeout(
+      listUrl,
+      {
+        method: 'GET',
+        headers: {
+          Authorization: `Bearer ${cfg.blobToken}`,
+          'x-api-version': '7',
+        },
       },
-    });
+      timeoutMs
+    );
     if (!listRes.ok) {
-      throw new Error(`Vercel Blob list trả về HTTP ${listRes.status}`);
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Vercel Blob list trả về HTTP ${listRes.status}`);
     }
     const listData = (await listRes.json()) as {
       blobs?: Array<{ pathname: string; url: string; downloadUrl?: string }>;
     };
     const match = listData.blobs?.find((b) => b.pathname === cfg.blobPathname);
-    if (!match) return null;
+    if (!match) return { raw: null, parsed: null };
 
     const targetUrl = new URL(match.downloadUrl || match.url);
     targetUrl.searchParams.set('_ts', String(Date.now()));
-    let fileRes = await fetchRemoteWithTimeout(targetUrl.toString(), {
-      method: 'GET',
-      cache: 'no-store',
-    });
+    let fileRes = await fetchRemoteWithTimeout(targetUrl.toString(), { method: 'GET', cache: 'no-store' }, timeoutMs);
     if (fileRes.status === 401 || fileRes.status === 403) {
-      fileRes = await fetchRemoteWithTimeout(targetUrl.toString(), {
-        method: 'GET',
-        cache: 'no-store',
-        headers: { Authorization: `Bearer ${cfg.blobToken}` },
-      });
+      fileRes = await fetchRemoteWithTimeout(
+        targetUrl.toString(),
+        {
+          method: 'GET',
+          cache: 'no-store',
+          headers: { Authorization: `Bearer ${cfg.blobToken}` },
+        },
+        timeoutMs
+      );
     }
     if (!fileRes.ok) {
-      throw new Error(`Vercel Blob get trả về HTTP ${fileRes.status}`);
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Vercel Blob get trả về HTTP ${fileRes.status}`);
     }
-    return (await fileRes.json()) as Partial<DatabaseSchema>;
+    const rawStr = await fileRes.text();
+    let parsed: any;
+    try {
+      parsed = JSON.parse(rawStr);
+    } catch {
+      throw new StorageError('STORAGE_CORRUPT_DATA', 503, 'Dữ liệu Vercel Blob bị lỗi định dạng JSON.');
+    }
+    if (!validateRegistryPayloadShape(parsed)) {
+      throw new StorageError('STORAGE_CORRUPT_DATA', 503, 'Cấu trúc dữ liệu Vercel Blob không hợp lệ.');
+    }
+    return { raw: rawStr, parsed };
   }
 
   if (cfg.mode === 'remote_webhook' && cfg.webhookUrl) {
-    const res = await fetchRemoteWithTimeout(cfg.webhookUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'load',
-        key: cfg.kvKey,
-        ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}),
-      }),
-    });
+    const res = await fetchRemoteWithTimeout(
+      cfg.webhookUrl,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'load',
+          key: cfg.kvKey,
+          ...(cfg.webhookSecret ? { secret: cfg.webhookSecret } : {}),
+        }),
+      },
+      timeoutMs
+    );
     if (!res.ok) {
-      throw new Error(`Remote Storage Webhook trả về HTTP ${res.status}`);
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Remote Storage Webhook trả về HTTP ${res.status}`);
     }
     const json = (await res.json()) as { ok?: boolean; error?: string; data?: Partial<DatabaseSchema> | null };
     if (json?.error || json?.ok === false) {
-      throw new Error(json?.error || 'Remote Storage Webhook báo lỗi khi đọc.');
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, json?.error || 'Remote Storage Webhook báo lỗi khi đọc.');
     }
-    return json?.data ?? null;
+    if (json?.data === null || json?.data === undefined) {
+      return { raw: null, parsed: null };
+    }
+    if (!validateRegistryPayloadShape(json.data)) {
+      throw new StorageError('STORAGE_CORRUPT_DATA', 503, 'Cấu trúc dữ liệu từ Remote Webhook không hợp lệ.');
+    }
+    return { raw: JSON.stringify(json.data), parsed: json.data };
   }
 
-  return null;
+  return { raw: null, parsed: null };
 }
 
-async function writeToPrimaryRemoteAndVerify(
+async function writeToPrimaryRemoteNX(
+  cfg: StorageAdapterConfig,
+  serialized: string,
+  expectedRevision: string
+): Promise<string> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    const result = await executeUpstashCommand<any>(cfg, ['SET', cfg.kvKey, serialized, 'NX']);
+    if (result === null) {
+      throw new StorageError(
+        'REVISION_CONFLICT',
+        409,
+        `Khóa "${cfg.kvKey}" trên Upstash Redis vừa được khởi tạo từ một phiên khác. Hệ thống đang nạp lại dữ liệu hiện có.`
+      );
+    }
+    if (result !== 'OK') {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Upstash Redis không xác nhận ghi khởi tạo thành công.');
+    }
+    const readBack = await readRawFromPrimaryRemote(cfg);
+    if (!readBack.parsed || readBack.parsed.meta?.revision !== expectedRevision || !readBack.raw) {
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        'Đọc lại từ Upstash Redis sau khi khởi tạo không khớp phiên bản dữ liệu.'
+      );
+    }
+    return readBack.raw;
+  }
+
+  await writeToPrimaryRemoteDirectAndVerify(cfg, serialized, expectedRevision);
+  return serialized;
+}
+
+async function writeToPrimaryRemoteCAS(
+  cfg: StorageAdapterConfig,
+  expectedPreviousRaw: string | null,
+  serialized: string,
+  expectedRevision: string
+): Promise<string> {
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    if (!expectedPreviousRaw) {
+      throw new StorageError(
+        'STORAGE_AWAITING_INITIALIZATION',
+        503,
+        'Khóa dữ liệu trên Upstash Redis chưa được khởi tạo hoặc chưa sẵn sàng.'
+      );
+    }
+    const evalResult = await executeUpstashCommand<string>(cfg, [
+      'EVAL',
+      LUA_COMPARE_AND_SWAP,
+      '1',
+      cfg.kvKey,
+      expectedPreviousRaw,
+      serialized,
+    ]);
+    if (evalResult === 'ERR_KEY_MISSING') {
+      remoteHydrated = false;
+      lastRemoteRawPayload = null;
+      lastStorageDiagnostic = { state: 'awaiting_migration', error: 'Khóa dữ liệu trên Upstash Redis không còn tồn tại.' };
+      throw new StorageError(
+        'STORAGE_AWAITING_INITIALIZATION',
+        503,
+        'Khóa dữ liệu trên Upstash Redis chưa tồn tại. Vui lòng kiểm tra mục Cài đặt → Lưu trữ & Đồng bộ.'
+      );
+    }
+    if (evalResult === 'ERR_CONFLICT') {
+      remoteHydrated = false;
+      throw new StorageError(
+        'REVISION_CONFLICT',
+        409,
+        'Dữ liệu trên Redis vừa được cập nhật đồng thời từ một phiên khác. Vui lòng thử lại để giữ an toàn dữ liệu.'
+      );
+    }
+    if (evalResult !== 'OK') {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Upstash Redis không xác nhận ghi dữ liệu thành công.');
+    }
+    const readBack = await readRawFromPrimaryRemote(cfg);
+    if (!readBack.parsed || readBack.parsed.meta?.revision !== expectedRevision || !readBack.raw) {
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        'Đọc lại từ Upstash Redis không khớp phiên bản dữ liệu vừa lưu.'
+      );
+    }
+    return readBack.raw;
+  }
+
+  await writeToPrimaryRemoteDirectAndVerify(cfg, serialized, expectedRevision);
+  return serialized;
+}
+
+async function writeToPrimaryRemoteDirectAndVerify(
   cfg: StorageAdapterConfig,
   serialized: string,
   expectedRevision: string
 ): Promise<void> {
-  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
-    const res = await fetchRemoteWithTimeout(cfg.kvUrl, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${cfg.kvToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(['SET', cfg.kvKey, serialized]),
-    });
-    if (!res.ok) {
-      throw new Error(`Ghi Upstash/Vercel KV thất bại (HTTP ${res.status})`);
-    }
-    const payload = (await res.json()) as { result?: any; error?: string };
-    if (payload?.error || payload?.result !== 'OK') {
-      throw new Error(payload?.error || 'Upstash/Vercel KV không xác nhận ghi thành công.');
-    }
-    const readBack = await readFromPrimaryRemote(cfg);
-    if (!readBack || readBack.meta?.revision !== expectedRevision) {
-      throw new Error('Đọc lại từ Upstash/Vercel KV không khớp phiên bản dữ liệu vừa lưu.');
-    }
-    return;
-  }
-
   if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
     const putUrl = `https://blob.vercel-storage.com/${cfg.blobPathname}`;
     const res = await fetchRemoteWithTimeout(putUrl, {
@@ -926,15 +1297,12 @@ async function writeToPrimaryRemoteAndVerify(
       body: serialized,
     });
     if (!res.ok) {
-      throw new Error(`Ghi Vercel Blob thất bại (HTTP ${res.status})`);
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Ghi Vercel Blob thất bại (HTTP ${res.status})`);
     }
     const putData = (await res.json()) as { url?: string; downloadUrl?: string };
     const verifyUrl = new URL(putData.downloadUrl || putData.url || '');
     verifyUrl.searchParams.set('_ts', String(Date.now()));
-    let checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), {
-      method: 'GET',
-      cache: 'no-store',
-    });
+    let checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), { method: 'GET', cache: 'no-store' });
     if (checkRes.status === 401 || checkRes.status === 403) {
       checkRes = await fetchRemoteWithTimeout(verifyUrl.toString(), {
         method: 'GET',
@@ -943,11 +1311,11 @@ async function writeToPrimaryRemoteAndVerify(
       });
     }
     if (!checkRes.ok) {
-      throw new Error(`Không đọc lại được từ Vercel Blob để xác nhận (HTTP ${checkRes.status}).`);
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Không đọc lại được từ Vercel Blob (HTTP ${checkRes.status}).`);
     }
     const verified = (await checkRes.json()) as Partial<DatabaseSchema>;
     if (!verified || verified.meta?.revision !== expectedRevision) {
-      throw new Error('Đọc lại từ Vercel Blob không khớp phiên bản dữ liệu vừa lưu.');
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Đọc lại từ Vercel Blob không khớp phiên bản vừa lưu.');
     }
     return;
   }
@@ -964,29 +1332,143 @@ async function writeToPrimaryRemoteAndVerify(
       }),
     });
     if (!res.ok) {
-      throw new Error(`Ghi Remote Storage Webhook thất bại (HTTP ${res.status})`);
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Ghi Remote Storage Webhook thất bại (HTTP ${res.status})`);
     }
     const json = (await res.json()) as { ok?: boolean; error?: string };
     if (json?.error || json?.ok === false) {
-      throw new Error(json?.error || 'Remote Storage Webhook không xác nhận ghi thành công.');
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, json?.error || 'Remote Webhook không xác nhận ghi.');
     }
-    const verified = await readFromPrimaryRemote(cfg);
-    if (!verified || verified.meta?.revision !== expectedRevision) {
-      throw new Error('Đọc lại từ Remote Storage Webhook không khớp phiên bản dữ liệu vừa lưu.');
+    const verified = await readRawFromPrimaryRemote(cfg);
+    if (!verified.parsed || verified.parsed.meta?.revision !== expectedRevision) {
+      throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, 'Đọc lại từ Remote Webhook không khớp phiên bản vừa lưu.');
     }
   }
 }
 
-function loadDatabase(): DatabaseSchema {
-  const sourceFile = fs.existsSync(DB_FILE)
-    ? DB_FILE
-    : BUNDLED_DB_FILE !== DB_FILE && fs.existsSync(BUNDLED_DB_FILE)
-    ? BUNDLED_DB_FILE
-    : null;
+async function testUpstashRedisConnection(): Promise<StorageTestResult> {
+  const startedAt = Date.now();
+  const cfg = getStorageAdapterConfig();
 
-  if (sourceFile) {
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+    return {
+      success: false,
+      readOk: false,
+      writeOk: false,
+      deleteOk: false,
+      keyExists: false,
+      latencyMs: Date.now() - startedAt,
+      message: cfg.configConflictError,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  }
+
+  if (cfg.mode !== 'upstash_kv') {
+    const msg =
+      cfg.mode === 'local_disk'
+        ? 'Máy chủ hiện dùng ổ đĩa cục bộ (data/db.json) vì chưa khai báo biến môi trường Upstash Redis.'
+        : cfg.missingConfigError || 'Chưa cấu hình Upstash Redis.';
+    return {
+      success: cfg.mode === 'local_disk',
+      readOk: cfg.mode === 'local_disk',
+      writeOk: cfg.mode === 'local_disk',
+      deleteOk: cfg.mode === 'local_disk',
+      keyExists: cfg.mode === 'local_disk',
+      latencyMs: Date.now() - startedAt,
+      message: msg,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  }
+
+  const probeKey = `${cfg.kvKey}:healthcheck:${Date.now()}:${crypto.randomBytes(4).toString('hex')}`;
+  const probeVal = `nct-probe-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+  let writeOk = false;
+  let readOk = false;
+  let deleteOk = false;
+  let keyExists = false;
+  let schemaValid: boolean | undefined;
+
+  try {
+    const setRes = await executeUpstashCommand<any>(cfg, ['SET', probeKey, probeVal, 'EX', '30'], 8000);
+    if (setRes !== 'OK') {
+      throw new Error('Redis không xác nhận ghi khóa kiểm tra.');
+    }
+    writeOk = true;
+
+    const getRes = await executeUpstashCommand<any>(cfg, ['GET', probeKey], 8000);
+    if (getRes !== probeVal) {
+      throw new Error('Giá trị đọc lại từ khóa kiểm tra không khớp.');
+    }
+    readOk = true;
+
     try {
-      const content = fs.readFileSync(sourceFile, 'utf-8');
+      await executeUpstashCommand(cfg, ['DEL', probeKey], 5000);
+      deleteOk = true;
+    } catch {
+      deleteOk = false;
+    }
+
+    const mainCheck = await readRawFromPrimaryRemote(cfg, 8000);
+    if (mainCheck.raw === null) {
+      keyExists = false;
+      lastStorageDiagnostic = {
+        state: 'awaiting_migration',
+        error: `Kết nối Redis thành công nhưng khóa "${cfg.kvKey}" chưa tồn tại dữ liệu.`,
+      };
+    } else {
+      keyExists = true;
+      schemaValid = true;
+      lastRemoteRawPayload = mainCheck.raw;
+      db = migrateDatabaseIdempotent(mainCheck.parsed!);
+      remoteHydrated = true;
+      lastRemoteSyncMs = Date.now();
+      lastVerifiedAt = new Date().toISOString();
+      lastStorageDiagnostic = { state: 'connected' };
+    }
+
+    return {
+      success: true,
+      readOk,
+      writeOk,
+      deleteOk,
+      keyExists,
+      schemaValid,
+      latencyMs: Date.now() - startedAt,
+      probeKey,
+      message: keyExists
+        ? `Kết nối Upstash Redis thành công (ghi & đọc khóa kiểm tra riêng an toàn, khóa chính "${cfg.kvKey}" hợp lệ).`
+        : `Kết nối Upstash Redis thành công (ghi & đọc tốt), nhưng khóa chính "${cfg.kvKey}" chưa có dữ liệu — đang ở trạng thái Chờ chuyển dữ liệu.`,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  } catch (err: any) {
+    const errMsg = sanitizeErrorForLog(err);
+    if (err instanceof StorageError && err.code === 'STORAGE_CORRUPT_DATA') {
+      keyExists = true;
+      schemaValid = false;
+      lastStorageDiagnostic = { state: 'corrupt_data', error: errMsg };
+    } else {
+      lastStorageDiagnostic = { state: 'connection_error', error: errMsg };
+    }
+    return {
+      success: false,
+      readOk,
+      writeOk,
+      deleteOk,
+      keyExists,
+      schemaValid,
+      latencyMs: Date.now() - startedAt,
+      probeKey,
+      message: errMsg,
+      persistenceStatus: getPersistenceStatus(),
+    };
+  }
+}
+
+function loadDatabase(): DatabaseSchema {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'local_disk' && fs.existsSync(DB_FILE)) {
+    try {
+      const content = fs.readFileSync(DB_FILE, 'utf-8');
       const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
       const migrated = migrateDatabaseIdempotent(loaded);
       saveDatabaseSync(migrated);
@@ -994,9 +1476,19 @@ function loadDatabase(): DatabaseSchema {
     } catch (e) {
       console.error('Lỗi khi đọc file db.json, khởi tạo lại:', e);
     }
+  } else if (fs.existsSync(BUNDLED_DB_FILE)) {
+    try {
+      const content = fs.readFileSync(BUNDLED_DB_FILE, 'utf-8');
+      const loaded = JSON.parse(content) as Partial<DatabaseSchema>;
+      const migrated = migrateDatabaseIdempotent(loaded);
+      return migrated;
+    } catch (e) {
+      console.error('Lỗi đọc dữ liệu seed:', e);
+    }
   }
 
   const initialDb = migrateDatabaseIdempotent({
+    meta: { revision: 'bootstrap', updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION },
     settings: DEFAULT_SETTINGS,
     documentTypes: DEFAULT_DOC_TYPES,
     signers: DEFAULT_SIGNERS,
@@ -1008,7 +1500,9 @@ function loadDatabase(): DatabaseSchema {
     systemAuditLogs: [],
     revokedSessions: {},
   });
-  saveDatabaseSync(initialDb);
+  if (cfg.mode === 'local_disk') {
+    saveDatabaseSync(initialDb);
+  }
   return initialDb;
 }
 
@@ -1045,12 +1539,28 @@ async function ensureLatestDb(options: { maxAgeMs?: number } = {}): Promise<void
   const cfg = getStorageAdapterConfig();
   const maxAgeMs = options.maxAgeMs ?? 500;
 
-  if (cfg.mode === 'local_disk' || cfg.mode === 'ephemeral_tmp') {
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+    throw new StorageError('STORAGE_CONFIG_CONFLICT', 503, cfg.configConflictError);
+  }
+
+  if (cfg.mode === 'ephemeral_tmp') {
+    lastStorageDiagnostic = { state: 'missing_config', error: cfg.missingConfigError };
+    throw new StorageError(
+      'DURABLE_STORAGE_NOT_CONFIGURED',
+      503,
+      cfg.missingConfigError ||
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững Upstash Redis. Đã chặn thao tác để tránh mất dữ liệu.'
+    );
+  }
+
+  if (cfg.mode === 'local_disk') {
     reloadDatabaseFromDiskIfNewer(maxAgeMs === 0);
+    lastStorageDiagnostic = { state: 'connected' };
     return;
   }
 
-  if (remoteHydrated && maxAgeMs > 0 && Date.now() - lastRemoteSyncMs < maxAgeMs) {
+  if (remoteHydrated && maxAgeMs > 0 && Date.now() - lastRemoteSyncMs < maxAgeMs && lastStorageDiagnostic.state === 'connected') {
     return;
   }
 
@@ -1060,22 +1570,82 @@ async function ensureLatestDb(options: { maxAgeMs?: number } = {}): Promise<void
   }
 
   const loadPromise = (async () => {
-    const remoteRaw = await readFromPrimaryRemote(cfg);
-    if (remoteRaw === null) {
-      const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-      const seeded = migrateDatabaseIdempotent(db);
-      seeded.meta = { revision, updatedAt: new Date().toISOString() };
-      const serialized = JSON.stringify(seeded, null, 2);
-      await writeToPrimaryRemoteAndVerify(cfg, serialized, revision);
-      db = seeded;
-      saveDatabaseSync(db);
-    } else {
-      db = migrateDatabaseIdempotent(remoteRaw);
-      saveDatabaseSync(db);
+    try {
+      const remoteResult = await readRawFromPrimaryRemote(cfg);
+      if (remoteResult.raw === null || remoteResult.parsed === null) {
+        remoteHydrated = false;
+        lastRemoteRawPayload = null;
+        lastStorageDiagnostic = {
+          state: 'awaiting_migration',
+          error: `Khóa "${cfg.kvKey}" trên Redis chưa tồn tại. Cần nhập bản sao từ nguồn cũ hoặc xác nhận khởi tạo hệ thống mới.`,
+        };
+        throw new StorageError(
+          'STORAGE_AWAITING_INITIALIZATION',
+          503,
+          `Chờ chuyển dữ liệu: Khóa "${cfg.kvKey}" trên Upstash Redis chưa tồn tại. Vui lòng mở Cài đặt → Lưu trữ & Đồng bộ để nhập bản sao hoặc xác nhận hệ thống mới.`
+        );
+      }
+
+      const incomingVersion = Number(remoteResult.parsed.meta?.schemaVersion || 0);
+      const migrated = migrateDatabaseIdempotent(remoteResult.parsed);
+      const needsSchemaUpgrade = incomingVersion < CURRENT_SCHEMA_VERSION;
+      migrated.meta = {
+        revision: remoteResult.parsed.meta?.revision || `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`,
+        updatedAt: remoteResult.parsed.meta?.updatedAt || new Date().toISOString(),
+        schemaVersion: CURRENT_SCHEMA_VERSION,
+      };
+
+      if (needsSchemaUpgrade) {
+        const upgradeRev = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        migrated.meta = {
+          revision: upgradeRev,
+          updatedAt: new Date().toISOString(),
+          schemaVersion: CURRENT_SCHEMA_VERSION,
+        };
+        const upgradedSerialized = JSON.stringify(migrated, null, 2);
+        try {
+          lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, remoteResult.raw, upgradedSerialized, upgradeRev);
+        } catch (casErr: any) {
+          if (casErr instanceof StorageError && casErr.code === 'REVISION_CONFLICT') {
+            const fresh = await readRawFromPrimaryRemote(cfg);
+            if (!fresh.parsed || !fresh.raw) throw casErr;
+            lastRemoteRawPayload = fresh.raw;
+            db = migrateDatabaseIdempotent(fresh.parsed);
+          } else {
+            throw casErr;
+          }
+        }
+      } else {
+        lastRemoteRawPayload = remoteResult.raw;
+        db = migrated;
+      }
+
+      if (!needsSchemaUpgrade) {
+        db = migrated;
+      }
+      remoteHydrated = true;
+      lastRemoteSyncMs = Date.now();
+      lastVerifiedAt = new Date().toISOString();
+      lastStorageDiagnostic = { state: 'connected' };
+    } catch (err: any) {
+      if (err instanceof StorageError) {
+        if (err.code === 'STORAGE_CORRUPT_DATA') {
+          lastStorageDiagnostic = { state: 'corrupt_data', error: err.message };
+        } else if (err.code === 'STORAGE_AWAITING_INITIALIZATION') {
+          lastStorageDiagnostic = { state: 'awaiting_migration', error: err.message };
+        } else {
+          lastStorageDiagnostic = { state: 'connection_error', error: err.message };
+        }
+        throw err;
+      }
+      const msg = sanitizeErrorForLog(err);
+      lastStorageDiagnostic = { state: 'connection_error', error: msg };
+      throw new StorageError(
+        'PRIMARY_STORAGE_UNAVAILABLE',
+        503,
+        `Không thể kết nối tới nguồn lưu trữ chính: ${msg}`
+      );
     }
-    remoteHydrated = true;
-    lastRemoteSyncMs = Date.now();
-    lastVerifiedAt = new Date().toISOString();
   })();
 
   inFlightRemoteLoad = loadPromise;
@@ -1088,20 +1658,53 @@ async function ensureLatestDb(options: { maxAgeMs?: number } = {}): Promise<void
   }
 }
 
+// --- Thread-Safe Atomic Lock Mutex ---
+class AsyncLock {
+  private p = Promise.resolve();
+  async acquire(): Promise<() => void> {
+    let release: () => void = () => {};
+    const next = new Promise<void>((res) => {
+      release = res;
+    });
+    const wait = this.p;
+    this.p = this.p.then(() => next);
+    await wait;
+    return release;
+  }
+}
+
+const persistLock = new AsyncLock();
+const atomicLock = new AsyncLock();
+
 async function saveDatabasePersistent(
   data: DatabaseSchema,
   options: { verifyWrite?: boolean } = {}
 ): Promise<PersistenceStatus> {
+  const releasePersist = await persistLock.acquire();
+  try {
+    const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+    throw new StorageError('STORAGE_CONFIG_CONFLICT', 503, cfg.configConflictError);
+  }
+  if (!cfg.durable) {
+    lastStorageDiagnostic = { state: 'missing_config', error: cfg.missingConfigError };
+    throw new StorageError(
+      'DURABLE_STORAGE_NOT_CONFIGURED',
+      503,
+      cfg.missingConfigError ||
+        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững. Đã chặn lưu tạm vào /tmp.'
+    );
+  }
+
   const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
   const updatedAt = new Date().toISOString();
-  data.meta = { revision, updatedAt };
+  data.meta = { revision, updatedAt, schemaVersion: CURRENT_SCHEMA_VERSION };
   const serialized = JSON.stringify(data, null, 2);
 
-  saveDatabaseSync(data);
-  lastPersistedAt = updatedAt;
-
-  const cfg = getStorageAdapterConfig();
   if (cfg.mode === 'local_disk') {
+    saveDatabaseSync(data);
+    lastPersistedAt = updatedAt;
     if (options.verifyWrite) {
       const raw = fs.readFileSync(DB_FILE, 'utf-8');
       const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
@@ -1111,18 +1714,35 @@ async function saveDatabasePersistent(
       db = migrateDatabaseIdempotent(parsed);
       lastVerifiedAt = new Date().toISOString();
     }
+    lastStorageDiagnostic = { state: 'connected' };
     return getPersistenceStatus();
   }
 
-  if (cfg.mode === 'ephemeral_tmp') {
+  try {
+    lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, lastRemoteRawPayload, serialized, revision);
+    lastPersistedAt = updatedAt;
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
     return getPersistenceStatus();
+  } catch (err: any) {
+    remoteHydrated = false;
+    if (err instanceof StorageError) {
+      if (err.code === 'STORAGE_AWAITING_INITIALIZATION') {
+        lastStorageDiagnostic = { state: 'awaiting_migration', error: err.message };
+      } else if (err.code !== 'REVISION_CONFLICT') {
+        lastStorageDiagnostic = { state: 'connection_error', error: err.message };
+      }
+      throw err;
+    }
+    const msg = sanitizeErrorForLog(err);
+    lastStorageDiagnostic = { state: 'connection_error', error: msg };
+    throw new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, `Lỗi ghi vào Upstash Redis: ${msg}`);
   }
-
-  await writeToPrimaryRemoteAndVerify(cfg, serialized, revision);
-  remoteHydrated = true;
-  lastRemoteSyncMs = Date.now();
-  lastVerifiedAt = new Date().toISOString();
-  return getPersistenceStatus();
+  } finally {
+    releasePersist();
+  }
 }
 
 db = loadDatabase();
@@ -1476,44 +2096,14 @@ async function syncDeletedDocumentToOnlineExcel(
   return { attempted: true, ok: false, error: doc.excelSyncError };
 }
 
-// --- Thread-Safe Atomic Lock Mutex ---
-class AsyncLock {
-  private p = Promise.resolve();
-  async acquire(): Promise<() => void> {
-    let release: () => void = () => {};
-    const next = new Promise<void>((res) => {
-      release = res;
-    });
-    const wait = this.p;
-    this.p = this.p.then(() => next);
-    await wait;
-    return release;
-  }
-}
-
-const atomicLock = new AsyncLock();
 const inFlightDocUploads = new Map<string, Promise<DocumentRecord>>();
 
 function sanitizeSettingsForUser(settings: SystemSettings, user?: User): SystemSettings {
   const isAdmin = user?.role === 'admin';
   const safeDrive = sanitizeDriveConfigForClient(settings.googleDriveConfig, isAdmin, settings.unitCode);
+  const { msGraphConfig: _legacyMsGraph, ...cleanSettings } = settings;
   return {
-    ...settings,
-    msGraphConfig: isAdmin
-      ? {
-          ...settings.msGraphConfig,
-          clientSecret: settings.msGraphConfig.clientSecret ? '••••••••' : '',
-        }
-      : {
-          enabled: settings.msGraphConfig.enabled,
-          tenantId: '',
-          clientId: '',
-          clientSecret: '',
-          driveId: '',
-          filePath: '',
-          tableName: settings.msGraphConfig.tableName,
-          lastSyncTime: settings.msGraphConfig.lastSyncTime,
-        },
+    ...cleanSettings,
     googleSheetsConfig: settings.googleSheetsConfig
       ? isAdmin
         ? settings.googleSheetsConfig
@@ -2119,7 +2709,19 @@ function requireAuth(req: Request, res: Response, next: NextFunction) {
     userId = session.user.id;
   }
 
-  const freshUser = db.users.find((u) => u.id === userId);
+  let freshUser = db.users.find((u) => u.id === userId);
+  const normAuthPath = req.path.replace(/^\/api/, '') || '/';
+  const allowBootstrapAdmin =
+    normAuthPath === '/auth/me' ||
+    normAuthPath === '/auth/logout' ||
+    normAuthPath.startsWith('/storage/');
+  if (!freshUser && allowBootstrapAdmin) {
+    const bundled = getBundledLegacySnapshot();
+    const bootstrapAdmins = [...(bundled?.users || []), ...DEFAULT_USERS].filter(
+      (u) => u.role === 'admin'
+    );
+    freshUser = bootstrapAdmins.find((u) => u.id === userId);
+  }
   if (!freshUser || !freshUser.isActive) {
     tokenStore.delete(token);
     return res.status(401).json({ error: 'Tài khoản đã bị khóa hoặc không còn hiệu lực' });
@@ -2157,27 +2759,370 @@ function renderFullDocNumber(format: string, seqStr: string, typeCode: string, u
 
 // --- API ROUTES ---
 
-// 1. Health check
-app.get('/api/health', (req, res) => {
+// 1. Health check (kiểm tra kết nối thực tế tới nguồn lưu trữ)
+app.get('/api/health', async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  let redisReachable = cfg.mode === 'local_disk';
+
+  if (cfg.configConflictError) {
+    lastStorageDiagnostic = { state: 'conflict', error: cfg.configConflictError };
+  } else if (cfg.mode === 'ephemeral_tmp') {
+    lastStorageDiagnostic = { state: 'missing_config', error: cfg.missingConfigError };
+  } else if (cfg.mode === 'upstash_kv' || cfg.mode === 'vercel_blob' || cfg.mode === 'remote_webhook') {
+    try {
+      const check = await readRawFromPrimaryRemote(cfg, 6000);
+      redisReachable = true;
+      if (check.raw === null || check.parsed === null) {
+        lastRemoteRawPayload = null;
+        lastStorageDiagnostic = {
+          state: 'awaiting_migration',
+          error: `Kết nối Redis thành công nhưng khóa "${cfg.kvKey}" chưa tồn tại.`,
+        };
+      } else {
+        lastRemoteRawPayload = check.raw;
+        db = migrateDatabaseIdempotent(check.parsed);
+        remoteHydrated = true;
+        lastRemoteSyncMs = Date.now();
+        lastVerifiedAt = new Date().toISOString();
+        lastStorageDiagnostic = { state: 'connected' };
+      }
+    } catch (err: any) {
+      redisReachable = false;
+      const msg = sanitizeErrorForLog(err);
+      if (err instanceof StorageError && err.code === 'STORAGE_CORRUPT_DATA') {
+        lastStorageDiagnostic = { state: 'corrupt_data', error: msg };
+      } else {
+        lastStorageDiagnostic = { state: 'connection_error', error: msg };
+      }
+    }
+  } else {
+    lastStorageDiagnostic = { state: 'connected' };
+  }
+
+  const statusPayload = getPersistenceStatus();
   res.json({
-    status: 'ok',
+    status: statusPayload.durable ? 'ok' : 'degraded',
     app: 'Sổ Cấp Số Văn Bản Đoàn Trường THPT Nguyễn Chí Thanh',
     timeVietnam: getRequestVietnamTimeInfo(req),
+    durable: statusPayload.durable,
+    storageMode: statusPayload.storageMode,
+    connectionState: statusPayload.connectionState,
+    redisReachable,
+    persistenceStatus: statusPayload,
+  });
+});
+
+// 1b. Storage diagnostics, connection test & migration/initialization endpoints
+app.get('/api/storage/status', requireAuth, requireAdmin, async (_req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (!cfg.configConflictError && (cfg.mode === 'upstash_kv' || cfg.mode === 'vercel_blob' || cfg.mode === 'remote_webhook')) {
+    try {
+      await ensureLatestDb({ maxAgeMs: 0 });
+    } catch {
+      // diagnostic state is captured cleanly in lastStorageDiagnostic
+    }
+  }
+  res.json({
     persistenceStatus: getPersistenceStatus(),
   });
 });
 
+app.post('/api/storage/test-connection', requireAuth, requireAdmin, async (_req, res) => {
+  const result = await testUpstashRedisConnection();
+  res.json(result);
+});
+
+app.get('/api/storage/export-legacy-snapshot', requireAuth, requireAdmin, (_req, res) => {
+  const bundled = getBundledLegacySnapshot();
+  const source = bundled || db;
+  const migrated = migrateDatabaseIdempotent(source);
+  const sanitized = {
+    meta: migrated.meta,
+    settings: sanitizeSettingsForUser(migrated.settings),
+    documentTypes: migrated.documentTypes,
+    signers: migrated.signers,
+    books: migrated.books.map((b) => sanitizeBookForUser(b)),
+    users: migrated.users.map((u) => toSafeUser(u)),
+    documents: migrated.documents,
+    numberRequests: migrated.numberRequests,
+    systemAuditLogs: migrated.systemAuditLogs,
+    documentHistoryLogs: migrated.documentHistoryLogs,
+  };
+  res.json({
+    summary: summarizeDatabaseObject(migrated),
+    snapshot: sanitized,
+  });
+});
+
+app.post('/api/storage/import-bundled-legacy', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError || !cfg.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      error: cfg.configConflictError || cfg.missingConfigError || 'Chưa kết nối lưu trữ bền vững Upstash Redis.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+  const bundled = getBundledLegacySnapshot();
+  if (!bundled) {
+    return res.status(404).json({ error: 'Không tìm thấy bản sao dữ liệu cũ sẵn có trên máy chủ.' });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    const existing = await readRawFromPrimaryRemote(cfg);
+    if (existing.raw !== null && !req.body?.forceOverwrite) {
+      return res.status(409).json({
+        code: 'KEY_ALREADY_EXISTS',
+        error: `Khóa "${cfg.kvKey}" trên Redis đã có dữ liệu. Không ghi đè tự động để bảo vệ dữ liệu hiện hành.`,
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+
+    const migrated = migrateDatabaseIdempotent(bundled);
+    const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    migrated.meta = { revision, updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION };
+    const serialized = JSON.stringify(migrated, null, 2);
+
+    if (existing.raw === null) {
+      lastRemoteRawPayload = await writeToPrimaryRemoteNX(cfg, serialized, revision);
+    } else {
+      lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, existing.raw, serialized, revision);
+    }
+
+    db = migrated;
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastPersistedAt = migrated.meta.updatedAt;
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+
+    res.json({
+      success: true,
+      summary: summarizeDatabaseObject(db),
+      persistenceStatus: getPersistenceStatus(),
+      message: 'Đã chuyển và xác nhận dữ liệu cũ vào Upstash Redis thành công.',
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: sanitizeErrorForLog(err),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.post('/api/storage/import', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError || !cfg.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      error: cfg.configConflictError || cfg.missingConfigError || 'Chưa kết nối lưu trữ bền vững Upstash Redis.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+
+  const rawPayload = req.body?.snapshot || req.body?.data || req.body;
+  if (!validateRegistryPayloadShape(rawPayload)) {
+    return res.status(400).json({
+      error: 'Tệp sao lưu không hợp lệ (thiếu cấu trúc books / documents / settings / users).',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    const existing = await readRawFromPrimaryRemote(cfg);
+    if (existing.raw !== null && !req.body?.forceOverwrite) {
+      return res.status(409).json({
+        code: 'KEY_ALREADY_EXISTS',
+        error: `Khóa "${cfg.kvKey}" trên Redis đã có dữ liệu. Vui lòng kiểm tra trước khi ghi đè.`,
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+
+    // Bảo toàn passwordHash nếu bản sao nhập vào không kèm passwordHash (từ bản xuất an toàn)
+    const bundled = getBundledLegacySnapshot();
+    const hashByUserId = new Map<string, string>();
+    for (const u of [...(bundled?.users || []), ...db.users, ...DEFAULT_USERS]) {
+      if (u?.id && (u as any).passwordHash) hashByUserId.set(u.id, (u as any).passwordHash);
+      if (u?.username && (u as any).passwordHash) hashByUserId.set(u.username.toLowerCase(), (u as any).passwordHash);
+    }
+
+    const cloned = JSON.parse(JSON.stringify(rawPayload)) as Partial<DatabaseSchema>;
+    if (Array.isArray(cloned.users)) {
+      cloned.users = cloned.users.map((u: any) => ({
+        ...u,
+        passwordHash:
+          u.passwordHash ||
+          hashByUserId.get(u.id) ||
+          hashByUserId.get(String(u.username || '').toLowerCase()) ||
+          hashPassword('123456'),
+      }));
+    }
+
+    const migrated = migrateDatabaseIdempotent(cloned);
+    const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    migrated.meta = { revision, updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION };
+    const serialized = JSON.stringify(migrated, null, 2);
+
+    if (cfg.mode === 'local_disk') {
+      saveDatabaseSync(migrated);
+      db = migrated;
+    } else if (existing.raw === null) {
+      lastRemoteRawPayload = await writeToPrimaryRemoteNX(cfg, serialized, revision);
+      db = migrated;
+    } else {
+      lastRemoteRawPayload = await writeToPrimaryRemoteCAS(cfg, existing.raw, serialized, revision);
+      db = migrated;
+    }
+
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastPersistedAt = migrated.meta.updatedAt;
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+
+    res.json({
+      success: true,
+      summary: summarizeDatabaseObject(db),
+      persistenceStatus: getPersistenceStatus(),
+      message: 'Đã nhập bản sao dữ liệu vào Upstash Redis và xác nhận toàn vẹn thành công.',
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: sanitizeErrorForLog(err),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
+app.post('/api/storage/initialize-new', requireAuth, requireAdmin, async (req, res) => {
+  const cfg = getStorageAdapterConfig();
+  if (cfg.configConflictError || !cfg.durable) {
+    return res.status(503).json({
+      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      error: cfg.configConflictError || cfg.missingConfigError || 'Chưa kết nối lưu trữ bền vững Upstash Redis.',
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+  if (req.body?.confirmationText !== 'XÁC NHẬN HỆ THỐNG MỚI') {
+    return res.status(400).json({
+      error: 'Vui lòng nhập chính xác cụm từ xác nhận "XÁC NHẬN HỆ THỐNG MỚI" trước khi khởi tạo.',
+    });
+  }
+
+  const releaseLock = await atomicLock.acquire();
+  try {
+    const existing = await readRawFromPrimaryRemote(cfg);
+    if (existing.raw !== null) {
+      lastRemoteRawPayload = existing.raw;
+      db = migrateDatabaseIdempotent(existing.parsed!);
+      lastStorageDiagnostic = { state: 'connected' };
+      return res.status(409).json({
+        code: 'KEY_ALREADY_EXISTS',
+        error: `Khóa "${cfg.kvKey}" trên Redis đã có dữ liệu nên không khởi tạo đè. Đang sử dụng dữ liệu hiện có.`,
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+
+    const revision = `${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+    const freshDb = migrateDatabaseIdempotent({
+      meta: { revision, updatedAt: new Date().toISOString(), schemaVersion: CURRENT_SCHEMA_VERSION },
+      settings: DEFAULT_SETTINGS,
+      documentTypes: DEFAULT_DOC_TYPES,
+      signers: DEFAULT_SIGNERS,
+      users: DEFAULT_USERS.map((u) => ({ ...u })),
+      documents: [],
+      books: [],
+      numberRequests: [],
+      idempotencyKeys: {},
+      systemAuditLogs: [],
+      revokedSessions: {},
+    });
+    const serialized = JSON.stringify(freshDb, null, 2);
+
+    if (cfg.mode === 'local_disk') {
+      saveDatabaseSync(freshDb);
+    } else {
+      lastRemoteRawPayload = await writeToPrimaryRemoteNX(cfg, serialized, revision);
+    }
+
+    db = freshDb;
+    remoteHydrated = true;
+    lastRemoteSyncMs = Date.now();
+    lastPersistedAt = freshDb.meta!.updatedAt;
+    lastVerifiedAt = new Date().toISOString();
+    lastStorageDiagnostic = { state: 'connected' };
+
+    res.json({
+      success: true,
+      summary: summarizeDatabaseObject(db),
+      persistenceStatus: getPersistenceStatus(),
+      message: 'Đã khởi tạo hệ thống mới vào Upstash Redis thành công.',
+    });
+  } catch (err: any) {
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_STORAGE_UNAVAILABLE',
+      error: sanitizeErrorForLog(err),
+      persistenceStatus: getPersistenceStatus(),
+    });
+  } finally {
+    releaseLock();
+  }
+});
+
 // 2. Authentication
-app.post('/api/auth/login', (req, res) => {
+app.post('/api/auth/login', async (req, res) => {
   const { username, password, rememberMe } = req.body || {};
   if (!username || !password) {
     return res.status(400).json({ error: 'Vui lòng nhập tên đăng nhập và mật khẩu' });
   }
 
+  let storageBlockedErr: StorageError | null = null;
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+  } catch (err: any) {
+    storageBlockedErr =
+      err instanceof StorageError
+        ? err
+        : new StorageError('PRIMARY_STORAGE_UNAVAILABLE', 503, sanitizeErrorForLog(err));
+  }
+
+  const cleanUsername = String(username).trim().toLowerCase();
   const hash = hashPassword(String(password));
-  const foundUser = db.users.find(
-    (u) => u.username.toLowerCase() === String(username).trim().toLowerCase() && u.passwordHash === hash
-  );
+
+  let foundUser = !storageBlockedErr
+    ? db.users.find((u) => u.username.toLowerCase() === cleanUsername && u.passwordHash === hash)
+    : undefined;
+
+  // Nếu Redis chưa khởi tạo / lỗi / thiếu cấu hình, chỉ cho phép Quản trị viên đăng nhập để vào Cài đặt Lưu trữ xử lý
+  if (!foundUser && storageBlockedErr) {
+    const bundled = getBundledLegacySnapshot();
+    const bootstrapAdmins = [...(bundled?.users || []), ...DEFAULT_USERS].filter((u) => u.role === 'admin');
+    foundUser = bootstrapAdmins.find((u) => u.username.toLowerCase() === cleanUsername && u.passwordHash === hash);
+
+    if (!foundUser) {
+      const nonAdminAttempt = (bundled?.users || []).some(
+        (u) => u.username.toLowerCase() === cleanUsername && u.passwordHash === hash
+      );
+      if (nonAdminAttempt) {
+        return res.status(storageBlockedErr.statusCode).json({
+          code: storageBlockedErr.code,
+          error: `${storageBlockedErr.message} Vui lòng liên hệ Quản trị viên.`,
+          persistenceStatus: getPersistenceStatus(),
+        });
+      }
+      return res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu' });
+    }
+  }
 
   if (!foundUser) {
     return res.status(401).json({ error: 'Sai tên đăng nhập hoặc mật khẩu' });
@@ -2198,10 +3143,34 @@ app.post('/api/auth/login', (req, res) => {
     })
   );
 
-  res.json({ user: userSafe, token, rememberMe: remember, expiresAt });
+  res.json({
+    user: userSafe,
+    token,
+    rememberMe: remember,
+    expiresAt,
+    persistenceStatus: getPersistenceStatus(),
+  });
 });
 
-app.get('/api/auth/me', requireAuth, (req, res) => {
+app.get('/api/auth/me', requireAuth, async (req, res) => {
+  try {
+    await ensureLatestDb({ maxAgeMs: 0 });
+  } catch {
+    // Nếu đang ở trạng thái chờ chuyển dữ liệu / lỗi lưu trữ, vẫn cho phép Admin kiểm tra phiên và vào Cài đặt Lưu trữ
+    const sessionUser = (req as any).user as User;
+    if (sessionUser.role !== 'admin') {
+      return res.status(503).json({
+        code: 'PRIMARY_STORAGE_UNAVAILABLE',
+        error: 'Hệ thống lưu trữ chưa sẵn sàng. Vui lòng liên hệ Quản trị viên.',
+        persistenceStatus: getPersistenceStatus(),
+      });
+    }
+    return res.json({
+      user: sessionUser,
+      persistenceStatus: getPersistenceStatus(),
+    });
+  }
+
   const sessionUser = (req as any).user as User;
   const freshUser = db.users.find((u) => u.id === sessionUser.id);
   if (!freshUser || !freshUser.isActive) {
@@ -2209,7 +3178,7 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
   }
   const userSafe = toSafeUser(freshUser);
   refreshUserSessions(userSafe);
-  res.json({ user: userSafe });
+  res.json({ user: userSafe, persistenceStatus: getPersistenceStatus() });
 });
 
 app.post('/api/auth/logout', async (req, res) => {
@@ -2227,11 +3196,14 @@ app.post('/api/auth/logout', async (req, res) => {
     revokeTokenSession(cookieToken);
     changed = true;
   }
-  if (changed) {
+  if (changed && getPersistenceStatus().durable) {
     try {
+      await ensureLatestDb({ maxAgeMs: 500 });
+      if (bearer) revokeTokenSession(bearer);
+      if (cookieToken && cookieToken !== bearer) revokeTokenSession(cookieToken);
       await saveDatabasePersistent(db);
     } catch (err) {
-      console.error('Lỗi lưu trạng thái hủy phiên:', err);
+      console.error('Lỗi lưu trạng thái hủy phiên:', sanitizeErrorForLog(err));
     }
   }
 
@@ -3117,10 +4089,14 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
   const currentPersistence = getPersistenceStatus();
   if (!currentPersistence.durable) {
     return res.status(503).json({
-      code: 'DURABLE_STORAGE_NOT_CONFIGURED',
+      code:
+        currentPersistence.connectionState === 'awaiting_migration'
+          ? 'STORAGE_AWAITING_INITIALIZATION'
+          : 'DURABLE_STORAGE_NOT_CONFIGURED',
       persistenceStatus: currentPersistence,
       error:
-        'Máy chủ Vercel Production chưa cấu hình nguồn lưu trữ bền vững (KV_REST_API_URL/TOKEN, BLOB_READ_WRITE_TOKEN hoặc PERSISTENT_DB_WEBHOOK_URL). Đã chặn lưu tạm vào /tmp để tránh mất mốc số sau khi tải lại trang hoặc đăng nhập lại.',
+        currentPersistence.errorDetail ||
+        'Máy chủ Vercel Production chưa sẵn sàng lưu trữ bền vững trên Upstash Redis. Đã chặn thao tác lưu để bảo vệ dữ liệu.',
     });
   }
 
@@ -3151,31 +4127,44 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
 
   const releaseLock = await atomicLock.acquire();
   try {
-    await ensureLatestDb({ maxAgeMs: 0 });
-    const lockedBook = findBookExplicitly(targetBook.id);
-    if (!lockedBook) {
-      return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+    let verifiedBook: RegistryBook | undefined;
+    let persistenceAfter: PersistenceStatus | undefined;
+
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await ensureLatestDb({ maxAgeMs: 0 });
+      const lockedBook = findBookExplicitly(targetBook.id);
+      if (!lockedBook) {
+        return res.status(404).json({ error: 'Không tìm thấy sổ văn bản cần cấu hình.' });
+      }
+
+      const beforeState = computeSeriesSequenceState(lockedBook, targetYear, canonicalType);
+      if (nextSeq <= beforeState.maxIssuedSequence) {
+        return res.status(400).json({
+          error: `Số bắt đầu (${nextSeq}) không được nhỏ hơn hoặc bằng số lớn nhất đã cấp/hủy trong dãy ${lockedBook.name} - ${targetYear} - ${canonicalType} (${beforeState.maxIssuedSequence}). Mức tối thiểu phải từ ${beforeState.minAllowedStartSequence} trở lên.`,
+        });
+      }
+
+      lockedBook.customStartSequences = {
+        ...(lockedBook.customStartSequences || {}),
+        [beforeState.storageKey]: nextSeq,
+      };
+      bumpBookVersion(lockedBook);
+      syncDefaultBookToLegacySettings(lockedBook);
+
+      try {
+        persistenceAfter = await saveDatabasePersistent(db, { verifyWrite: true });
+        await ensureLatestDb({ maxAgeMs: 0 });
+        verifiedBook = findBookExplicitly(lockedBook.id) || undefined;
+        break;
+      } catch (casErr: any) {
+        if (casErr instanceof StorageError && casErr.code === 'REVISION_CONFLICT' && attempt < 2) {
+          continue;
+        }
+        throw casErr;
+      }
     }
 
-    const beforeState = computeSeriesSequenceState(lockedBook, targetYear, canonicalType);
-    if (nextSeq <= beforeState.maxIssuedSequence) {
-      return res.status(400).json({
-        error: `Số bắt đầu (${nextSeq}) không được nhỏ hơn hoặc bằng số lớn nhất đã cấp/hủy trong dãy ${lockedBook.name} - ${targetYear} - ${canonicalType} (${beforeState.maxIssuedSequence}). Mức tối thiểu phải từ ${beforeState.minAllowedStartSequence} trở lên.`,
-      });
-    }
-
-    lockedBook.customStartSequences = {
-      ...(lockedBook.customStartSequences || {}),
-      [beforeState.storageKey]: nextSeq,
-    };
-    bumpBookVersion(lockedBook);
-    syncDefaultBookToLegacySettings(lockedBook);
-    const persistenceAfter = await saveDatabasePersistent(db, { verifyWrite: true });
-
-    // Đọc lại từ nguồn dữ liệu chính để xác nhận chắc chắn mốc mới đã bền vững
-    await ensureLatestDb({ maxAgeMs: 0 });
-    const verifiedBook = findBookExplicitly(lockedBook.id);
-    if (!verifiedBook) {
+    if (!verifiedBook || !persistenceAfter) {
       throw new Error('Không tìm thấy sổ văn bản khi đọc lại xác nhận từ nguồn dữ liệu chính.');
     }
 
@@ -3204,10 +4193,11 @@ app.post('/api/settings/start-sequence', requireAuth, async (req, res) => {
       book: sanitizeBookForUser(verifiedBook, currentUser),
     });
   } catch (err: any) {
-    console.error('[StartSequence Save Error]:', err);
-    return res.status(503).json({
-      code: 'PRIMARY_PERSISTENCE_FAILED',
-      error: `Chưa xác nhận được lưu mốc số vào nguồn dữ liệu chính: ${err?.message || 'Lỗi lưu trữ'}`,
+    console.error('[StartSequence Save Error]:', sanitizeErrorForLog(err));
+    const statusCode = err?.statusCode || 503;
+    return res.status(statusCode).json({
+      code: err?.code || 'PRIMARY_PERSISTENCE_FAILED',
+      error: `Chưa xác nhận được lưu mốc số vào nguồn dữ liệu chính: ${sanitizeErrorForLog(err)}`,
       persistenceStatus: getPersistenceStatus(),
     });
   } finally {
@@ -3487,7 +4477,7 @@ app.post('/api/number-requests/:id/issue', requireAuth, async (req, res) => {
       status: 'active',
       notes: reqItem.notes || '',
       auditLogs: [],
-      syncStatus: db.settings.msGraphConfig.enabled ? 'pending' : 'not_configured',
+      syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
       idempotencyKey: `req-issue-${reqItem.id}`,
       driveStatus: 'none',
     };
@@ -3810,7 +4800,7 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
       status: 'active',
       notes: notes ? notes.trim() : '',
       auditLogs: [],
-      syncStatus: db.settings.msGraphConfig.enabled ? 'pending' : 'not_configured',
+      syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
       idempotencyKey,
       driveStatus: hasAttachment ? 'uploading' : 'none',
       driveFileName: resolvedDriveFileName,
@@ -3853,9 +4843,22 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
     // Trả kết quả ngay sau khi lưu nguồn dữ liệu chính (độ trễ đồng bộ Excel/Sheets không ảnh hưởng số cấp)
     res.json({ document: newDocument, nextPreview, success: true });
   } catch (err: any) {
-    console.error('Lỗi khi cấp số:', err);
+    // Roll back uncommitted in-memory document mutation if persistence failed
+    db.documents = db.documents.filter((d) => d.idempotencyKey !== idempotencyKey);
+    if (db.idempotencyKeys && db.idempotencyKeys[idempotencyKey]) {
+      delete db.idempotencyKeys[idempotencyKey];
+    }
+    console.error('Lỗi khi cấp số:', sanitizeErrorForLog(err));
     if (!res.headersSent) {
-      res.status(500).json({ error: 'Lỗi máy chủ khi cấp số: ' + (err.message || 'Không xác định') });
+      const statusCode = err?.statusCode || 500;
+      res.status(statusCode).json({
+        ...(err?.code ? { code: err.code } : {}),
+        persistenceStatus: getPersistenceStatus(),
+        error:
+          err instanceof StorageError
+            ? err.message
+            : 'Lỗi máy chủ khi cấp số: ' + sanitizeErrorForLog(err),
+      });
     }
   } finally {
     releaseLock();
@@ -4361,7 +5364,7 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
       status: 'active',
       notes: typeof notes === 'string' ? notes.trim() : '',
       auditLogs: [],
-      syncStatus: db.settings.msGraphConfig.enabled ? 'pending' : 'not_configured',
+      syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
       idempotencyKey,
       driveStatus: 'uploading',
       driveFileName: targetFileName,
@@ -5794,145 +6797,7 @@ app.get('/api/export-excel', requireAuth, async (req, res) => {
   }
 });
 
-// 11. Cấu hình & Đồng bộ Microsoft Graph (OneDrive / SharePoint)
-app.post('/api/sync/config', requireAuth, requireAdmin, async (req, res) => {
-  const { enabled, tenantId, clientId, clientSecret, driveId, filePath, tableName } = req.body;
-
-  const nextSecret =
-    clientSecret && clientSecret.trim() && clientSecret.trim() !== '••••••••'
-      ? clientSecret.trim()
-      : db.settings.msGraphConfig.clientSecret;
-
-  db.settings.msGraphConfig = {
-    enabled: Boolean(enabled),
-    tenantId: tenantId ? tenantId.trim() : '',
-    clientId: clientId ? clientId.trim() : '',
-    clientSecret: nextSecret,
-    driveId: driveId ? driveId.trim() : '',
-    filePath: filePath ? filePath.trim() : '',
-    tableName: tableName ? tableName.trim() : 'SoCapSoVanBan',
-    lastSyncTime: db.settings.msGraphConfig.lastSyncTime,
-  };
-
-  await saveDatabasePersistent(db);
-  broadcastSSE('settings_updated', { settings: sanitizeSettingsForUser(db.settings) });
-  res.json({
-    msGraphConfig: {
-      ...db.settings.msGraphConfig,
-      clientSecret: db.settings.msGraphConfig.clientSecret ? '••••••••' : '',
-    },
-  });
-});
-
-app.post('/api/sync/test', requireAuth, requireAdmin, async (req, res) => {
-  const config = db.settings.msGraphConfig;
-  if (!config.enabled || !config.tenantId || !config.clientId || !config.clientSecret) {
-    return res.status(400).json({
-      success: false,
-      message: 'Chưa điền đủ thông tin xác thực Microsoft Graph (Tenant ID, Client ID, Client Secret).',
-    });
-  }
-
-  // Thực hiện kiểm tra OAuth token với Microsoft Graph
-  try {
-    const tokenUrl = `https://login.microsoftonline.com/${config.tenantId}/oauth2/v2.0/token`;
-    const params = new URLSearchParams();
-    params.append('client_id', config.clientId);
-    params.append('client_secret', config.clientSecret);
-    params.append('scope', 'https://graph.microsoft.com/.default');
-    params.append('grant_type', 'client_credentials');
-
-    const tokenRes = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-
-    if (!tokenRes.ok) {
-      const errData = await tokenRes.json().catch(() => ({}));
-      return res.status(400).json({
-        success: false,
-        message: 'Kết nối Microsoft Entra ID thất bại: ' + (errData.error_description || tokenRes.statusText),
-      });
-    }
-
-    const tokenData = await tokenRes.json();
-    return res.json({
-      success: true,
-      message: 'Kết nối Microsoft Graph API thành công! Đã xác thực quyền ứng dụng.',
-      expiresIn: tokenData.expires_in,
-    });
-  } catch (err: any) {
-    return res.status(500).json({
-      success: false,
-      message: 'Lỗi khi gọi Microsoft Graph: ' + (err.message || 'Không thể kết nối'),
-    });
-  }
-});
-
-app.post('/api/sync/sync-all', requireAuth, requireAdmin, async (req, res) => {
-  const config = db.settings.msGraphConfig;
-  if (!config.enabled) {
-    return res.status(400).json({
-      error: 'Chưa bật tính năng đồng bộ Microsoft Graph trong Cài đặt.',
-    });
-  }
-
-  // Đánh dấu các bản ghi đang chờ
-  const pendingDocs = db.documents.filter((d) => d.syncStatus === 'pending' || d.syncStatus === 'error');
-  if (pendingDocs.length === 0) {
-    return res.json({ message: 'Tất cả văn bản đã được đồng bộ.', syncedCount: 0 });
-  }
-
-  // Thử đồng bộ
-  try {
-    // Lấy OAuth token
-    const tokenUrl = `https://login.microsoftonline.com/${config.tenantId}/oauth2/v2.0/token`;
-    const params = new URLSearchParams();
-    params.append('client_id', config.clientId);
-    params.append('client_secret', config.clientSecret);
-    params.append('scope', 'https://graph.microsoft.com/.default');
-    params.append('grant_type', 'client_credentials');
-
-    const tokenRes = await fetch(tokenUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: params.toString(),
-    });
-
-    if (!tokenRes.ok) {
-      throw new Error('Không thể lấy Token Microsoft Graph');
-    }
-
-    // Đánh dấu đồng bộ thành công
-    for (const d of pendingDocs) {
-      d.syncStatus = 'synced';
-      d.syncedAt = new Date().toISOString();
-      delete d.syncError;
-    }
-
-    db.settings.msGraphConfig.lastSyncTime = new Date().toISOString();
-    await saveDatabasePersistent(db);
-    broadcastSSE('sync_completed', { syncedCount: pendingDocs.length });
-
-    res.json({
-      success: true,
-      syncedCount: pendingDocs.length,
-      message: `Đã đồng bộ thành công ${pendingDocs.length} văn bản vào OneDrive/SharePoint!`,
-    });
-  } catch (err: any) {
-    for (const d of pendingDocs) {
-      d.syncStatus = 'error';
-      d.syncError = err.message || 'Lỗi kết nối Microsoft Graph';
-    }
-    await saveDatabasePersistent(db);
-    res.status(500).json({
-      error: 'Đồng bộ thất bại: ' + err.message,
-    });
-  }
-});
-
-// 12. Cấu hình & Đồng bộ Google Sheets Webhook (Cách đồng bộ dễ nhất cho trường học)
+// 11. Cấu hình & Đồng bộ Google Sheets Webhook (Cách đồng bộ dễ nhất cho trường học)
 app.post('/api/sync/google-sheets/config', requireAuth, requireAdmin, async (req, res) => {
   const { enabled, webhookUrl } = req.body;
   if (!db.settings.googleSheetsConfig) {

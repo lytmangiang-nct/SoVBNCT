@@ -121,7 +121,7 @@ function getExcelDeleteSyncMeta(doc: DocumentRecord): {
     };
   }
   return {
-    label: 'Đã chuyển VB đã xóa (Chưa bật Excel trực tuyến)',
+    label: 'Đã chuyển VB đã xóa (Chưa bật Google Trang tính)',
     className: 'text-slate-600 bg-slate-100 border-slate-200',
     needsRetry: false,
   };

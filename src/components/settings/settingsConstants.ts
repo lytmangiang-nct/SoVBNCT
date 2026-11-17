@@ -7,9 +7,9 @@ export type SettingsSubTab =
   | 'numbering'
   | 'signers'
   | 'docTypes'
+  | 'database'
   | 'googledrive'
   | 'googlesheets'
-  | 'msgraph'
   | 'users';
 
 export type SettingsGroupKey =
@@ -53,9 +53,9 @@ export const SETTINGS_NAV_GROUPS: SettingsNavGroupDef[] = [
     key: 'storage_sync',
     title: 'Lưu trữ & Đồng bộ',
     items: [
+      { id: 'database', label: 'Upstash Redis & Lưu trữ chính', adminOnly: true },
       { id: 'googledrive', label: 'Google Drive' },
       { id: 'googlesheets', label: 'Google Trang tính', adminOnly: true },
-      { id: 'msgraph', label: 'OneDrive / SharePoint', adminOnly: true },
     ],
   },
   {

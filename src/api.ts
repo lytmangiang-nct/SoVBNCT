@@ -5,6 +5,7 @@ import type {
   DocumentRecord,
   DocumentTypeConfig,
   GoogleDriveConfig,
+  LegacySnapshotSummary,
   NumberRequest,
   PdfAnalyzeResponse,
   PersistenceStatus,
@@ -13,6 +14,7 @@ import type {
   SignerConfig,
   StartSequenceSeriesConfig,
   StatisticsData,
+  StorageTestResult,
   SystemAuditLog,
   SystemSettings,
   User,
@@ -243,21 +245,88 @@ export const api = {
     status: string;
     app: string;
     timeVietnam: { year: number; month: number; day: number; formattedDate: string };
+    durable?: boolean;
+    storageMode?: string;
+    connectionState?: string;
+    redisReachable?: boolean;
     persistenceStatus?: PersistenceStatus;
   }> => {
     return request('/api/health');
   },
 
+  // Storage & Upstash Redis Management (Admin)
+  getStorageStatus: async (): Promise<{ persistenceStatus: PersistenceStatus }> => {
+    return request<{ persistenceStatus: PersistenceStatus }>('/api/storage/status');
+  },
+
+  testStorageConnection: async (): Promise<StorageTestResult> => {
+    return request<StorageTestResult>('/api/storage/test-connection', {
+      method: 'POST',
+    });
+  },
+
+  exportLegacySnapshot: async (): Promise<{
+    summary: LegacySnapshotSummary;
+    snapshot: Record<string, any>;
+  }> => {
+    return request<{ summary: LegacySnapshotSummary; snapshot: Record<string, any> }>(
+      '/api/storage/export-legacy-snapshot'
+    );
+  },
+
+  importBundledLegacyToStorage: async (forceOverwrite = false): Promise<{
+    success: boolean;
+    summary: LegacySnapshotSummary;
+    persistenceStatus: PersistenceStatus;
+    message: string;
+  }> => {
+    return request('/api/storage/import-bundled-legacy', {
+      method: 'POST',
+      body: JSON.stringify({ forceOverwrite }),
+    });
+  },
+
+  importSnapshotToStorage: async (
+    snapshot: Record<string, any>,
+    forceOverwrite = false
+  ): Promise<{
+    success: boolean;
+    summary: LegacySnapshotSummary;
+    persistenceStatus: PersistenceStatus;
+    message: string;
+  }> => {
+    return request('/api/storage/import', {
+      method: 'POST',
+      body: JSON.stringify({ snapshot, forceOverwrite }),
+    });
+  },
+
+  initializeNewStorage: async (confirmationText: string): Promise<{
+    success: boolean;
+    summary: LegacySnapshotSummary;
+    persistenceStatus: PersistenceStatus;
+    message: string;
+  }> => {
+    return request('/api/storage/initialize-new', {
+      method: 'POST',
+      body: JSON.stringify({ confirmationText }),
+    });
+  },
+
   // Auth
-  login: async (username: string, password: string, rememberMe = false): Promise<AuthResponse> => {
-    return request<AuthResponse>('/api/auth/login', {
+  login: async (
+    username: string,
+    password: string,
+    rememberMe = false
+  ): Promise<AuthResponse & { persistenceStatus?: PersistenceStatus }> => {
+    return request<AuthResponse & { persistenceStatus?: PersistenceStatus }>('/api/auth/login', {
       method: 'POST',
       body: JSON.stringify({ username, password, rememberMe }),
     });
   },
 
-  getCurrentUser: async (): Promise<{ user: User }> => {
-    return request<{ user: User }>('/api/auth/me');
+  getCurrentUser: async (): Promise<{ user: User; persistenceStatus?: PersistenceStatus }> => {
+    return request<{ user: User; persistenceStatus?: PersistenceStatus }>('/api/auth/me');
   },
 
   logout: async (): Promise<void> => {
@@ -893,26 +962,6 @@ export const api = {
     a.click();
     a.remove();
     setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 5000);
-  },
-
-  // Microsoft Graph sync
-  saveSyncConfig: async (config: any): Promise<any> => {
-    return request('/api/sync/config', {
-      method: 'POST',
-      body: JSON.stringify(config),
-    });
-  },
-
-  testSyncConnection: async (): Promise<{ success: boolean; message: string }> => {
-    return request<{ success: boolean; message: string }>('/api/sync/test', {
-      method: 'POST',
-    });
-  },
-
-  syncAllPending: async (): Promise<{ success: boolean; syncedCount: number; message: string }> => {
-    return request<{ success: boolean; syncedCount: number; message: string }>('/api/sync/sync-all', {
-      method: 'POST',
-    });
   },
 
   // Google Sheets Webhook sync

@@ -32,6 +32,7 @@ export interface SignerConfig {
   role: string;
 }
 
+/** @deprecated Giữ kiểu tùy chọn để đọc dữ liệu sao lưu cũ có trường msGraphConfig */
 export interface MsGraphConfig {
   enabled: boolean;
   tenantId: string;
@@ -108,7 +109,7 @@ export interface SystemSettings {
   numberMode: NumberMode; // "separate" (mỗi loại dãy riêng) hoặc "shared" (dãy chung)
   numberFormat: string; // Mẫu số: default "{so}-{loai}/{don_vi}"
   customStartSequences: Record<string, number>; // key: `${year}_${typeCode}` hoặc `${year}_SHARED`
-  msGraphConfig: MsGraphConfig;
+  msGraphConfig?: MsGraphConfig;
   googleSheetsConfig?: GoogleSheetsConfig;
   googleDriveConfig?: GoogleDriveConfig;
   configVersion?: number;
@@ -383,14 +384,61 @@ export type StorageMode =
   | 'local_disk'
   | 'ephemeral_tmp';
 
+export type StorageConnectionState =
+  | 'connected'
+  | 'missing_config'
+  | 'conflict'
+  | 'connection_error'
+  | 'awaiting_migration'
+  | 'corrupt_data';
+
+export interface LegacySnapshotSummary {
+  usersCount: number;
+  booksCount: number;
+  documentsCount: number;
+  deletedDocumentsCount: number;
+  startMilestonesCount: number;
+  driveLinkedCount: number;
+  bookNames: string[];
+}
+
 export interface PersistenceStatus {
   durable: boolean;
   storageMode: StorageMode;
   storageLabel: string;
+  connectionState: StorageConnectionState;
+  connectionLabel: string;
+  envPairUsed?:
+    | 'UPSTASH_REDIS_REST'
+    | 'KV_REST_API'
+    | 'VERCEL_BLOB'
+    | 'REMOTE_WEBHOOK'
+    | 'LOCAL_DISK'
+    | 'NONE';
+  dbKey?: string;
+  maskedHost?: string;
+  schemaVersion?: number;
+  hasLegacyBundledSnapshot?: boolean;
+  legacySnapshotSummary?: LegacySnapshotSummary;
+  sessionSecretConfigured?: boolean;
   requiresRemoteEnvOnVercel?: boolean;
   lastSavedAt?: string;
   lastVerifiedAt?: string;
   warning?: string;
+  errorDetail?: string;
+}
+
+export interface StorageTestResult {
+  success: boolean;
+  readOk: boolean;
+  writeOk: boolean;
+  deleteOk: boolean;
+  keyExists: boolean;
+  schemaValid?: boolean;
+  latencyMs: number;
+  probeKey?: string;
+  message: string;
+  persistenceStatus: PersistenceStatus;
 }
 
 export interface PreviewNumberResponse {

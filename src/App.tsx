@@ -5,6 +5,7 @@ import { ImportPdfView } from './components/ImportPdfView';
 import { DocumentRegistryView } from './components/DocumentRegistryView';
 import { StatisticsView } from './components/StatisticsView';
 import { SettingsView } from './components/SettingsView';
+import type { SettingsSubTab } from './components/settings/settingsConstants';
 import { LoginModal } from './components/LoginModal';
 import { api, buildApiUrl, clearAuth } from './api';
 import type {
@@ -67,15 +68,6 @@ export default function App() {
     numberMode: 'separate',
     numberFormat: '{so}-{loai}/{don_vi}',
     customStartSequences: {},
-    msGraphConfig: {
-      enabled: false,
-      tenantId: '',
-      clientId: '',
-      clientSecret: '',
-      driveId: '',
-      filePath: '',
-      tableName: 'SoCapSoVanBan',
-    },
   });
   const [books, setBooks] = useState<RegistryBook[]>([]);
   const [activeBookId, setActiveBookId] = useState<string>(DEFAULT_BOOK_ID);
@@ -90,6 +82,7 @@ export default function App() {
   const [syncError, setSyncError] = useState<string | null>(null);
   const [persistenceStatus, setPersistenceStatus] = useState<PersistenceStatus | null>(null);
   const [legacyReconciliationWarnings, setLegacyReconciliationWarnings] = useState<string[]>([]);
+  const [requestedSettingsTab, setRequestedSettingsTab] = useState<SettingsSubTab | null>(null);
   const syncInFlightRef = React.useRef<boolean>(false);
 
   // Live Toast Notification
@@ -205,6 +198,8 @@ export default function App() {
       setNumberRequests(reqsRes.requests);
       if (settingsRes.persistenceStatus) {
         setPersistenceStatus(settingsRes.persistenceStatus);
+      } else if (meRes.persistenceStatus) {
+        setPersistenceStatus(meRes.persistenceStatus);
       }
       setLegacyReconciliationWarnings(settingsRes.legacyReconciliationWarnings || []);
       applyServerTime(settingsRes.serverTimeVietnam || booksRes.serverTimeVietnam);
@@ -462,7 +457,7 @@ export default function App() {
     if (hasPerm('view')) {
       allowedTabs.push('statistics');
     }
-    if (hasPerm('manage_book')) {
+    if (hasPerm('manage_book') || isAdmin) {
       allowedTabs.push('settings');
     }
 
@@ -638,25 +633,44 @@ export default function App() {
         </div>
       </section>
 
-      {/* Sync Failure Banner */}
+      {/* Sync Failure / Storage Attention Banner */}
       {syncError && (
         <div className="bg-rose-50 border-b border-rose-200 px-3 sm:px-6 lg:px-8 py-2.5">
           <div className="max-w-7xl mx-auto flex flex-wrap items-center justify-between gap-2 text-xs text-rose-900">
-            <div className="flex items-center gap-2 min-w-0">
+            <div className="flex items-center gap-2 min-w-0 flex-1">
               <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0" />
               <span className="break-words min-w-0">
-                <strong>Chưa cập nhật được dữ liệu</strong> — {syncError}
+                <strong>
+                  {persistenceStatus && !persistenceStatus.durable
+                    ? `Lưu trữ chính: ${persistenceStatus.connectionLabel}`
+                    : 'Chưa cập nhật được dữ liệu'}
+                </strong>{' '}
+                — {syncError}
               </span>
             </div>
-            <button
-              type="button"
-              onClick={loadAppData}
-              disabled={loadingData}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-md transition-colors disabled:opacity-50"
-            >
-              <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? 'animate-spin' : ''}`} />
-              <span>Thử lại</span>
-            </button>
+            <div className="flex flex-wrap items-center gap-2 shrink-0">
+              {isSystemAdmin(currentUser) && persistenceStatus && !persistenceStatus.durable && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setRequestedSettingsTab('database');
+                    setActiveTab('settings');
+                  }}
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] bg-amber-600 hover:bg-amber-700 text-white font-semibold rounded-md transition-colors"
+                >
+                  <span>Mở Lưu trữ &amp; Đồng bộ (Redis)</span>
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={loadAppData}
+                disabled={loadingData}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 min-h-[36px] bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-md transition-colors disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3.5 h-3.5 ${loadingData ? 'animate-spin' : ''}`} />
+                <span>Thử lại</span>
+              </button>
+            </div>
           </div>
         </div>
       )}
@@ -798,6 +812,9 @@ export default function App() {
                 syncError={syncError}
                 persistenceStatus={persistenceStatus}
                 legacyReconciliationWarnings={legacyReconciliationWarnings}
+                requestedSubTab={requestedSettingsTab}
+                onClearRequestedSubTab={() => setRequestedSettingsTab(null)}
+                onPersistenceStatusChange={(status) => setPersistenceStatus(status)}
                 onSettingsUpdated={(newSettings) => setSettings(newSettings)}
                 onBooksUpdated={refreshBooks}
                 onRefreshData={loadAppData}

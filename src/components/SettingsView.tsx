@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Users,
   Shield,
-  Cloud,
   Check,
   AlertTriangle,
   Plus,
@@ -61,6 +60,7 @@ import {
 } from './settings/settingsConstants';
 import { BooksListSection } from './settings/BooksListSection';
 import { CreateBookDrawer, type CreateBookFormValues } from './settings/CreateBookDrawer';
+import { RedisStorageSection } from './settings/RedisStorageSection';
 import {
   ConfirmDeleteModal,
   PendingBookSwitchModal,
@@ -81,6 +81,9 @@ interface SettingsViewProps {
   syncError?: string | null;
   persistenceStatus?: PersistenceStatus | null;
   legacyReconciliationWarnings?: string[];
+  requestedSubTab?: SettingsSubTab | null;
+  onClearRequestedSubTab?: () => void;
+  onPersistenceStatusChange?: (status: PersistenceStatus) => void;
   onSettingsUpdated: (newSettings: SystemSettings) => void;
   onBooksUpdated?: () => void;
   onRefreshData: () => void;
@@ -99,6 +102,9 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   syncError = null,
   persistenceStatus = null,
   legacyReconciliationWarnings = [],
+  requestedSubTab = null,
+  onClearRequestedSubTab,
+  onPersistenceStatusChange,
   onSettingsUpdated,
   onBooksUpdated,
   onRefreshData,
@@ -155,8 +161,28 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const canManageSelectedBook = isAdmin || hasBookPermission(currentUser, selectedBook.id, 'manage_book');
 
   // Sub-tab inside Settings
-  const [activeSubTab, setActiveSubTab] = useState<SettingsSubTab>('books');
+  const [activeSubTab, setActiveSubTab] = useState<SettingsSubTab>(() => {
+    if (requestedSubTab) return requestedSubTab;
+    if (isAdmin && persistenceStatus && !persistenceStatus.durable) return 'database';
+    return 'books';
+  });
   const [mobileNavOpen, setMobileNavOpen] = useState(false);
+  const [storageOverrideStatus, setStorageOverrideStatus] = useState<PersistenceStatus | null>(null);
+
+  useEffect(() => {
+    if (requestedSubTab) {
+      if (requestedSubTab !== 'database' || isAdmin) {
+        setActiveSubTab(requestedSubTab);
+      }
+      onClearRequestedSubTab?.();
+    }
+  }, [requestedSubTab, isAdmin, onClearRequestedSubTab]);
+
+  useEffect(() => {
+    if (persistenceStatus) {
+      setStorageOverrideStatus(null);
+    }
+  }, [persistenceStatus]);
 
   // Book Management State (Multi-book drawer & lock modal)
   const [createBookDrawerOpen, setCreateBookDrawerOpen] = useState(false);
@@ -533,7 +559,8 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
   const isSeriesWaiting =
     !effectiveSeriesLoadError &&
     (!configLoaded || seqConfigLoading || !hasMatchingSavedConfig);
-  const effectivePersistenceStatus = seriesPersistenceStatus || persistenceStatus || null;
+  const effectivePersistenceStatus =
+    storageOverrideStatus || seriesPersistenceStatus || persistenceStatus || null;
   const effectiveReconciliationWarnings =
     seriesReconciliationWarnings.length > 0
       ? seriesReconciliationWarnings
@@ -563,20 +590,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     currentStartInputValue.trim() !== '' &&
     Number.isInteger(parsedStartInputNum) &&
     parsedStartInputNum >= 1;
-
-  // Microsoft Graph
-  const [msEnabled, setMsEnabled] = useState(settings.msGraphConfig.enabled);
-  const [msTenantId, setMsTenantId] = useState(settings.msGraphConfig.tenantId);
-  const [msClientId, setMsClientId] = useState(settings.msGraphConfig.clientId);
-  const [msClientSecret, setMsClientSecret] = useState(settings.msGraphConfig.clientSecret);
-  const [msDriveId, setMsDriveId] = useState(settings.msGraphConfig.driveId);
-  const [msFilePath, setMsFilePath] = useState(settings.msGraphConfig.filePath);
-  const [msTableName, setMsTableName] = useState(settings.msGraphConfig.tableName);
-  const [msTesting, setMsTesting] = useState(false);
-  const [msTestResult, setMsTestResult] = useState<{ success: boolean; message: string } | null>(null);
-  const [msSaving, setMsSaving] = useState(false);
-  const [msSyncingAll, setMsSyncingAll] = useState(false);
-  const [msSyncResult, setMsSyncResult] = useState<string | null>(null);
 
   // User Management & Per-Book Permissions
   const [usersList, setUsersList] = useState<User[]>([]);
@@ -1474,60 +1487,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const [msSaveMessage, setMsSaveMessage] = useState<{ success: boolean; message: string } | null>(null);
   const [userFeedback, setUserFeedback] = useState<{ success: boolean; message: string } | null>(null);
-
-  // 7. Save Microsoft Graph Config
-  const handleSaveMsGraph = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!isAdmin) return;
-    setMsSaving(true);
-    setMsSaveMessage(null);
-    try {
-      const res = await api.saveSyncConfig({
-        enabled: msEnabled,
-        tenantId: msTenantId,
-        clientId: msClientId,
-        clientSecret: msClientSecret,
-        driveId: msDriveId,
-        filePath: msFilePath,
-        tableName: msTableName,
-      });
-      onSettingsUpdated({ ...settings, msGraphConfig: res.msGraphConfig });
-      setMsSaveMessage({ success: true, message: 'Đã lưu cấu hình OneDrive / SharePoint!' });
-    } catch (err: any) {
-      setMsSaveMessage({ success: false, message: err.message || 'Lỗi khi lưu cấu hình' });
-    } finally {
-      setMsSaving(false);
-    }
-  };
-
-  const handleTestMsConnection = async () => {
-    setMsTesting(true);
-    setMsTestResult(null);
-    try {
-      const res = await api.testSyncConnection();
-      setMsTestResult(res);
-    } catch (err: any) {
-      setMsTestResult({ success: false, message: err.message || 'Lỗi kết nối' });
-    } finally {
-      setMsTesting(false);
-    }
-  };
-
-  const handleSyncAll = async () => {
-    setMsSyncingAll(true);
-    setMsSyncResult(null);
-    try {
-      const res = await api.syncAllPending();
-      setMsSyncResult(res.message);
-      onRefreshData();
-    } catch (err: any) {
-      setMsSyncResult('Lỗi: ' + err.message);
-    } finally {
-      setMsSyncingAll(false);
-    }
-  };
 
   // 8. User Management Handlers (Admin Only)
   const handleCreateUser = async (e: React.FormEvent) => {
@@ -1804,10 +1764,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
     }
   };
 
-  const getNavItemBadge = (tabId: SettingsSubTab): number | null => {
+  const getNavItemBadge = (tabId: SettingsSubTab): string | number | null => {
     if (tabId === 'books') return books.length;
     if (tabId === 'signers') return displayedBookSigners.length;
     if (tabId === 'docTypes') return documentTypes.length;
+    if (tabId === 'database' && effectivePersistenceStatus) {
+      return effectivePersistenceStatus.connectionLabel;
+    }
     return null;
   };
 
@@ -1963,10 +1926,10 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                             : 'bg-transparent text-slate-600 border-transparent hover:text-slate-900 hover:bg-slate-50'
                         }`}
                       >
-                        <span className="leading-snug">{item.label}</span>
+                        <span className="leading-snug min-w-0 break-words">{item.label}</span>
                         {badge !== null && (
                           <span
-                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 ${
+                            className={`px-1.5 py-0.5 rounded text-[10px] font-bold shrink-0 whitespace-nowrap ${
                               active ? 'bg-sky-100 text-sky-800' : 'bg-slate-100 text-slate-600'
                             }`}
                           >
@@ -2448,21 +2411,30 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
 
             {effectivePersistenceStatus && !effectivePersistenceStatus.durable && (
-              <div className="p-3 bg-rose-50 border border-rose-300 rounded-lg text-xs text-rose-900 space-y-1">
-                <div className="flex items-start gap-2">
-                  <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                  <div className="space-y-1 min-w-0">
-                    <strong className="block font-bold">
-                      Cảnh báo Vercel Production: Chưa cấu hình nguồn lưu trữ bền vững
-                    </strong>
-                    <p className="break-words">
-                      {effectivePersistenceStatus.warning ||
-                        'Máy chủ serverless đang chạy ở chế độ /tmp tạm thời nên cấu hình số bắt đầu sẽ không được lưu giữ qua các lần đăng nhập hoặc khởi động lại.'}{' '}
-                      Vui lòng thêm biến môi trường <code className="font-mono font-semibold">KV_REST_API_URL</code> +{' '}
-                      <code className="font-mono font-semibold">KV_REST_API_TOKEN</code> (hoặc{' '}
-                      <code className="font-mono font-semibold">BLOB_READ_WRITE_TOKEN</code>) trên Vercel.
-                    </p>
+              <div className="p-3 bg-rose-50 border border-rose-300 rounded-lg text-xs text-rose-900 space-y-2">
+                <div className="flex flex-wrap items-start justify-between gap-2">
+                  <div className="flex items-start gap-2 min-w-0 flex-1">
+                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
+                    <div className="space-y-1 min-w-0">
+                      <strong className="block font-bold">
+                        Lưu trữ chính: {effectivePersistenceStatus.connectionLabel}
+                      </strong>
+                      <p className="break-words">
+                        {effectivePersistenceStatus.warning ||
+                          effectivePersistenceStatus.errorDetail ||
+                          'Hệ thống lưu trữ bền vững Upstash Redis chưa sẵn sàng nên tạm khóa ghi mốc số bắt đầu.'}
+                      </p>
+                    </div>
                   </div>
+                  {isAdmin && (
+                    <button
+                      type="button"
+                      onClick={() => setActiveSubTab('database')}
+                      className="px-3 py-1.5 bg-rose-700 hover:bg-rose-800 text-white font-semibold rounded-md transition-colors shrink-0"
+                    >
+                      Mở Lưu trữ &amp; Đồng bộ
+                    </button>
+                  )}
                 </div>
               </div>
             )}
@@ -2968,6 +2940,18 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             </div>
           )}
         </div>
+      )}
+
+      {/* SUB-TAB: UPSTASH REDIS & LƯU TRỮ CHÍNH */}
+      {activeSubTab === 'database' && isAdmin && (
+        <RedisStorageSection
+          persistenceStatus={effectivePersistenceStatus}
+          onStatusUpdated={(next) => {
+            setStorageOverrideStatus(next);
+            onPersistenceStatusChange?.(next);
+          }}
+          onFullRefresh={onRefreshData}
+        />
       )}
 
       {/* SUB-TAB: LƯU TRỮ GOOGLE DRIVE (THEO TỪNG SỔ) */}
@@ -3556,160 +3540,6 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
                 </div>
               </form>
             </div>
-          </div>
-        </div>
-      )}
-
-      {/* SUB-TAB: MICROSOFT GRAPH EXCEL (ADMIN ONLY) */}
-      {activeSubTab === 'msgraph' && isAdmin && (
-        <div className="space-y-6 max-w-3xl">
-          <div className="bg-white border border-slate-200 rounded-xl p-4 sm:p-6 shadow-xs space-y-5">
-            <div className="flex flex-wrap items-start justify-between gap-2">
-              <div className="min-w-0">
-                <h2 className="text-base font-bold text-slate-900 flex items-center gap-2">
-                  <Cloud className="w-5 h-5 text-sky-700 shrink-0" />
-                  <span>Đồng Bộ Tự Động Vào Excel Trực Tuyến (OneDrive / SharePoint)</span>
-                </h2>
-              </div>
-              <span
-                className={`text-xs px-2.5 py-1 rounded font-semibold shrink-0 ${
-                  msEnabled ? 'bg-emerald-50 text-emerald-800' : 'bg-slate-100 text-slate-600'
-                }`}
-              >
-                {msEnabled ? 'Đã bật đồng bộ' : 'Chưa bật'}
-              </span>
-            </div>
-
-            <form onSubmit={handleSaveMsGraph} className="space-y-4 text-xs">
-              <label className="flex items-center gap-3 p-3 bg-slate-50 border border-slate-200 rounded-lg cursor-pointer">
-                <input
-                  type="checkbox"
-                  checked={msEnabled}
-                  onChange={(e) => setMsEnabled(e.target.checked)}
-                  className="rounded text-sky-700 focus:ring-sky-700"
-                />
-                <span className="font-semibold text-slate-900">
-                  Bật tính năng tự động đồng bộ vào Microsoft Graph Excel
-                </span>
-              </label>
-
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Azure Directory (Tenant) ID</label>
-                  <input
-                    type="text"
-                    value={msTenantId}
-                    onChange={(e) => setMsTenantId(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                  />
-                </div>
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Application (Client) ID</label>
-                  <input
-                    type="text"
-                    value={msClientId}
-                    onChange={(e) => setMsClientId(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                  />
-                </div>
-                <div className="space-y-1 sm:col-span-2 min-w-0">
-                  <label className="font-bold text-slate-700">Client Secret</label>
-                  <input
-                    type="password"
-                    value={msClientSecret}
-                    onChange={(e) => setMsClientSecret(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                  />
-                </div>
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Drive ID (Tùy chọn)</label>
-                  <input
-                    type="text"
-                    value={msDriveId}
-                    onChange={(e) => setMsDriveId(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                  />
-                </div>
-                <div className="space-y-1 min-w-0">
-                  <label className="font-bold text-slate-700">Đường dẫn file Excel</label>
-                  <input
-                    type="text"
-                    value={msFilePath}
-                    onChange={(e) => setMsFilePath(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                  />
-                </div>
-                <div className="space-y-1 sm:col-span-2 min-w-0">
-                  <label className="font-bold text-slate-700">Tên bảng dữ liệu (Table Name)</label>
-                  <input
-                    type="text"
-                    value={msTableName}
-                    onChange={(e) => setMsTableName(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-9 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                  />
-                </div>
-              </div>
-
-              {msSaveMessage && (
-                <div
-                  className={`p-3 rounded-lg text-xs flex items-start gap-2 ${
-                    msSaveMessage.success
-                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                      : 'bg-rose-50 text-rose-800 border border-rose-200'
-                  }`}
-                >
-                  {msSaveMessage.success ? (
-                    <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0 mt-0.5" />
-                  ) : (
-                    <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                  )}
-                  <span>{msSaveMessage.message}</span>
-                </div>
-              )}
-
-              {msTestResult && (
-                <div
-                  className={`p-3 rounded-lg text-xs ${
-                    msTestResult.success
-                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
-                      : 'bg-rose-50 text-rose-800 border border-rose-200'
-                  }`}
-                >
-                  {msTestResult.message}
-                </div>
-              )}
-
-              {msSyncResult && (
-                <div className="p-3 bg-slate-100 text-slate-800 rounded-lg text-xs">{msSyncResult}</div>
-              )}
-
-              <div className="flex flex-col sm:flex-row flex-wrap items-stretch sm:items-center gap-2.5 sm:gap-3 pt-2">
-                <button
-                  type="submit"
-                  disabled={msSaving || isConfigBlocked}
-                  className="min-h-[44px] px-4 py-2.5 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-xs transition-colors"
-                >
-                  {msSaving ? 'Đang lưu...' : 'Lưu cấu hình'}
-                </button>
-                <button
-                  type="button"
-                  onClick={handleTestMsConnection}
-                  disabled={msTesting || !msTenantId || !msClientId}
-                  className="min-h-[44px] px-4 py-2.5 bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold rounded-lg transition-colors flex items-center justify-center gap-1.5"
-                >
-                  <RotateCw className={`w-3.5 h-3.5 ${msTesting ? 'animate-spin' : ''}`} />
-                  <span>{msTesting ? 'Đang kiểm tra...' : 'Kiểm tra kết nối'}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={handleSyncAll}
-                  disabled={msSyncingAll || !msEnabled}
-                  className="min-h-[44px] px-4 py-2.5 bg-emerald-700 hover:bg-emerald-800 text-white font-semibold rounded-lg shadow-xs transition-colors"
-                >
-                  {msSyncingAll ? 'Đang đồng bộ...' : 'Đồng bộ lại tất cả'}
-                </button>
-              </div>
-            </form>
           </div>
         </div>
       )}
