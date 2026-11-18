@@ -5,12 +5,15 @@ import { ImportPdfView } from './components/ImportPdfView';
 import { DocumentRegistryView } from './components/DocumentRegistryView';
 import { TasksView } from './components/TasksView';
 import { ReconciliationView } from './components/ReconciliationView';
+import { ArchiveImportView } from './components/ArchiveImportView';
+import { YearEndClosingView } from './components/YearEndClosingView';
 import { StatisticsView } from './components/StatisticsView';
 import { SettingsView } from './components/SettingsView';
 import type { SettingsSubTab } from './components/settings/settingsConstants';
 import { LoginModal } from './components/LoginModal';
 import { api, buildApiUrl, clearAuth, updateStoredUser } from './api';
 import type {
+  BookPermission,
   DocumentRecord,
   DocumentTypeConfig,
   NumberRequest,
@@ -474,7 +477,7 @@ export default function App() {
   useEffect(() => {
     if (!currentUser || loadingData) return;
     const isAdmin = isSystemAdmin(currentUser);
-    const hasPerm = (perm: 'issue_number' | 'request_number' | 'import_incoming' | 'view' | 'delete' | 'manage_book') => {
+    const hasPerm = (perm: BookPermission) => {
       if (isAdmin) return true;
       if (activeBook?.id && books.some((b) => b.id === activeBook.id)) {
         return hasBookPermission(currentUser, activeBook.id, perm);
@@ -498,6 +501,12 @@ export default function App() {
     allowedTabs.push('tasks');
     if (isAdmin || hasAnyBookPermission(currentUser, 'manage_book', books)) {
       allowedTabs.push('reconciliation');
+    }
+    if (isAdmin || hasAnyBookPermission(currentUser, 'import_archive', books)) {
+      allowedTabs.push('archive_import');
+    }
+    if (isAdmin || hasAnyBookPermission(currentUser, 'close_book', books)) {
+      allowedTabs.push('year_end_closing');
     }
     if (hasPerm('manage_book') || isAdmin) {
       allowedTabs.push('settings');
@@ -887,6 +896,41 @@ export default function App() {
                 serverYear={serverYear}
                 onOpenDocument={handleOpenExistingDocument}
                 onRefreshApp={loadAppData}
+              />
+            )}
+
+            {activeTab === 'archive_import' && (
+              <ArchiveImportView
+                currentUser={currentUser}
+                books={books.length > 0 ? books : [activeBook]}
+                activeBookId={activeBook.id}
+                onOpenExistingDocument={handleOpenExistingDocument}
+                onDocumentsImported={(createdDocs, updatedBook) => {
+                  if (createdDocs.length > 0) {
+                    setDocuments((prev) => {
+                      const seen = new Set(prev.map((d) => d.id));
+                      const fresh = createdDocs.filter((d) => !seen.has(d.id));
+                      return [...fresh, ...prev];
+                    });
+                    setLastSyncAt(new Date());
+                    showToast(`Đã nhập ${createdDocs.length} văn bản cũ vào sổ.`, 'success');
+                  }
+                  if (updatedBook) {
+                    setBooks((prev) =>
+                      prev.map((b) => (b.id === updatedBook.id ? updatedBook : b))
+                    );
+                  }
+                }}
+              />
+            )}
+
+            {activeTab === 'year_end_closing' && (
+              <YearEndClosingView
+                currentUser={currentUser}
+                books={books.length > 0 ? books : [activeBook]}
+                activeBookId={activeBook.id}
+                serverYear={serverYear}
+                onOpenDocument={handleOpenExistingDocument}
               />
             )}
 

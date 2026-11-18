@@ -1,14 +1,24 @@
 import type {
   ArchiveDeletedResult,
+  ArchiveImportCommitResponse,
+  ArchiveImportEditableRow,
+  ArchiveImportPreviewResponse,
+  ArchiveParseExcelResponse,
   AttachmentGroup,
   AuthResponse,
   BookPermission,
   BulkSyncDeletedResult,
+  ClosingAmendmentChange,
+  ClosingAmendmentRecord,
+  ClosingPreviewResponse,
+  DateComparisonStatus,
   DocumentHistoryEntry,
+  DocumentQaResponse,
   DocumentRecord,
   DocumentTask,
   DocumentTaskStatus,
   DocumentTypeConfig,
+  ExtractedDateSource,
   GoogleDriveConfig,
   HistoryCleanupPreviewResponse,
   HistoryCleanupResultResponse,
@@ -30,6 +40,7 @@ import type {
   SystemSettings,
   User,
   WordTemplate,
+  YearEndClosingSnapshot,
 } from './types';
 
 const TOKEN_KEY = 'nct_doc_token';
@@ -807,8 +818,16 @@ export const api = {
     fullDocNumber: string;
     docName: string;
     title?: string;
+    documentDate?: string;
     issueDate: string;
     signDate?: string;
+    dateComparisonStatus?: DateComparisonStatus;
+    dateMismatchSources?: {
+      topRight?: ExtractedDateSource;
+      signature?: ExtractedDateSource;
+    };
+    confirmUnifiedDate?: boolean;
+    parentAgency?: string;
     issuingAgency?: string;
     signer?: string;
     signerRole?: string;
@@ -964,9 +983,11 @@ export const api = {
       notes?: string;
       sequenceNumber?: number;
       fullDocNumber?: string;
+      parentAgency?: string;
       issuingAgency?: string;
       issueDate?: string;
       signDate?: string;
+      confirmUnifiedDate?: boolean;
       needsReview?: boolean;
     }
   ): Promise<{ document: DocumentRecord }> => {
@@ -974,6 +995,19 @@ export const api = {
       method: 'PUT',
       body: JSON.stringify(payload),
     });
+  },
+
+  confirmDocumentDate: async (
+    id: string,
+    confirmedDate: string
+  ): Promise<{ document: DocumentRecord; success: boolean }> => {
+    return request<{ document: DocumentRecord; success: boolean }>(
+      `/api/documents/${encodeURIComponent(id)}/confirm-date`,
+      {
+        method: 'POST',
+        body: JSON.stringify({ confirmedDate }),
+      }
+    );
   },
 
   deleteDocument: async (
@@ -1395,5 +1429,157 @@ export const api = {
       timeoutMs: 60000,
       body: JSON.stringify({ docIds }),
     });
+  },
+
+  // 1. Chat tra cứu có dẫn nguồn
+  askDocuments: async (payload: {
+    question: string;
+    bookIds?: string[];
+  }): Promise<DocumentQaResponse> => {
+    return request<DocumentQaResponse>('/api/documents/ask', {
+      method: 'POST',
+      timeoutMs: 45000,
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getDocumentPdfStreamUrl: (docId: string, attachmentId?: string): string => {
+    const token = getStoredToken();
+    const sp = new URLSearchParams();
+    if (attachmentId) sp.append('attachmentId', attachmentId);
+    if (token) sp.append('token', token);
+    const qs = sp.toString();
+    return buildApiUrl(`/api/documents/${encodeURIComponent(docId)}/pdf-file${qs ? `?${qs}` : ''}`);
+  },
+
+  // 2. Nhập kho văn bản cũ từ Excel & Drive
+  downloadArchiveTemplate: async (): Promise<void> => {
+    const token = getStoredToken();
+    const headers = new Headers();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    const res = await fetch(buildApiUrl('/api/archive/template'), {
+      headers,
+      credentials: 'include',
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Không tải được tệp mẫu Excel.');
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'Mau_nhap_kho_van_ban_cu.xlsx';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => window.URL.revokeObjectURL(url), 5000);
+  },
+
+  parseArchiveExcel: async (file: File): Promise<ArchiveParseExcelResponse> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    return request<ArchiveParseExcelResponse>('/api/archive/parse-excel', {
+      method: 'POST',
+      timeoutMs: 30000,
+      body: formData,
+    });
+  },
+
+  previewArchiveImport: async (payload: {
+    bookId: string;
+    folderUrlOrId?: string;
+    rows: ArchiveImportEditableRow[];
+  }): Promise<ArchiveImportPreviewResponse> => {
+    return request<ArchiveImportPreviewResponse>('/api/archive/preview', {
+      method: 'POST',
+      timeoutMs: 60000,
+      body: JSON.stringify(payload),
+    });
+  },
+
+  commitArchiveImport: async (payload: {
+    bookId: string;
+    batchId: string;
+    rows: any[];
+  }): Promise<ArchiveImportCommitResponse> => {
+    return request<ArchiveImportCommitResponse>('/api/archive/commit', {
+      method: 'POST',
+      timeoutMs: 60000,
+      body: JSON.stringify(payload),
+    });
+  },
+
+  // 3. Chốt sổ & bàn giao cuối năm
+  getClosingPreview: async (params: {
+    bookId: string;
+    year: number;
+  }): Promise<ClosingPreviewResponse> => {
+    const sp = new URLSearchParams();
+    sp.append('bookId', params.bookId);
+    sp.append('year', String(params.year));
+    return request<ClosingPreviewResponse>(`/api/closing/preview?${sp.toString()}`);
+  },
+
+  confirmClosing: async (payload: {
+    bookId: string;
+    year: number;
+    note?: string;
+  }): Promise<{ snapshot: YearEndClosingSnapshot }> => {
+    return request<{ snapshot: YearEndClosingSnapshot }>('/api/closing/confirm', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  getClosingSnapshots: async (params: {
+    bookId?: string;
+    year?: string | number;
+  } = {}): Promise<{ snapshots: YearEndClosingSnapshot[] }> => {
+    const sp = new URLSearchParams();
+    if (params.bookId) sp.append('bookId', params.bookId);
+    if (params.year) sp.append('year', String(params.year));
+    const qs = sp.toString();
+    return request<{ snapshots: YearEndClosingSnapshot[] }>(`/api/closing/snapshots${qs ? `?${qs}` : ''}`);
+  },
+
+  getClosingSnapshotById: async (id: string): Promise<{ snapshot: YearEndClosingSnapshot }> => {
+    return request<{ snapshot: YearEndClosingSnapshot }>(`/api/closing/snapshots/${encodeURIComponent(id)}`);
+  },
+
+  addClosingAmendment: async (
+    snapshotId: string,
+    payload: { reason: string; changes: ClosingAmendmentChange[] }
+  ): Promise<{ snapshot: YearEndClosingSnapshot; amendment: ClosingAmendmentRecord }> => {
+    return request(`/api/closing/snapshots/${encodeURIComponent(snapshotId)}/amendments`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    });
+  },
+
+  downloadClosingHandoverExcel: async (snapshotId: string, closingCode?: string): Promise<void> => {
+    const token = getStoredToken();
+    const headers = new Headers();
+    if (token) headers.set('Authorization', `Bearer ${token}`);
+    const res = await fetch(
+      buildApiUrl(`/api/closing/snapshots/${encodeURIComponent(snapshotId)}/export-excel`),
+      {
+        headers,
+        credentials: 'include',
+      }
+    );
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || 'Không thể tải Excel bàn giao.');
+    }
+    const blob = await res.blob();
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `Ban_giao_${(closingCode || snapshotId).replace(/[^A-Za-z0-9_-]+/g, '_')}.xlsx`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => window.URL.revokeObjectURL(url), 5000);
   },
 };

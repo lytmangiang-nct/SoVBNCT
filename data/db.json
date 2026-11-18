@@ -593,5 +593,7 @@
       "username": "admin"
     }
   ],
-  "revokedSessions": {}
+  "revokedSessions": {},
+  "wordTemplates": [],
+  "documentTasks": []
 }

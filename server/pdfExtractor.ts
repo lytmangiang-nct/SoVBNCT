@@ -7,12 +7,13 @@ import { execFile } from 'child_process';
 import { pathToFileURL } from 'url';
 import { promisify } from 'util';
 import type {
+  DateComparisonStatus,
   ExtractableFieldKey,
+  ExtractedDateSource,
   FieldLocation,
   NormalizedBBox,
   PdfExtractionResult,
   PdfPageContent,
-  PdfTaskSuggestion,
 } from '../src/types.js';
 import {
   getMaxWordFileSizeBytes,
@@ -865,69 +866,260 @@ function formatDateDdMmYyyy(day: string, month: string, year: string): string {
   const d = day.padStart(2, '0');
   const m = month.padStart(2, '0');
   const y = year.length === 2 ? `20${year}` : year;
-  const dn = parseInt(d, 10);
-  const mn = parseInt(m, 10);
-  const yn = parseInt(y, 10);
-  if (dn < 1 || dn > 31 || mn < 1 || mn > 12 || yn < 1990 || yn > 2100) return '';
-  return `${d}/${m}/${y}`;
+  return normalizeDateOnlyDdMmYyyy(`${d}/${m}/${y}`);
 }
 
-function extractIssueDate(text: string): string {
-  if (!text) return '';
-  const norm = removeVietnameseDiacritics(text);
-  // 1. Dạng "ngày 12 tháng 11 năm 2026"
-  const mText = norm.match(/\bngay\s+(\d{1,2})\s+thang\s+(\d{1,2})\s+nam\s+(\d{4})\b/i);
+const BODY_DATE_CONTEXT_REGEX =
+  /\b(?:can\s+cu|dieu\s+\d+|khoan\s+\d+|diem\s+[a-z]|ngay\s+hieu\s+luc|co\s+hieu\s+luc|ke\s+tu\s+ngay|han\s+(?:nop|cuoi)|cham\s+nhat|truoc\s+ngay|tu\s+ngay|den\s+(?:het\s+)?ngay|lich\s+trinh|thoi\s+gian\s+(?:to\s+chuc|nhan|nop|thi)|quyet\s+dinh\s+so|cong\s+van\s+so|thong\s+tu\s+so|nghi\s+dinh\s+so|ke\s+hoach\s+so|ban\s+hanh\s+kem\s+theo)\b/i;
+
+function extractDateFromHeaderOrSigLine(lineText: string): string {
+  if (!lineText) return '';
+  const norm = removeVietnameseDiacritics(lineText);
+  if (BODY_DATE_CONTEXT_REGEX.test(norm)) return '';
+
+  // 1. "ngày10 tháng 11 năm 2026" hoặc "An Giang, ngày 10 tháng 11 năm 2026"
+  const mText = norm.match(/\bngay\s*(\d{1,2})\s*thang\s*(\d{1,2})\s*nam\s*(\d{4})\b/i);
   if (mText) {
     return formatDateDdMmYyyy(mText[1], mText[2], mText[3]);
   }
-  // 2. Dạng "ngày 12/11/2026" hoặc "ngày 12-11-2026"
-  const mSlash = norm.match(/\bngay\s+(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})\b/i);
+  // 2. "ngày 10/11/2026" hoặc "ngày 10-11-2026"
+  const mSlash = norm.match(/\bngay\s*[:\-]?\s*(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})\b/i);
   if (mSlash) {
     return formatDateDdMmYyyy(mSlash[1], mSlash[2], mSlash[3]);
   }
   return '';
 }
 
-function extractSeparateSignDate(allTexts: string[], rawSigDates: string[]): string {
-  const combined = allTexts.join('\n');
-  // 1. Khối chữ ký số: "Ngày ký: ...", "Thời gian ký: ...", "Ký ngày: ..." — chỉ lưu ngày/tháng/năm (dd/MM/yyyy)
-  const explicitPatterns = [
-    /(?:Ng[àa]y\s+k[ýy]|Th[ờơ]i\s+gian\s+k[ýy]|K[ýy]\s+ng[àa]y|Signed\s+on|Signing\s+time)\s*[:\-]?\s*(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/i,
-    /(?:Ng[àa]y\s+k[ýy]|Th[ờơ]i\s+gian\s+k[ýy]|K[ýy]\s+ng[àa]y|Signed\s+on|Signing\s+time)\s*[:\-]?\s*(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:\s+\d{1,2}:\d{2}(?::\d{2})?)?/i,
-    /(?:Ng[àa]y\s+k[ýy]|Th[ờơ]i\s+gian\s+k[ýy]|K[ýy]\s+ng[àa]y)\s*[:\-]?\s*(?:ng[àa]y\s+)?(\d{1,2})\s+th[áa]ng\s+(\d{1,2})\s+n[ăa]m\s+(\d{4})/i,
-  ];
+function extractTopRightHeaderDate(
+  page1Boxes: NormalizedBox[],
+  rightTopText: string,
+  splitX: number
+): ExtractedDateSource | null {
+  const topRightBoxes = page1Boxes.filter(
+    (b) => (b.y0 + b.y1) / 2 <= 0.44 && b.x0 >= Math.max(0.32, splitX - 0.04)
+  );
+  const topRightLines = groupBoxesIntoLines(topRightBoxes).filter((l) => !l.isDivider);
 
-  const m1 = combined.match(explicitPatterns[0]);
-  if (m1) {
-    const base = formatDateDdMmYyyy(m1[1], m1[2], m1[3]);
-    if (base) return normalizeDateOnlyDdMmYyyy(base);
+  let foundMottoIdx = -1;
+  for (let i = 0; i < topRightLines.length; i++) {
+    const norm = removeVietnameseDiacritics(topRightLines[i].text);
+    if (/(CONG HOA XA HOI|DOC LAP\s*[-–—]?\s*TU DO|HANH PHUC)/i.test(norm)) {
+      foundMottoIdx = i;
+    }
   }
 
-  const m2 = combined.match(explicitPatterns[1]);
-  if (m2) {
-    const base = formatDateDdMmYyyy(m2[3], m2[2], m2[1]);
-    if (base) return normalizeDateOnlyDdMmYyyy(base);
+  const candidateLines =
+    foundMottoIdx !== -1 ? topRightLines.slice(foundMottoIdx + 1) : topRightLines;
+
+  for (const line of candidateLines) {
+    const norm = removeVietnameseDiacritics(line.text);
+    if (/^(KE HOACH|QUYET DINH|THONG BAO|CONG VAN|CAN CU|KINH GUI|DIEU \d+)/i.test(norm)) {
+      break;
+    }
+    const parsed = extractDateFromHeaderOrSigLine(line.text);
+    if (parsed) {
+      return {
+        date: parsed,
+        positionLabel: 'Góc trên bên phải (Trang 1)',
+        page: 1,
+        bbox: unionLineBBoxes([line]),
+        rawText: line.text,
+      };
+    }
   }
 
-  const m3 = combined.match(explicitPatterns[2]);
-  if (m3) {
-    const base = formatDateDdMmYyyy(m3[1], m3[2], m3[3]);
-    if (base) return normalizeDateOnlyDdMmYyyy(base);
+  // Fallback từ text cột phải trên
+  if (rightTopText) {
+    for (const rawLine of rightTopText.split('\n').map((s) => s.trim()).filter(Boolean)) {
+      const norm = removeVietnameseDiacritics(rawLine);
+      if (/(CONG HOA|DOC LAP)/i.test(norm)) continue;
+      const parsed = extractDateFromHeaderOrSigLine(rawLine);
+      if (parsed) {
+        return {
+          date: parsed,
+          positionLabel: 'Góc trên bên phải (Trang 1)',
+          page: 1,
+          estimated: true,
+          rawText: rawLine,
+        };
+      }
+    }
   }
 
-  // 2. Ngày trong chữ ký số PDF (/M D:...) — đã bỏ giờ phút giây
+  return null;
+}
+
+function extractExplicitSignDateFromText(text: string): { date: string; rawText: string } | null {
+  if (!text) return null;
+  const lines = text.split('\n').map((s) => s.trim()).filter(Boolean);
+  for (const line of lines) {
+    const m1 = line.match(
+      /(?:Ng[àa]y\s+k[ýy]|Th[ờơ]i\s+gian\s+k[ýy]|K[ýy]\s+ng[àa]y|Signed\s+on|Signing\s+time)\s*[:\-]?\s*(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})(?:[T\s,]+\d{1,2}:\d{2}(?::\d{2})?)?/i
+    );
+    if (m1) {
+      const d = formatDateDdMmYyyy(m1[1], m1[2], m1[3]);
+      if (d) return { date: d, rawText: line };
+    }
+    const m2 = line.match(
+      /(?:Ng[àa]y\s+k[ýy]|Th[ờơ]i\s+gian\s+k[ýy]|K[ýy]\s+ng[àa]y|Signed\s+on|Signing\s+time)\s*[:\-]?\s*(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[T\s,]+\d{1,2}:\d{2}(?::\d{2})?)?/i
+    );
+    if (m2) {
+      const d = formatDateDdMmYyyy(m2[3], m2[2], m2[1]);
+      if (d) return { date: d, rawText: line };
+    }
+    const m3 = line.match(
+      /(?:Ng[àa]y\s+k[ýy]|Th[ờơ]i\s+gian\s+k[ýy]|K[ýy]\s+ng[àa]y)\s*[:\-]?\s*(?:ng[àa]y\s*)?(\d{1,2})\s*th[áa]ng\s*(\d{1,2})\s*n[ăa]m\s*(\d{4})/i
+    );
+    if (m3) {
+      const d = formatDateDdMmYyyy(m3[1], m3[2], m3[3]);
+      if (d) return { date: d, rawText: line };
+    }
+  }
+  return null;
+}
+
+function extractSignatureZoneDate(params: {
+  signaturePage: number;
+  pageBoxes: NormalizedBox[];
+  annotationText: string;
+  rawSigDates: string[];
+  signerPageText: string;
+}): ExtractedDateSource | null {
+  const { signaturePage, pageBoxes, annotationText, rawSigDates, signerPageText } = params;
+
+  // 1. Tìm nhãn tường minh "Ngày ký:" / "Thời gian ký:" trong vùng chữ ký hoặc annotation PDF
+  const explicitAnnot = extractExplicitSignDateFromText(annotationText);
+  if (explicitAnnot) {
+    const bbox = findLinesBBoxByQuery(pageBoxes, explicitAnnot.date, 0.2, 1);
+    return {
+      date: explicitAnnot.date,
+      positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+      page: signaturePage,
+      ...(bbox ? { bbox } : { estimated: true }),
+      rawText: explicitAnnot.rawText,
+    };
+  }
+
+  // Lọc các hộp thuộc phần ký (bỏ phần tiêu đề góc trên trang 1 để không đếm trùng Vị trí 1)
+  const sigZoneBoxes = pageBoxes.filter((b) => {
+    const yc = (b.y0 + b.y1) / 2;
+    if (signaturePage === 1 && yc <= 0.40) return false;
+    return yc >= 0.25;
+  });
+  const sigZoneLines = groupBoxesIntoLines(sigZoneBoxes).filter((l) => !l.isDivider);
+
+  // Tìm dòng chức vụ ký đầu tiên ở vùng chữ ký
+  let roleLineIdx = -1;
+  for (let i = 0; i < sigZoneLines.length; i++) {
+    const norm = removeVietnameseDiacritics(sigZoneLines[i].text);
+    if (SIGNER_ROLE_REGEX.test(norm) && sigZoneLines[i].x0 >= 0.30) {
+      roleLineIdx = i;
+      break;
+    }
+  }
+
+  const sigScopeLines =
+    roleLineIdx !== -1
+      ? sigZoneLines.slice(Math.max(0, roleLineIdx - 4), Math.min(sigZoneLines.length, roleLineIdx + 14))
+      : sigZoneLines.filter((l) => l.x0 >= 0.35 && l.yCenter >= 0.45);
+
+  const explicitZone = extractExplicitSignDateFromText(sigScopeLines.map((l) => l.text).join('\n'));
+  if (explicitZone) {
+    const matchedLine = sigScopeLines.find((l) => l.text.includes(explicitZone.rawText) || l.text.includes(explicitZone.date));
+    return {
+      date: explicitZone.date,
+      positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+      page: signaturePage,
+      bbox: matchedLine ? unionLineBBoxes([matchedLine]) : findLinesBBoxByQuery(sigZoneBoxes, explicitZone.date, 0.25, 1),
+      rawText: explicitZone.rawText,
+    };
+  }
+
+  // 2. Dòng ngày ngay phía trên hoặc trong khối ký ở nửa dưới/phải trang ký (vd: "An Giang, ngày 12 tháng 11 năm 2026" hoặc con dấu ngày "12/11/2026")
+  for (const line of sigScopeLines) {
+    if (signaturePage === 1 && line.yCenter <= 0.40) continue;
+    const norm = removeVietnameseDiacritics(line.text);
+    if (BODY_DATE_CONTEXT_REGEX.test(norm)) continue;
+
+    const fromVn = extractDateFromHeaderOrSigLine(line.text);
+    if (fromVn) {
+      return {
+        date: fromVn,
+        positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+        page: signaturePage,
+        bbox: unionLineBBoxes([line]),
+        rawText: line.text,
+      };
+    }
+
+    // Ngày dạng dd/MM/yyyy đứng độc lập trong khối ký (cạnh chữ ký / dấu mộc)
+    if (line.x0 >= 0.35 && line.yCenter >= 0.42) {
+      const mBare = line.text.match(/\b(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{4})\b/);
+      if (mBare && line.text.length <= 48) {
+        const d = formatDateDdMmYyyy(mBare[1], mBare[2], mBare[3]);
+        if (d) {
+          return {
+            date: d,
+            positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+            page: signaturePage,
+            bbox: unionLineBBoxes([line]),
+            rawText: line.text,
+          };
+        }
+      }
+    }
+  }
+
+  // Fallback từ text trang ký nếu chưa có boxes (tránh phần đầu trang 1)
+  if (sigZoneBoxes.length === 0 && signerPageText) {
+    const rawLines = signerPageText.split('\n').map((s) => s.trim()).filter(Boolean);
+    const searchLines = signaturePage === 1 ? rawLines.slice(Math.floor(rawLines.length * 0.45)) : rawLines;
+    const explicitText = extractExplicitSignDateFromText(searchLines.join('\n'));
+    if (explicitText) {
+      return {
+        date: explicitText.date,
+        positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+        page: signaturePage,
+        estimated: true,
+        rawText: explicitText.rawText,
+      };
+    }
+    for (const l of searchLines) {
+      const d = extractDateFromHeaderOrSigLine(l);
+      if (d) {
+        return {
+          date: d,
+          positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+          page: signaturePage,
+          estimated: true,
+          rawText: l,
+        };
+      }
+    }
+  }
+
+  // 3. Ngày trong chữ ký số PDF (/Type /Sig /M D:...) — bỏ giờ phút giây
   if (rawSigDates.length > 0) {
-    return normalizeDateOnlyDdMmYyyy(rawSigDates[0]);
+    const validRaw = normalizeDateOnlyDdMmYyyy(rawSigDates[0]);
+    if (validRaw) {
+      return {
+        date: validRaw,
+        positionLabel: `Chữ ký số PDF (Trang ${signaturePage})`,
+        page: signaturePage,
+        estimated: true,
+        rawText: rawSigDates[0],
+      };
+    }
   }
 
-  return '';
+  return null;
 }
 
 function extractDocNumberFromSoValue(rawAfterLabel: string): string {
   if (!rawAfterLabel) return '';
   const cleaned = rawAfterLabel
     .replace(/[ \t]*\/[ \t]*/g, '/')
-    .replace(/[ \t]*-[ \t]*/g, '-')
+    .replace(/[ \t]*[-–—][ \t]*/g, '-')
     .trim();
   if (!cleaned) return '';
 
@@ -948,7 +1140,8 @@ function isSoLabelLine(lineText: string): boolean {
   if (/^(?:S[ốoôơ6](?:\s*\/\s*K[ýy]\s*hi[ệe]u)?)\s*[:\.]/i.test(cleaned)) {
     return true;
   }
-  if (/^S[ốoôơ6]\s+\d{1,5}\s*[\/\-]/i.test(cleaned)) {
+  // Hỗ trợ cả "Số 2937/QĐ-SGDĐT" lẫn thiếu dấu hai chấm/khoảng trắng "Số2937 /QĐ-SGDĐT"
+  if (/^S[ốoôơ6]\s*\d{1,5}\s*[\/\-]/i.test(cleaned)) {
     return true;
   }
   return false;
@@ -966,14 +1159,14 @@ function extractValueFromSoLine(lineText: string): string {
 function extractDocNumberCandidates(text: string): string[] {
   if (!text) return [];
   const regex =
-    /(?:S[ốoôơ6]|Số\/Ký hiệu)\s*[:\.]?[ \t]*([0-9]{1,5}[ \t]*[\/\-][ \t]*[\p{L}\p{N}_\-\.\/]+(?:[ \t]*[\-\/][ \t]*[\p{L}\p{N}_\-\.]+)*)/giu;
+    /(?:S[ốoôơ6]|Số\s*\/\s*Ký\s*hiệu)\s*[:\.]?[ \t]*([0-9]{1,5}[ \t]*[\/\-][ \t]*[\p{L}\p{N}_\-\.\/]+(?:[ \t]*[\-\/][ \t]*[\p{L}\p{N}_\-\.]+)*)/giu;
   const results: string[] = [];
   const seen = new Set<string>();
 
   for (const m of text.matchAll(regex)) {
     let num = (m[1] || '')
       .replace(/[ \t]*\/[ \t]*/g, '/')
-      .replace(/[ \t]*-[ \t]*/g, '-')
+      .replace(/[ \t]*[-–—][ \t]*/g, '-')
       .replace(/[.,;:\)]+$/g, '')
       .trim();
 
@@ -994,27 +1187,48 @@ function isMostlyUppercaseLine(str: string): boolean {
   const letters = (str || '').match(/\p{L}/gu) || [];
   if (letters.length === 0) return false;
   const upperCount = letters.filter((ch) => ch === ch.toUpperCase() && ch !== ch.toLowerCase()).length;
-  return upperCount / letters.length >= 0.85;
+  return upperCount / letters.length >= 0.82;
+}
+
+function startsWithAgencyNoun(str: string): boolean {
+  const norm = removeVietnameseDiacritics(str).trim();
+  return /^(?:SO|PHONG|TRUONG|TRUNG TAM|UY BAN|UBND|BO|CUC|VU|CHI CUC|CHI BO|DOAN|BAN|VIEN|HOC VIEN|CONG AN|TINH DOAN|HUYEN DOAN|THANH DOAN|HDND|DAI HOC)\b/i.test(
+    norm
+  );
+}
+
+function isWrappedAgencyContinuation(prevText: string, curText: string): boolean {
+  const normPrev = removeVietnameseDiacritics(prevText).trim();
+  const normCur = removeVietnameseDiacritics(curText).trim();
+  if (!normPrev || !normCur) return false;
+  if (startsWithAgencyNoun(curText)) return false;
+  if (/^(?:VA|CUA|TINH|THANH PHO|THPT|THCS|TH|QUAN|HUYEN|THI XA|TP\.|VIET NAM|NGUYEN|AN GIANG|DAO TAO)\b/i.test(normCur)) {
+    return true;
+  }
+  if (/\b(?:VA|CUA|GIAO DUC|DAO TAO|NHAN DAN|THPT|TRUONG|TRUNG TAM|PHONG)\s*$/i.test(normPrev)) {
+    return true;
+  }
+  return false;
 }
 
 function detectHeaderColumnSplitX(topBoxes: NormalizedBox[]): number {
-  const headerTopBoxes = topBoxes.filter((b) => (b.y0 + b.y1) / 2 <= 0.30);
+  const headerTopBoxes = topBoxes.filter((b) => (b.y0 + b.y1) / 2 <= 0.34);
   if (headerTopBoxes.length === 0) return 0.48;
 
   // 1. Neo theo khối quốc hiệu "CỘNG HÒA XÃ HỘI CHỦ NGHĨA VIỆT NAM" / "Độc lập..." bên phải
   const rightMottoRegex = /^(?:CONG|HOA|XA|HOI|CHU|NGHIA|VIET|NAM|DOC|LAP|TU|DO|HANH|PHUC)$/i;
   const rightAnchors = headerTopBoxes.filter((b) => {
     const norm = removeVietnameseDiacritics(b.text).replace(/[^A-Za-z]/g, '');
-    return b.x0 >= 0.36 && rightMottoRegex.test(norm);
+    return b.x0 >= 0.34 && rightMottoRegex.test(norm);
   });
   if (rightAnchors.length >= 2) {
     const minRightX = Math.min(...rightAnchors.map((b) => b.x0));
-    return Math.min(0.54, Math.max(0.38, minRightX - 0.01));
+    return Math.min(0.55, Math.max(0.36, minRightX - 0.01));
   }
 
-  // 2. Fallback: tìm khoảng trắng dọc (gutter) rộng nhất trong khoảng x = 0.36..0.56
+  // 2. Fallback: tìm khoảng trắng dọc (gutter) rộng nhất trong khoảng x = 0.35..0.56
   const leftCandidates = headerTopBoxes.filter((b) => b.x1 <= 0.52);
-  const rightCandidates = headerTopBoxes.filter((b) => b.x0 >= 0.40);
+  const rightCandidates = headerTopBoxes.filter((b) => b.x0 >= 0.38);
   if (leftCandidates.length > 0 && rightCandidates.length > 0) {
     const intervals = headerTopBoxes
       .map((b) => ({ x0: b.x0, x1: b.x1 }))
@@ -1026,14 +1240,14 @@ function detectHeaderColumnSplitX(topBoxes: NormalizedBox[]): number {
       if (intervals[i].x0 > curMaxX) {
         const gapMid = (curMaxX + intervals[i].x0) / 2;
         const gapSize = intervals[i].x0 - curMaxX;
-        if (gapMid >= 0.36 && gapMid <= 0.56 && gapSize > bestGap) {
+        if (gapMid >= 0.35 && gapMid <= 0.56 && gapSize > bestGap) {
           bestGap = gapSize;
           bestSplit = gapMid;
         }
       }
       curMaxX = Math.max(curMaxX, intervals[i].x1);
     }
-    if (bestGap >= 0.025) {
+    if (bestGap >= 0.022) {
       return bestSplit;
     }
   }
@@ -1065,26 +1279,31 @@ function findLinesBBoxByQuery(boxes: NormalizedBox[], query: string, yMin = 0, y
   const queryWords = normQuery.split(/\s+/).filter((w) => w.length >= 2);
   if (normQuery.length < 2) return undefined;
 
-  // 1. Direct single-line or 2-line window substring match
+  // 1. Direct single-line match first (tightest bbox), then multi-line window substring match
   for (let i = 0; i < lines.length; i++) {
     const norm1 = removeVietnameseDiacritics(lines[i].text).toLowerCase().replace(/\s+/g, ' ').trim();
-    if (norm1.includes(normQuery) || (norm1.length >= 6 && normQuery.includes(norm1) && norm1.length >= normQuery.length * 0.5)) {
+    if (norm1.includes(normQuery) || (norm1.length >= 6 && normQuery.includes(norm1) && norm1.length >= normQuery.length * 0.45)) {
       return unionLineBBoxes([lines[i]]);
     }
-    if (i + 1 < lines.length) {
-      const combined = `${norm1} ${removeVietnameseDiacritics(lines[i + 1].text).toLowerCase().replace(/\s+/g, ' ').trim()}`;
+  }
+  for (let len = 2; len <= 5; len++) {
+    for (let i = 0; i + len <= lines.length; i++) {
+      const slice = lines.slice(i, i + len);
+      const combined = slice
+        .map((l) => removeVietnameseDiacritics(l.text).toLowerCase().replace(/\s+/g, ' ').trim())
+        .join(' ');
       if (combined.includes(normQuery)) {
-        return unionLineBBoxes([lines[i], lines[i + 1]]);
+        return unionLineBBoxes(slice);
       }
     }
   }
 
-  // 2. Best token overlap match across 1..3 consecutive lines
+  // 2. Best token overlap match across 1..5 consecutive lines
   if (queryWords.length >= 2) {
     let bestScore = 0;
     let bestSlice: NormalizedLine[] = [];
     for (let i = 0; i < lines.length; i++) {
-      for (let len = 1; len <= 3 && i + len <= lines.length; len++) {
+      for (let len = 1; len <= 5 && i + len <= lines.length; len++) {
         const slice = lines.slice(i, i + len);
         const sliceNorm = removeVietnameseDiacritics(slice.map((l) => l.text).join(' '))
           .toLowerCase()
@@ -1097,7 +1316,7 @@ function findLinesBBoxByQuery(boxes: NormalizedBox[], query: string, yMin = 0, y
         }
       }
     }
-    if (bestScore >= 0.6 && bestSlice.length > 0) {
+    if (bestScore >= 0.55 && bestSlice.length > 0) {
       return unionLineBBoxes(bestSlice);
     }
   }
@@ -1106,6 +1325,8 @@ function findLinesBBoxByQuery(boxes: NormalizedBox[], query: string, yMin = 0, y
 }
 
 interface TopLeftHeaderAnalysis {
+  parentAgency: string;
+  parentAgencyBBox?: NormalizedBBox;
   issuingAgency: string;
   agencyBBox?: NormalizedBBox;
   agencyNeedsReview: boolean;
@@ -1117,6 +1338,7 @@ interface TopLeftHeaderAnalysis {
   topLeftHeaderDocNumbers: string[];
   rightTopText: string;
   leftTopText: string;
+  splitX: number;
 }
 
 function analyzeTopLeftHeader(
@@ -1125,6 +1347,7 @@ function analyzeTopLeftHeader(
 ): TopLeftHeaderAnalysis {
   if (page1Boxes.length === 0) {
     return {
+      parentAgency: '',
       issuingAgency: '',
       agencyNeedsReview: false,
       agencyReviewReason: '',
@@ -1134,17 +1357,18 @@ function analyzeTopLeftHeader(
       topLeftHeaderDocNumbers: [],
       rightTopText: '',
       leftTopText: '',
+      splitX: 0.48,
     };
   }
 
-  const topBoxes = page1Boxes.filter((b) => (b.y0 + b.y1) / 2 <= 0.45);
+  const topBoxes = page1Boxes.filter((b) => (b.y0 + b.y1) / 2 <= 0.48);
   const splitX = detectHeaderColumnSplitX(topBoxes);
 
   const leftTopBoxes = topBoxes.filter((b) => {
     const xCenter = (b.x0 + b.x1) / 2;
-    return xCenter < splitX && b.x0 < splitX - 0.004;
+    return xCenter < splitX + 0.01 && b.x0 < splitX - 0.002;
   });
-  const rightTopBoxes = topBoxes.filter((b) => b.x0 >= splitX - 0.01);
+  const rightTopBoxes = topBoxes.filter((b) => b.x0 >= splitX - 0.02);
 
   const leftTopLines = groupBoxesIntoLines(leftTopBoxes);
   const rightTopText = boxesToText(rightTopBoxes);
@@ -1156,7 +1380,7 @@ function analyzeTopLeftHeader(
   const headerStopRegex =
     /^(KE HOACH|QUYET DINH|THONG BAO|BAO CAO|TO TRINH|CHUONG TRINH|HUONG DAN|CONG VAN|QUY CHE|GIAY MOI|THU MOI|CAN CU|KINH GUI|V\/V\b|VE VIEC\b|DIEU 1|I\.\s)/i;
 
-  // Tìm dòng "Số:" trong khối phía trên bên trái (trước phần thân văn bản)
+  // Tìm dòng "Số:" trong khối phía trên bên trái (ưu tiên ngay dưới khối cơ quan)
   let firstSoIndex = -1;
   const headerSoNumbers: string[] = [];
   const headerSoLines: NormalizedLine[] = [];
@@ -1165,10 +1389,7 @@ function analyzeTopLeftHeader(
     const line = leftTopLines[i];
     if (line.isDivider) continue;
     const norm = removeVietnameseDiacritics(line.text);
-    if (firstSoIndex !== -1 && headerStopRegex.test(norm)) {
-      break;
-    }
-    if (firstSoIndex === -1 && headerStopRegex.test(norm)) {
+    if (headerStopRegex.test(norm)) {
       break;
     }
     if (isSoLabelLine(line.text)) {
@@ -1178,7 +1399,7 @@ function analyzeTopLeftHeader(
       // Nếu "Số:" đứng một mình trên dòng và giá trị nằm ngay dòng sát bên dưới
       if (!val && i + 1 < leftTopLines.length) {
         const nextLine = leftTopLines[i + 1];
-        if (!nextLine.isDivider && nextLine.yCenter - line.yCenter <= 0.03) {
+        if (!nextLine.isDivider && nextLine.yCenter - line.yCenter <= 0.035) {
           val = extractDocNumberFromSoValue(nextLine.text);
           if (val) matchedSoLines.push(nextLine);
         }
@@ -1201,10 +1422,10 @@ function analyzeTopLeftHeader(
   if (firstSoIndex !== -1 && !docNumber) {
     docNumberNeedsReview = true;
     docNumberReviewReason =
-      'Đã thấy nhãn "Số:" ở góc trên bên trái nhưng chưa đọc chắc chắn phần số/ký hiệu phía sau.';
+      'Đã thấy nhãn "Số" ở góc trên bên trái nhưng chưa đọc chắc chắn phần số/ký hiệu phía sau.';
   } else if (headerSoNumbers.length > 1) {
     docNumberNeedsReview = true;
-    docNumberReviewReason = `Phát hiện nhiều dòng "Số:" trong khối tiêu đề góc trên bên trái (${headerSoNumbers.join(', ')}), vui lòng xác nhận đúng số gốc.`;
+    docNumberReviewReason = `Phát hiện nhiều dòng "Số" trong khối tiêu đề góc trên bên trái (${headerSoNumbers.join(', ')}), vui lòng xác nhận đúng số gốc.`;
   }
 
   // Thu thập các dòng tên cơ quan STRICTLY phía trên dòng "Số:" (bỏ đường kẻ, dòng trống, quốc hiệu)
@@ -1237,6 +1458,8 @@ function analyzeTopLeftHeader(
   const hasDividerBetween = (yTop: number, yBottom: number) =>
     allDividerYs.some((dy) => dy > yTop + 0.001 && dy < yBottom - 0.001);
 
+  let parentAgency = '';
+  let parentUsedLines: NormalizedLine[] = [];
   let issuingAgency = '';
   let agencyUsedLines: NormalizedLine[] = [];
   let agencyNeedsReview = false;
@@ -1250,83 +1473,122 @@ function analyzeTopLeftHeader(
     issuingAgency = rawAgencyLines[0].text;
     agencyUsedLines = [rawAgencyLines[0]];
   } else if (rawAgencyLines.length === 2) {
-    // 2 dòng: dòng 1 là cơ quan chủ quản, dòng 2 là cơ quan ban hành
-    issuingAgency = rawAgencyLines[1].text;
-    agencyUsedLines = [rawAgencyLines[1]];
+    const [line1, line2] = rawAgencyLines;
+    const divider12 = hasDividerBetween(line1.yCenter, line2.yCenter);
+    const wrapped12 = !divider12 && isWrappedAgencyContinuation(line1.text, line2.text);
+    if (wrapped12) {
+      issuingAgency = `${line1.text} ${line2.text}`.replace(/\s+/g, ' ').trim();
+      agencyUsedLines = [line1, line2];
+    } else {
+      parentAgency = line1.text;
+      parentUsedLines = [line1];
+      issuingAgency = line2.text;
+      agencyUsedLines = [line2];
+    }
   } else if (rawAgencyLines.length === 3) {
     const [line1, line2, line3] = rawAgencyLines;
     const dividerBetween23 = hasDividerBetween(line2.yCenter, line3.yCenter);
     const dividerBetween12 = hasDividerBetween(line1.yCenter, line2.yCenter);
-    const dividerBelow3 =
-      firstSoIndex !== -1
-        ? hasDividerBetween(line3.yCenter, leftTopLines[firstSoIndex].yCenter)
-        : allDividerYs.some((dy) => dy > line3.yCenter && dy - line3.yCenter <= 0.045);
 
-    const centerDiff23 = Math.abs(line2.xCenter - line3.xCenter);
-    const leftDiff23 = Math.abs(line2.x0 - line3.x0);
-    const aligned23 = centerDiff23 <= 0.045 || leftDiff23 <= 0.025;
+    const aligned23 = Math.abs(line2.xCenter - line3.xCenter) <= 0.055 || Math.abs(line2.x0 - line3.x0) <= 0.035;
+    const aligned12 = Math.abs(line1.xCenter - line2.xCenter) <= 0.055 || Math.abs(line1.x0 - line2.x0) <= 0.035;
 
     const dy12 = Math.max(0.004, line2.yCenter - line1.yCenter);
     const dy23 = Math.max(0.004, line3.yCenter - line2.yCenter);
-    const spacing23Tight = dy23 <= dy12 * 1.15;
 
-    const maxH23 = Math.max(line2.avgHeight, line3.avgHeight, 0.001);
-    const heightSimilar23 = Math.abs(line2.avgHeight - line3.avgHeight) / maxH23 <= 0.28;
+    const heightSimilar23 =
+      Math.abs(line2.avgHeight - line3.avgHeight) / Math.max(line2.avgHeight, line3.avgHeight, 0.001) <= 0.30;
+    const heightSimilar12 =
+      Math.abs(line1.avgHeight - line2.avgHeight) / Math.max(line1.avgHeight, line2.avgHeight, 0.001) <= 0.30;
     const bothUpper23 = isMostlyUppercaseLine(line2.text) && isMostlyUppercaseLine(line3.text);
-    const fontsAvailable = line2.fontNames.length > 0 && line3.fontNames.length > 0;
-    const fontConsistent23 =
-      !fontsAvailable || line2.fontNames.some((f) => line3.fontNames.includes(f));
+    const bothUpper12 = isMostlyUppercaseLine(line1.text) && isMostlyUppercaseLine(line2.text);
+
+    const wrapped23 =
+      !dividerBetween23 &&
+      aligned23 &&
+      heightSimilar23 &&
+      bothUpper23 &&
+      (isWrappedAgencyContinuation(line2.text, line3.text) || (!dividerBetween12 && dy23 <= dy12 * 1.25));
+    const wrapped12 =
+      !dividerBetween12 &&
+      aligned12 &&
+      heightSimilar12 &&
+      bothUpper12 &&
+      (isWrappedAgencyContinuation(line1.text, line2.text) || dy12 * 1.25 < dy23);
 
     if (dividerBetween23) {
-      // Có đường kẻ nằm giữa dòng 2 và dòng 3 => dòng 3 không phải phần xuống dòng của dòng 2
+      parentAgency = line1.text;
+      parentUsedLines = [line1];
       issuingAgency = line2.text;
       agencyUsedLines = [line2];
       agencyNeedsReview = true;
       agencyReviewReason =
         'Khối cơ quan ban hành có 3 dòng và có đường kẻ phân tách trước dòng thứ 3, vui lòng kiểm tra lại.';
-    } else if (
-      !dividerBetween12 &&
-      aligned23 &&
-      spacing23Tight &&
-      heightSimilar23 &&
-      bothUpper23 &&
-      fontConsistent23
-    ) {
-      // Dòng 3 chắc chắn là phần xuống dòng của dòng 2 (cùng căn giữa/lề, khoảng cách dòng gần, cùng kiểu chữ)
+    } else if (wrapped23 && !wrapped12) {
+      parentAgency = line1.text;
+      parentUsedLines = [line1];
       issuingAgency = `${line2.text} ${line3.text}`.replace(/\s+/g, ' ').trim();
       agencyUsedLines = [line2, line3];
-      agencyNeedsReview = false;
+    } else if (wrapped12 && !wrapped23) {
+      parentAgency = `${line1.text} ${line2.text}`.replace(/\s+/g, ' ').trim();
+      parentUsedLines = [line1, line2];
+      issuingAgency = line3.text;
+      agencyUsedLines = [line3];
+    } else if (isWrappedAgencyContinuation(line1.text, line2.text) && isWrappedAgencyContinuation(line2.text, line3.text)) {
+      issuingAgency = `${line1.text} ${line2.text} ${line3.text}`.replace(/\s+/g, ' ').trim();
+      agencyUsedLines = [line1, line2, line3];
     } else {
-      // Chưa chắc chắn (ví dụ dòng 1-2 xuống dòng còn dòng 3 là cơ quan, hoặc khoảng cách/kiểu chữ lệch)
-      const looksLike12Wrapped =
-        dy12 * 1.2 < dy23 &&
-        Math.abs(line1.xCenter - line2.xCenter) <= 0.045 &&
-        isMostlyUppercaseLine(line3.text);
-
-      if (looksLike12Wrapped && !dividerBelow3) {
-        issuingAgency = line3.text;
-        agencyUsedLines = [line3];
-      } else if (bothUpper23) {
-        issuingAgency = `${line2.text} ${line3.text}`.replace(/\s+/g, ' ').trim();
-        agencyUsedLines = [line2, line3];
-      } else {
-        issuingAgency = line2.text;
-        agencyUsedLines = [line2];
-      }
+      parentAgency = line1.text;
+      parentUsedLines = [line1];
+      issuingAgency = `${line2.text} ${line3.text}`.replace(/\s+/g, ' ').trim();
+      agencyUsedLines = [line2, line3];
       agencyNeedsReview = true;
       agencyReviewReason =
-        'Khối tên cơ quan ban hành có 3 dòng nhưng chưa đủ chắc chắn phần xuống dòng, vui lòng kiểm tra và chỉnh sửa nếu cần.';
+        'Khối tên cơ quan ban hành có 3 dòng, vui lòng kiểm tra lại phần cơ quan chủ quản và cơ quan ban hành.';
     }
   } else {
-    // >= 4 dòng phía trên Số:
-    const tail = rawAgencyLines.slice(1);
-    issuingAgency = tail.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim();
-    agencyUsedLines = tail;
-    agencyNeedsReview = true;
-    agencyReviewReason = `Khối tên cơ quan ban hành có ${rawAgencyLines.length} dòng phía trên dòng Số:, vui lòng kiểm tra và xác nhận đúng cơ quan ban hành.`;
+    // >= 4 dòng: gom thành cụm theo khoảng cách hoặc từ khóa cơ quan
+    const clusters: NormalizedLine[][] = [[rawAgencyLines[0]]];
+    const gaps: number[] = [];
+    for (let i = 1; i < rawAgencyLines.length; i++) {
+      gaps.push(Math.max(0.002, rawAgencyLines[i].yCenter - rawAgencyLines[i - 1].yCenter));
+    }
+    const minGap = Math.min(...gaps);
+    for (let i = 1; i < rawAgencyLines.length; i++) {
+      const prev = rawAgencyLines[i - 1];
+      const cur = rawAgencyLines[i];
+      const gap = cur.yCenter - prev.yCenter;
+      const newCluster =
+        hasDividerBetween(prev.yCenter, cur.yCenter) ||
+        startsWithAgencyNoun(cur.text) ||
+        (gap > minGap * 1.45 && !isWrappedAgencyContinuation(prev.text, cur.text));
+      if (newCluster) {
+        clusters.push([cur]);
+      } else {
+        clusters[clusters.length - 1].push(cur);
+      }
+    }
+    if (clusters.length === 2) {
+      parentUsedLines = clusters[0];
+      agencyUsedLines = clusters[1];
+      parentAgency = parentUsedLines.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+      issuingAgency = agencyUsedLines.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+    } else if (clusters.length === 1) {
+      agencyUsedLines = clusters[0];
+      issuingAgency = agencyUsedLines.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+    } else {
+      parentUsedLines = clusters[0];
+      agencyUsedLines = clusters.slice(1).flat();
+      parentAgency = parentUsedLines.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+      issuingAgency = agencyUsedLines.map((l) => l.text).join(' ').replace(/\s+/g, ' ').trim();
+      agencyNeedsReview = true;
+      agencyReviewReason = `Khối tên cơ quan có ${rawAgencyLines.length} dòng phía trên dòng Số, vui lòng kiểm tra lại.`;
+    }
   }
 
   return {
+    parentAgency,
+    parentAgencyBBox: unionLineBBoxes(parentUsedLines),
     issuingAgency,
     agencyBBox: unionLineBBoxes(agencyUsedLines),
     agencyNeedsReview,
@@ -1338,6 +1600,7 @@ function analyzeTopLeftHeader(
     topLeftHeaderDocNumbers: headerSoNumbers,
     rightTopText,
     leftTopText,
+    splitX,
   };
 }
 
@@ -1375,70 +1638,115 @@ function capitalizeSentenceStart(str: string): string {
   return s.charAt(0).toUpperCase() + s.slice(1);
 }
 
-function extractSubjectAndTitle(page1Text: string): {
+function extractSubjectAndTitle(
+  page1Boxes: NormalizedBox[],
+  page1Text: string
+): {
   docName: string;
   title: string;
   hasVv: boolean;
+  docNameBBox?: NormalizedBBox;
+  titleBBox?: NormalizedBBox;
 } {
-  const lines = page1Text
-    .split('\n')
-    .map((l) => l.trim())
-    .filter(Boolean);
+  const boxLines =
+    page1Boxes.length > 0
+      ? groupBoxesIntoLines(page1Boxes).filter((l) => !l.isDivider)
+      : page1Text
+          .split('\n')
+          .map((l) => l.trim())
+          .filter(Boolean)
+          .map((text, idx) => ({
+            text,
+            x0: 0.1,
+            x1: 0.9,
+            xCenter: 0.5,
+            y0: idx * 0.03,
+            y1: idx * 0.03 + 0.02,
+            yCenter: idx * 0.03 + 0.01,
+            avgHeight: 0.015,
+            fontNames: [],
+            words: [],
+            isDivider: false,
+          }));
 
   // 1. Ưu tiên tìm dòng "V/v" hoặc "Về việc" (công văn)
-  for (let i = 0; i < lines.length; i++) {
-    const vvMatch = lines[i].match(/^(?:[-•*]\s*)?(?:V\/v|V[ềe]\s+vi[ệe]c)\s*[:\-]?\s*(.*)$/i);
+  for (let i = 0; i < boxLines.length; i++) {
+    const vvMatch = boxLines[i].text.match(/^(?:[-•*]\s*)?(?:V\/v|V[ềe]\s+vi[ệe]c)\s*[:\-]?\s*(.*)$/i);
     if (vvMatch) {
       const parts: string[] = [];
+      const usedTitleLines: NormalizedLine[] = [boxLines[i]];
       if (vvMatch[1]?.trim()) parts.push(vvMatch[1].trim());
-      for (let j = i + 1; j < Math.min(i + 4, lines.length); j++) {
-        const nextLine = lines[j];
-        const normNext = removeVietnameseDiacritics(nextLine);
+      for (let j = i + 1; j < Math.min(i + 6, boxLines.length); j++) {
+        const nextLine = boxLines[j];
+        const prevLine = boxLines[j - 1];
+        if (nextLine.yCenter - prevLine.yCenter > 0.045) break;
+        const normNext = removeVietnameseDiacritics(nextLine.text);
         if (
-          /^(Kinh gui|Can cu|Thuc hien|Theo|I\.|1\.|Noi nhan|Doc lap)/i.test(normNext) ||
-          /^[A-ZĐÂĂÊÔƠƯ\s]{8,}$/.test(nextLine)
+          /^(Kinh gui|Can cu|Thuc hien|Theo |I\.|1\.|Noi nhan|Doc lap|Dieu \d+)/i.test(normNext) ||
+          (/^[A-ZĐÂĂÊÔƠƯ\s]{8,}$/.test(nextLine.text) && nextLine.text.length >= 12)
         ) {
           break;
         }
-        parts.push(nextLine);
+        parts.push(nextLine.text);
+        usedTitleLines.push(nextLine);
       }
       const afterVv = capitalizeSentenceStart(parts.join(' ').replace(/\s+/g, ' ').trim());
       if (afterVv) {
-        const prevHeading = i > 0 ? lines[i - 1] : '';
-        const isHeading = /^(KE HOACH|QUYET DINH|THONG BAO|BAO CAO|TO TRINH|CHUONG TRINH|HUONG DAN|GIAY MOI)$/i.test(
-          removeVietnameseDiacritics(prevHeading)
-        );
+        const prevHeading = i > 0 ? boxLines[i - 1] : null;
+        const isHeading = prevHeading
+          ? /^(KE HOACH|QUYET DINH|THONG BAO|BAO CAO|TO TRINH|CHUONG TRINH|HUONG DAN|GIAY MOI)$/i.test(
+              removeVietnameseDiacritics(prevHeading.text)
+            )
+          : false;
+        const docNameLines = isHeading && prevHeading ? [prevHeading, ...usedTitleLines] : usedTitleLines;
         return {
-          docName: isHeading ? `${prevHeading} ${afterVv}` : afterVv,
+          docName: isHeading && prevHeading ? `${prevHeading.text} ${afterVv}`.replace(/\s+/g, ' ').trim() : afterVv,
           title: afterVv,
           hasVv: true,
+          docNameBBox: unionLineBBoxes(docNameLines),
+          titleBBox: unionLineBBoxes(usedTitleLines),
         };
       }
     }
   }
 
-  // 2. Nếu không có "V/v", tìm tiêu đề văn bản in hoa (KẾ HOẠCH / QUYẾT ĐỊNH / THÔNG BÁO...) + dòng trích yếu ngay sau
+  // 2. Nếu không có "V/v", tìm tiêu đề loại văn bản in hoa (QUYẾT ĐỊNH / KẾ HOẠCH / THÔNG BÁO...) + dòng tên/trích yếu ngay sau
   const headingKeywords =
-    /^(KE HOACH|QUYET DINH|THONG BAO|BAO CAO|CHUONG TRINH|HUONG DAN|TO TRINH|QUY CHE|GIAY MOI|THU MOI|CONG VAN)\b/i;
-  for (let i = 0; i < lines.length; i++) {
-    if (headingKeywords.test(removeVietnameseDiacritics(lines[i]))) {
+    /^(KE HOACH|QUYET DINH|THONG BAO|BAO CAO|CHUONG TRINH|HUONG DAN|TO TRINH|QUY CHE|GIAY MOI|THU MOI|CONG VAN|NGHI QUYET|CHI THI)\b(?!\s*:)/i;
+  const subStopRegex =
+    /^(Can cu|Kinh gui|Dieu \d+|I\.|1\.|So\s*[:.]|Noi nhan|Thuc hien|Theo |Xet de nghi|Ban chap hanh|Uy ban nhan dan|Giam doc\b|Pho giam doc\b|Hieu truong\b|Chu tich\b|Truong phong\b)/i;
+
+  for (let i = 0; i < boxLines.length; i++) {
+    const curLine = boxLines[i];
+    const normCur = removeVietnameseDiacritics(curLine.text);
+    // Bỏ qua khối tiêu đề cơ quan/quốc hiệu quá cao nếu chưa qua dòng quốc hiệu/Số
+    if (curLine.yCenter < 0.14) continue;
+    if (headingKeywords.test(normCur)) {
       const subParts: string[] = [];
-      for (let j = i + 1; j < Math.min(i + 3, lines.length); j++) {
-        const normSub = removeVietnameseDiacritics(lines[j]);
+      const subLines: NormalizedLine[] = [];
+      for (let j = i + 1; j < Math.min(i + 7, boxLines.length); j++) {
+        const cand = boxLines[j];
+        const prev = boxLines[j - 1];
+        if (cand.yCenter - prev.yCenter > 0.045) break;
+        const normSub = removeVietnameseDiacritics(cand.text);
         if (
-          /^(Can cu|Kinh gui|Dieu 1|I\.|1\.|So\s*:|Noi nhan|Thuc hien|Theo )/i.test(normSub) ||
-          SIGNER_ROLE_REGEX.test(normSub)
+          subStopRegex.test(normSub) ||
+          SIGNER_ROLE_REGEX.test(normSub) ||
+          isDividerLineText(cand.text)
         ) {
           break;
         }
-        subParts.push(lines[j]);
+        subParts.push(cand.text);
+        subLines.push(cand);
       }
       const subtitle = subParts.join(' ').replace(/\s+/g, ' ').trim();
-      const combined = [lines[i], subtitle].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
+      const combined = [curLine.text, subtitle].filter(Boolean).join(' ').replace(/\s+/g, ' ').trim();
       return {
         docName: combined,
         title: subtitle || combined,
         hasVv: false,
+        docNameBBox: unionLineBBoxes([curLine, ...subLines]),
+        titleBBox: unionLineBBoxes(subLines.length > 0 ? subLines : [curLine]),
       };
     }
   }
@@ -1452,20 +1760,20 @@ function isAppendixPage(text: string): boolean {
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean)
-    .slice(0, 6);
+    .slice(0, 8);
 
   for (let i = 0; i < topLines.length; i++) {
     const line = removeVietnameseDiacritics(topLines[i]);
     if (
-      /^(?:PHU\s*LUC(?:\s*[IVXLCDM0-9]+|\b)|DANH\s*SACH\s*KEM\s*THEO|BANG\s*(?:KEM\s*THEO|PHAN\s*CONG|TONG\s*HOP|DU\s*TOAN|THEO\s*DOI)|BIEU\s*MAU|MAU\s*SO)\b/i.test(
+      /^(?:PHU\s*LUC(?:\s*[IVXLCDM0-9]+|\b)|THE\s*LE(?:\b|\s+CUOC\s+THI)|QUY\s*CHE\s*(?:KEM\s*THEO|DINH\s*KEM)|DANH\s*SACH\s*KEM\s*THEO|BANG\s*(?:KEM\s*THEO|PHAN\s*CONG|TONG\s*HOP|DU\s*TOAN|THEO\s*DOI)|BIEU\s*MAU|MAU\s*SO)\b/i.test(
         line
       )
     ) {
       return true;
     }
     if (
-      i < 4 &&
-      /^\(?\s*(?:Ban\s+hanh\s+)?kem\s+theo\s+(?:Cong\s+van|Quyet\s+dinh|Ke\s+hoach|Thong\s+bao|To\s+trinh|Huong\s+dan|Chuong\s+trinh)\s+so\b/i.test(
+      i < 5 &&
+      /^\(?\s*(?:Ban\s+hanh\s+)?kem\s+theo\s+(?:Cong\s+van|Quyet\s+dinh|Ke\s+hoach|Thong\s+bao|To\s+trinh|Huong\s+dan|Chuong\s+trinh)\b/i.test(
         line
       )
     ) {
@@ -1475,14 +1783,41 @@ function isAppendixPage(text: string): boolean {
   return false;
 }
 
+const DELEGATION_PREFIX_REGEX = /^(?:KT\.|TM\.|Q\.|TL\.|TUQ\.)(?:\s|$)/i;
+
+const CONCRETE_ROLE_REGEX =
+  /^(?:GIAM DOC|PHO GIAM DOC|CHU TICH|PHO CHU TICH|HIEU TRUONG|PHO HIEU TRUONG|BI THU|PHO BI THU|TRUONG PHONG|PHO TRUONG PHONG|CHANH VAN PHONG|PHO CHANH VAN PHONG|TRUONG BAN|PHO TRUONG BAN|THU TRUONG|CUC TRUONG|PHO CUC TRUONG|VU TRUONG|CHU NHIEM|PHO CHU NHIEM|BO TRUONG|THU TUONG|PHO THU TUONG|QUYEN HIEU TRUONG|QUYEN GIAM DOC|TONG BIEN TAP|PHO TONG BIEN TAP|UY VIEN)/i;
+
 const SIGNER_ROLE_REGEX =
-  /^(KT\.|TM\.|Q\.|TL\.|TUQ\.|GIAM DOC|PHO GIAM DOC|CHU TICH|PHO CHU TICH|HIEU TRUONG|PHO HIEU TRUONG|BI THU|PHO BI THU|TRUONG PHONG|PHO TRUONG PHONG|CHANH VAN PHONG|PHO CHANH VAN PHONG|TRUONG BAN|PHO TRUONG BAN|THU TRUONG|CUC TRUONG|PHO CUC TRUONG|VU TRUONG|CHU NHIEM|PHO CHU NHIEM|BO TRUONG|UY VIEN)/i;
+  /^(?:KT\.|TM\.|Q\.|TL\.|TUQ\.|GIAM DOC|PHO GIAM DOC|CHU TICH|PHO CHU TICH|HIEU TRUONG|PHO HIEU TRUONG|BI THU|PHO BI THU|TRUONG PHONG|PHO TRUONG PHONG|CHANH VAN PHONG|PHO CHANH VAN PHONG|TRUONG BAN|PHO TRUONG BAN|THU TRUONG|CUC TRUONG|PHO CUC TRUONG|VU TRUONG|CHU NHIEM|PHO CHU NHIEM|BO TRUONG|THU TUONG|PHO THU TUONG|QUYEN HIEU TRUONG|QUYEN GIAM DOC|TONG BIEN TAP|PHO TONG BIEN TAP|UY VIEN)/i;
 
 const NON_NAME_LINE_REGEX =
-  /^(CONG HOA|DOC LAP|NOI NHAN|DA KY|SO GIAO DUC|UY BAN NHAN DAN|THANH PHO|TINH |TRUONG THPT|DOAN TRUONG|PHONG GIAO DUC|BO GIAO DUC|PHU LUC)/i;
+  /^(CONG HOA|DOC LAP|NOI NHAN|DA KY|SO GIAO DUC|UY BAN NHAN DAN|THANH PHO|TINH |TRUONG THPT|DOAN TRUONG|PHONG GIAO DUC|BO GIAO DUC|PHU LUC|THE LE|KT\.|TM\.|TL\.|TUQ\.|Q\.|BAN GIAM HIEU|BAN TO CHUC)/i;
 
 const SKIP_SIG_LINE_REGEX =
-  /^(Noi nhan|Luu|-\s*Nhu tren|Kinh gui|Ngay ky|Thoi gian ky|\(?Da ky\)?|\(?Ky,?\s*(?:ghi ro ho ten|dong dau|ten).*?\)?)/i;
+  /^(Noi nhan|Luu|-\s*Nhu tren|Kinh gui|Ngay ky|Thoi gian ky|Ky boi|\(?Da ky\)?|\(?Ky,?\s*(?:ghi ro ho ten|dong dau|ten).*?\)?)/i;
+
+function cleanOcrStampNoiseFromName(rawLine: string): string {
+  return (rawLine || '')
+    .replace(/^[\s\-–—•*·|~`'":;.,()\[\]{}\/\\0-9]+/, '')
+    .replace(/[\s\-–—•*·|~`'":;.,()\[\]{}\/\\0-9]+$/, '')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function chooseBestSignerRole(roleLines: string[]): string {
+  const cleaned = roleLines.map((r) => r.trim()).filter(Boolean);
+  if (cleaned.length === 0) return '';
+  // Ưu tiên chức vụ cụ thể (vd "PHÓ GIÁM ĐỐC") thay vì dòng ủy quyền ("KT. GIÁM ĐỐC")
+  const concrete = cleaned.filter((r) => {
+    const norm = removeVietnameseDiacritics(r);
+    return !DELEGATION_PREFIX_REGEX.test(norm) && CONCRETE_ROLE_REGEX.test(norm);
+  });
+  if (concrete.length > 0) {
+    return concrete[concrete.length - 1];
+  }
+  return cleaned.join(' - ');
+}
 
 function extractSignersFromZoneText(
   zoneText: string,
@@ -1497,12 +1832,13 @@ function extractSignersFromZoneText(
   );
   for (const dm of digitalMatches) {
     const candName = dm[1].replace(/\([^)]*\)/g, '').trim();
-    if (candName.length >= 4) {
+    const normCand = removeVietnameseDiacritics(candName);
+    if (candName.length >= 4 && !DELEGATION_PREFIX_REGEX.test(normCand) && !SIGNER_ROLE_REGEX.test(normCand)) {
       found.push({ name: candName, role: '', page: pageNumber });
     }
   }
 
-  // 2. Khối chức vụ + tên người ký bên dưới
+  // 2. Khối chức vụ + tên người ký bên dưới (chịu nhiễu con dấu đỏ / chữ ký chồng lên)
   const lines = zoneText
     .split('\n')
     .map((l) => l.trim())
@@ -1513,21 +1849,23 @@ function extractSignersFromZoneText(
     if (SIGNER_ROLE_REGEX.test(normLine)) {
       const roleParts = [lines[i]];
       let nameLine = '';
-      for (let j = i + 1; j < Math.min(i + 8, lines.length); j++) {
-        const l = lines[j];
+      for (let j = i + 1; j < Math.min(i + 15, lines.length); j++) {
+        const rawL = lines[j];
+        const l = cleanOcrStampNoiseFromName(rawL);
         const normL = removeVietnameseDiacritics(l);
-        if (SKIP_SIG_LINE_REGEX.test(normL)) {
+        if (!l || SKIP_SIG_LINE_REGEX.test(normL)) {
           continue;
         }
-        if (SIGNER_ROLE_REGEX.test(normL) && j <= i + 2) {
+        if (SIGNER_ROLE_REGEX.test(normL) && j <= i + 3) {
           roleParts.push(l);
           continue;
         }
-        // Tên người Việt: 2-5 từ bắt đầu chữ hoa, không chứa số hoặc dấu câu dài
-        if (
-          /^[\p{Lu}][\p{L}]+(?:\s+[\p{Lu}][\p{L}]+){1,4}$/u.test(l) &&
-          !NON_NAME_LINE_REGEX.test(normL)
-        ) {
+        // Bỏ qua các mảnh chữ rời hoặc nhiễu con dấu (vd: 1-2 ký tự, hoặc toàn chữ hoa tên cơ quan)
+        if (DELEGATION_PREFIX_REGEX.test(normL) || NON_NAME_LINE_REGEX.test(normL) || SIGNER_ROLE_REGEX.test(normL)) {
+          continue;
+        }
+        // Tên người Việt: 2-6 từ bắt đầu chữ hoa (Title Case hoặc có dấu), không chứa số
+        if (/^[\p{Lu}][\p{L}]+(?:\s+[\p{Lu}][\p{L}]+){1,5}$/u.test(l) && !isMostlyUppercaseLine(l)) {
           nameLine = l;
           break;
         }
@@ -1535,7 +1873,7 @@ function extractSignersFromZoneText(
       if (nameLine) {
         found.push({
           name: nameLine,
-          role: roleParts.join(' - '),
+          role: chooseBestSignerRole(roleParts),
           page: pageNumber,
         });
       }
@@ -1593,9 +1931,16 @@ function extractSignerInfo(
   }
 
   for (const rs of rawSigSigners) {
-    if (rs && !candidates.some((c) => c.name.toLowerCase() === rs.toLowerCase())) {
+    const cleanRs = rs.trim();
+    const normRs = removeVietnameseDiacritics(cleanRs);
+    if (
+      cleanRs &&
+      !DELEGATION_PREFIX_REGEX.test(normRs) &&
+      !SIGNER_ROLE_REGEX.test(normRs) &&
+      !candidates.some((c) => c.name.toLowerCase() === cleanRs.toLowerCase())
+    ) {
       candidates.push({
-        name: rs,
+        name: cleanRs,
         role: '',
         page: signaturePages[0]?.pageNumber || 1,
       });
@@ -1619,176 +1964,8 @@ function extractSignerInfo(
   };
 }
 
-const ACTION_LINE_REGEX =
-  /\b(?:bao cao|nop|gui|hoan thanh|thuc hien|trien khai|tham du|to chuc|dang ky|cu|ra soat|tong hop|cap nhat|phan cong|chuan bi|lap danh sach|de nghi|yeu cau|thong bao cho)\b/i;
-
-const EXPLICIT_DEADLINE_REGEX =
-  /(?:truoc\s+ngay|cham\s+nhat(?:\s+la)?\s+ngay|han\s+cuoi(?:\s+la)?(?:\s+ngay)?|han\s+nop(?:\s+la)?(?:\s+ngay)?|den\s+het\s+ngay|tu\s+ngay\s+\d{1,2}[\/\-\.]\d{1,2}[\/\-\.]\d{2,4}\s+den(?:\s+het)?\s+ngay|ngay\s+het\s+han(?:\s+la)?(?:\s+ngay)?)\s*[:\-]?\s*(?:ngay\s+)?(\d{1,2})\s*(?:[\/\-\.]|\s+thang\s+)\s*(\d{1,2})\s*(?:[\/\-\.]|\s+nam\s+)\s*(\d{2,4})/gi;
-
-const RELATIVE_DEADLINE_REGEX =
-  /(?:trong\s+(?:vong\s+)?\d+\s*(?:ngay|tuan|thang)(?:\s+lam\s+viec)?(?:\s+ke\s+tu\s+ngay[^.,;\n]*)?|sau\s+\d+\s*(?:ngay|tuan|thang)[^.,;\n]*|trong\s+thoi\s+han\s+\d+\s*(?:ngay|tuan|thang)[^.,;\n]*|ngay\s+sau\s+khi\s+nhan\s+duoc[^.,;\n]*|truoc\s+khi\s+(?:bat\s+dau|khai\s+mac|to\s+chuc)[^.,;\n]*)/gi;
-
-function extractDocumentRecipients(pageTexts: PdfPageContent[]): string {
-  const recipients: string[] = [];
-  for (const p of pageTexts) {
-    const lines = p.text
-      .split('\n')
-      .map((l) => l.trim())
-      .filter(Boolean);
-    for (let i = 0; i < lines.length; i++) {
-      const norm = removeVietnameseDiacritics(lines[i]);
-      const m = lines[i].match(/^(?:Kính\s+gửi|Nơi\s+nhận|Thành\s+phần|Đơn\s+vị\s+thực\s+hiện)\s*[:\-]\s*(.*)$/i);
-      if (m) {
-        const inline = (m[1] || '').replace(/;$/, '').trim();
-        if (inline && !/^như\s+trên$/i.test(inline)) {
-          recipients.push(inline);
-        }
-        for (let j = i + 1; j < Math.min(i + 5, lines.length); j++) {
-          const next = lines[j];
-          const normNext = removeVietnameseDiacritics(next);
-          if (/^(?:Luu|KT\.|TM\.|BI THU|HIEU TRUONG|CONG HOA|DIEU \d+)/i.test(normNext)) break;
-          if (/^[-•+]\s*/.test(next)) {
-            const cleanItem = next.replace(/^[-•+]\s*/, '').replace(/[;.]$/, '').trim();
-            if (cleanItem && !/^luu\b/i.test(removeVietnameseDiacritics(cleanItem)) && !/^nhu tren$/i.test(removeVietnameseDiacritics(cleanItem))) {
-              recipients.push(cleanItem);
-            }
-          } else {
-            break;
-          }
-        }
-      } else if (/^(?:Kinh\s+gui)\s*[:\-]/i.test(norm) && recipients.length === 0) {
-        recipients.push(lines[i].replace(/^Kính\s+gửi\s*[:\-]?\s*/i, '').trim());
-      }
-    }
-  }
-  const unique = Array.from(new Set(recipients.map((r) => r.trim()).filter((r) => r.length >= 2)));
-  return unique.slice(0, 4).join('; ');
-}
-
-function summarizeTaskTitleFromSegment(segment: string): string {
-  const cleaned = segment
-    .replace(/\s+/g, ' ')
-    .replace(/^[-•*\d.)\s]+/, '')
-    .trim();
-  if (!cleaned) return 'Thực hiện nội dung theo văn bản';
-  if (cleaned.length <= 140) return cleaned;
-  return cleaned.slice(0, 137).trim() + '...';
-}
-
-export function extractPdfTaskSuggestions(pageTexts: PdfPageContent[]): PdfTaskSuggestion[] {
-  const suggestions: PdfTaskSuggestion[] = [];
-  const defaultRecipient = extractDocumentRecipients(pageTexts);
-  const seenKeys = new Set<string>();
-
-  for (const pageEntry of pageTexts) {
-    const rawText = (pageEntry.text || '').trim();
-    if (!rawText) continue;
-
-    // Tách theo câu/dòng giữ ngữ cảnh gọn
-    const sentences = rawText
-      .replace(/\r/g, '\n')
-      .split(/(?<=[.;!\n])\s+|\n+/)
-      .map((s) => s.replace(/\s+/g, ' ').trim())
-      .filter((s) => s.length >= 12);
-
-    for (let idx = 0; idx < sentences.length; idx++) {
-      const sentence = sentences[idx];
-      const norm = removeVietnameseDiacritics(sentence);
-
-      // Bỏ qua dòng tiêu đề/ngày ban hành ở đầu trang hoặc dòng lưu văn thư
-      if (/^(?:CONG HOA|DOC LAP|SO\s*:|NGAY\s+\d+|LUU\s*:)/i.test(norm)) continue;
-
-      // Tìm hạn nộp rõ ràng có ngày cụ thể dd/mm/yyyy
-      EXPLICIT_DEADLINE_REGEX.lastIndex = 0;
-      let explicitMatch: RegExpExecArray | null;
-      let matchedAnyDeadline = false;
-
-      while ((explicitMatch = EXPLICIT_DEADLINE_REGEX.exec(norm)) !== null) {
-        matchedAnyDeadline = true;
-        const dd = explicitMatch[1].padStart(2, '0');
-        const mm = explicitMatch[2].padStart(2, '0');
-        let yyyy = explicitMatch[3];
-        if (yyyy.length === 2) yyyy = `20${yyyy}`;
-        const dueDate = normalizeDateOnlyDdMmYyyy(`${dd}/${mm}/${yyyy}`);
-        if (!dueDate) continue;
-
-        const key = `${pageEntry.page}|${dueDate}|${norm.slice(0, 40)}`;
-        if (seenKeys.has(key)) continue;
-        seenKeys.add(key);
-
-        const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 6);
-        suggestions.push({
-          id: `sug-p${pageEntry.page}-${suggestions.length + 1}-${hash}`,
-          taskTitle: summarizeTaskTitleFromSegment(sentence),
-          dueDate,
-          rawDeadlineText: sentence.slice(explicitMatch.index, explicitMatch.index + explicitMatch[0].length).trim() || dueDate,
-          needsConfirmation: false,
-          recipient: defaultRecipient || undefined,
-          sourceExcerpt: sentence,
-          page: pageEntry.page,
-        });
-      }
-
-      // Tìm hạn tương đối / chưa rõ ngày cụ thể (vd: "trong 05 ngày kể từ ngày nhận")
-      RELATIVE_DEADLINE_REGEX.lastIndex = 0;
-      let relMatch: RegExpExecArray | null;
-      while ((relMatch = RELATIVE_DEADLINE_REGEX.exec(norm)) !== null) {
-        matchedAnyDeadline = true;
-        const phraseStart = relMatch.index;
-        const phraseEnd = phraseStart + relMatch[0].length;
-        const exactPhrase = sentence.slice(phraseStart, phraseEnd).trim() || relMatch[0];
-        const key = `${pageEntry.page}|REL|${removeVietnameseDiacritics(exactPhrase).slice(0, 40)}`;
-        if (seenKeys.has(key)) continue;
-        seenKeys.add(key);
-
-        const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 6);
-        suggestions.push({
-          id: `sug-p${pageEntry.page}-${suggestions.length + 1}-${hash}`,
-          taskTitle: summarizeTaskTitleFromSegment(sentence),
-          dueDate: '',
-          rawDeadlineText: exactPhrase,
-          needsConfirmation: true,
-          recipient: defaultRecipient || undefined,
-          sourceExcerpt: sentence,
-          page: pageEntry.page,
-        });
-      }
-
-      // Nếu không bắt được từ khóa hạn nộp nhưng câu có động từ yêu cầu rõ ràng + ngày dd/mm/yyyy
-      if (!matchedAnyDeadline && ACTION_LINE_REGEX.test(norm)) {
-        const inlineDateMatch = sentence.match(/\b(\d{1,2})[\/\-](\d{1,2})[\/\-](\d{4})\b/);
-        if (inlineDateMatch) {
-          const dueDate = normalizeDateOnlyDdMmYyyy(
-            `${inlineDateMatch[1].padStart(2, '0')}/${inlineDateMatch[2].padStart(2, '0')}/${inlineDateMatch[3]}`
-          );
-          if (dueDate) {
-            const key = `${pageEntry.page}|ACT|${dueDate}|${norm.slice(0, 35)}`;
-            if (!seenKeys.has(key)) {
-              seenKeys.add(key);
-              const hash = crypto.createHash('md5').update(key).digest('hex').slice(0, 6);
-              suggestions.push({
-                id: `sug-p${pageEntry.page}-${suggestions.length + 1}-${hash}`,
-                taskTitle: summarizeTaskTitleFromSegment(sentence),
-                dueDate,
-                rawDeadlineText: inlineDateMatch[0],
-                needsConfirmation: true,
-                recipient: defaultRecipient || undefined,
-                sourceExcerpt: sentence,
-                page: pageEntry.page,
-              });
-            }
-          }
-        }
-      }
-    }
-  }
-
-  return suggestions;
-}
-
 export async function extractPdfPageContentsForIndex(buffer: Buffer): Promise<{
   pageTexts: PdfPageContent[];
-  taskSuggestions: PdfTaskSuggestion[];
 }> {
   const { pageCount, pages } = await extractPdfTextWithPdfJs(buffer);
   const pageTextByNum = new Map<number, string>();
@@ -1825,8 +2002,104 @@ export async function extractPdfPageContentsForIndex(buffer: Buffer): Promise<{
 
   return {
     pageTexts,
-    taskSuggestions: extractPdfTaskSuggestions(pageTexts),
   };
+}
+
+interface GeminiExtractedMetadata {
+  docNumber?: string;
+  parentAgency?: string;
+  issuingAgency?: string;
+  docName?: string;
+  title?: string;
+  topRightDate?: string;
+  signatureDate?: string;
+  signer?: string;
+  signerRole?: string;
+}
+
+async function extractMetadataWithGemini(params: {
+  pdfBuffer: Buffer;
+  page1Text: string;
+  signaturePageText: string;
+  signaturePageNumber: number;
+  pageCount: number;
+}): Promise<GeminiExtractedMetadata | null> {
+  const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+  if (!apiKey) return null;
+
+  try {
+    const { GoogleGenAI, Type } = await import('@google/genai');
+    const ai = new GoogleGenAI({
+      apiKey,
+      httpOptions: {
+        headers: {
+          'User-Agent': 'aistudio-build',
+        },
+      },
+    });
+
+    const parts: any[] = [];
+    if (params.pdfBuffer.length <= 8 * 1024 * 1024) {
+      parts.push({
+        inlineData: {
+          mimeType: 'application/pdf',
+          data: params.pdfBuffer.toString('base64'),
+        },
+      });
+    }
+
+    const promptText = [
+      'Bạn là hệ thống trích xuất thông tin hành chính văn bản tiếng Việt của trường học.',
+      'CHỈ trích xuất 5 nhóm thông tin hành chính sau đây (KHÔNG trích xuất thời hạn xử lý, hạn nộp, nơi nhận, người phụ trách hay danh sách công việc):',
+      '1. docNumber: Số/ký hiệu gốc ở dòng "Số" góc trên bên trái trang 1. Ghép các cụm bị tách khoảng trắng, chuẩn hóa dạng "2937/QĐ-SGDĐT" (kể cả khi bản gốc viết "Số2937 /QĐ-SGDĐT"), giữ nguyên số 0 ở đầu nếu có. Không lấy số văn bản được viện dẫn trong phần Căn cứ/nội dung.',
+      '2. parentAgency & issuingAgency: Khối tên cơ quan góc trên bên trái trang 1 phía trên dòng Số. Nếu có 2 cấp cơ quan (vd cấp 1 UBND TỈNH AN GIANG, cấp 2 SỞ GIÁO DỤC VÀ ĐÀO TẠO), đưa cấp 1 vào parentAgency và cấp 2 vào issuingAgency; ghép các dòng xuống hàng thuộc cùng một tên cơ quan. Nếu chỉ có 1 cấp thì để parentAgency rỗng.',
+      '3. docName & title: Tên văn bản đầy đủ bằng cách nối tiêu đề loại văn bản (vd QUYẾT ĐỊNH, KẾ HOẠCH...) với dòng trích yếu bên dưới, bỏ xuống dòng và khoảng trắng thừa. Nếu là công văn V/v thì title là nội dung sau V/v.',
+      '4. topRightDate & signatureDate: Tìm ngày tháng năm ban hành/ký ở HAI vị trí riêng biệt và chuẩn hóa về dd/MM/yyyy (không gồm giờ:phút:giây, trả về chuỗi rỗng nếu không có hoặc ngày không hợp lệ):',
+      '   - topRightDate: Ngày ở góc trên bên phải trang 1 phía dưới dòng Độc lập - Tự do - Hạnh phúc (kể cả khi thiếu khoảng trắng như "ngày10 tháng 11 năm 2026").',
+      '   - signatureDate: Ngày ở vùng chữ ký / cuối văn bản chính (hoặc Ngày ký chữ ký số), bỏ qua các trang Phụ lục / Thể lệ đính kèm phía sau. KHÔNG lấy ngày của văn bản viện dẫn hay lịch trình trong nội dung.',
+      '5. signer & signerRole: Họ tên người ký và chức vụ ở khối chữ ký cuối văn bản chính (bỏ qua các trang Phụ lục / Thể lệ kèm theo). Không nhầm chữ ký tắt/ký thay (KT., TL., TUQ., TM.) thành họ tên người ký; ưu tiên chức vụ thực tế của người ký (vd "PHÓ GIÁM ĐỐC").',
+      '',
+      `Tổng số trang PDF: ${params.pageCount}. Trang chữ ký chính ước tính: ${params.signaturePageNumber}.`,
+      params.page1Text ? `--- Văn bản đọc được từ Trang 1 ---\n${params.page1Text.slice(0, 3500)}` : '',
+      params.signaturePageText && params.signaturePageNumber > 1
+        ? `--- Văn bản đọc được từ Trang ${params.signaturePageNumber} ---\n${params.signaturePageText.slice(0, 3500)}`
+        : '',
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    parts.push({ text: promptText });
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-4-hydrogen',
+      contents: [{ role: 'user', parts }],
+      config: {
+        responseMimeType: 'application/json',
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            docNumber: { type: Type.STRING },
+            parentAgency: { type: Type.STRING },
+            issuingAgency: { type: Type.STRING },
+            docName: { type: Type.STRING },
+            title: { type: Type.STRING },
+            topRightDate: { type: Type.STRING },
+            signatureDate: { type: Type.STRING },
+            signer: { type: Type.STRING },
+            signerRole: { type: Type.STRING },
+          },
+        },
+      },
+    });
+
+    const rawText = (response.text || '').trim();
+    if (!rawText) return null;
+    const parsed = JSON.parse(rawText);
+    return parsed && typeof parsed === 'object' ? (parsed as GeminiExtractedMetadata) : null;
+  } catch (err: any) {
+    console.warn('[PDF Gemini] Không dùng được Gemini fallback/assist, tiếp tục với kết quả phân tích bố cục + OCR:', err?.message);
+    return null;
+  }
 }
 
 export async function analyzePdfBuffer(buffer: Buffer): Promise<{
@@ -1883,13 +2156,13 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     }
   }
 
-  // Nếu PDF scan nhiều trang (> 3) và các trang cuối là Phụ lục hoặc chưa có chữ ký, lùi thêm về các trang trước phụ lục
+  // Nếu PDF scan nhiều trang (> 3) và các trang cuối là Phụ lục / Thể lệ hoặc chưa có chữ ký, lùi thêm về các trang trước phụ lục
   if (pageCount > 3 && usedOcr) {
     const trailingHasNonAppendixSigner = [pageCount, pageCount - 1].some((pNum) => {
       const txt = pageTextByNum.get(pNum) || '';
       if (!txt || isAppendixPage(txt)) return false;
       const lines = txt.split('\n').filter(Boolean);
-      const bottomApprox = lines.slice(Math.floor(lines.length * 0.35)).join('\n');
+      const bottomApprox = lines.slice(Math.floor(lines.length * 0.30)).join('\n');
       return extractSignersFromZoneText(bottomApprox || txt, pNum).length > 0;
     });
 
@@ -1935,20 +2208,15 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     usedFallbackDocNumber = Boolean(docNumber);
   }
 
-  const issuingAgency =
+  let parentAgency = headerAnalysis.parentAgency;
+  let issuingAgency =
     headerAnalysis.issuingAgency || extractIssuingAgencyFallback(page1Text);
 
-  const issueDateSource = headerAnalysis.rightTopText || page1?.rightTopText || '';
-  const page1Top35Text =
-    page1Boxes.length > 0
-      ? boxesToText(page1Boxes.filter((b) => (b.y0 + b.y1) / 2 <= 0.35))
-      : page1Text.split('\n').slice(0, 10).join('\n');
-  const issueDate = normalizeDateOnlyDdMmYyyy(
-    extractIssueDate(issueDateSource) || extractIssueDate(page1Top35Text)
-  );
-  const { docName, title } = extractSubjectAndTitle(page1Text);
+  const subjectRes = extractSubjectAndTitle(page1Boxes, page1Text);
+  let docName = subjectRes.docName;
+  let title = subjectRes.title;
 
-  // 2. Xác định các trang ứng viên cho khối chữ ký: loại bỏ trang Phụ lục phía sau, quét lùi từ trang chính cuối về trang 1
+  // 2. Xác định các trang ứng viên cho khối chữ ký: loại bỏ trang Phụ lục / Thể lệ phía sau, quét lùi từ trang chính cuối về trang 1
   const orderedPageNums: number[] = [];
   for (let p = pageCount; p >= 1; p--) {
     orderedPageNums.push(p);
@@ -1959,15 +2227,25 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   });
   const appendixPages = orderedPageNums.filter((pNum) => !nonAppendixPages.includes(pNum));
 
+  const getBoxesForPage = (pNum: number): NormalizedBox[] => {
+    const pInfo = pages.find((p) => p.pageNumber === pNum);
+    if (pInfo && !isGarbledText(pInfo.fullText) && pInfo.boxes.length > 0) {
+      return pInfo.boxes;
+    }
+    return ocrBoxesByNum.get(pNum) || [];
+  };
+
   const buildZonePage = (pNum: number): SignatureZonePage => {
     const pInfo = pages.find((x) => x.pageNumber === pNum);
     const full = pageTextByNum.get(pNum) || '';
     const hasReliableSpans = Boolean(pInfo && !isGarbledText(pInfo.fullText));
 
     if (hasReliableSpans && pInfo) {
+      // Cho phép lệch nhẹ vùng ký (yCenter >= 0.30, x0 >= 0.35)
+      const widerRightBottom = pInfo.boxes.filter((b) => (b.y0 + b.y1) / 2 >= 0.30 && b.x0 >= 0.35);
       return {
         pageNumber: pNum,
-        rightBottomText: pInfo.rightBottomText,
+        rightBottomText: boxesToText(widerRightBottom) || pInfo.rightBottomText,
         rightHalfText: pInfo.rightHalfText,
         bottomText: pInfo.bottomText,
         fullText: full,
@@ -1977,9 +2255,9 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
 
     const ocrBoxes = ocrBoxesByNum.get(pNum) || [];
     if (ocrBoxes.length > 0) {
-      const rightBottomBoxes = ocrBoxes.filter((b) => (b.y0 + b.y1) / 2 >= 0.35 && b.x0 >= 0.40);
-      const rightHalfBoxes = ocrBoxes.filter((b) => b.x0 >= 0.40);
-      const bottomBoxes = ocrBoxes.filter((b) => (b.y0 + b.y1) / 2 >= 0.35);
+      const rightBottomBoxes = ocrBoxes.filter((b) => (b.y0 + b.y1) / 2 >= 0.30 && b.x0 >= 0.35);
+      const rightHalfBoxes = ocrBoxes.filter((b) => b.x0 >= 0.35);
+      const bottomBoxes = ocrBoxes.filter((b) => (b.y0 + b.y1) / 2 >= 0.30);
       return {
         pageNumber: pNum,
         rightBottomText: boxesToText(rightBottomBoxes),
@@ -1991,7 +2269,7 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     }
 
     const ocrLines = full.split('\n').map((l) => l.trim()).filter(Boolean);
-    const ocrBottom = ocrLines.slice(Math.floor(ocrLines.length * 0.35)).join('\n');
+    const ocrBottom = ocrLines.slice(Math.floor(ocrLines.length * 0.30)).join('\n');
     return {
       pageNumber: pNum,
       rightBottomText: '',
@@ -2006,14 +2284,127 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   if (!sigResult.signer && appendixPages.length > 0) {
     sigResult = extractSignerInfo(appendixPages.map(buildZonePage), rawSigSigners);
   }
-  const { signer, signerRole, signerCandidates, signaturePage } = sigResult;
+  let { signer, signerRole } = sigResult;
+  const { signerCandidates, signaturePage } = sigResult;
 
-  const allTexts = [
-    ...Array.from(pageTextByNum.values()),
-    ...pages.map((p) => p.annotationText).filter(Boolean),
-  ];
-  // Chỉ lưu ngày ký (dd/MM/yyyy) khi phát hiện riêng ngày ký; giữ trống nếu chỉ có ngày ban hành
-  const signDate = normalizeDateOnlyDdMmYyyy(extractSeparateSignDate(allTexts, rawSigDates));
+  // 3. Đối chiếu ngày ở HAI vị trí:
+  //    (1) Góc trên bên phải trang 1 dưới "Độc lập - Tự do - Hạnh phúc"
+  //    (2) Vùng chữ ký cuối văn bản chính (hoặc ngày ký chữ ký số)
+  let topRightDate = extractTopRightHeaderDate(
+    page1Boxes,
+    headerAnalysis.rightTopText || page1?.rightTopText || '',
+    headerAnalysis.splitX
+  );
+  const sigPageInfo = pages.find((p) => p.pageNumber === signaturePage);
+  let signatureDate = extractSignatureZoneDate({
+    signaturePage,
+    pageBoxes: getBoxesForPage(signaturePage),
+    annotationText: sigPageInfo?.annotationText || '',
+    rawSigDates,
+    signerPageText: pageTextByNum.get(signaturePage) || '',
+  });
+
+  // 4. Optional server-side Gemini assist (strictly 5 administrative metadata fields, only when GEMINI_API_KEY is configured)
+  let aiUsed = false;
+  const geminiResult = await extractMetadataWithGemini({
+    pdfBuffer: buffer,
+    page1Text,
+    signaturePageText: pageTextByNum.get(signaturePage) || '',
+    signaturePageNumber: signaturePage,
+    pageCount,
+  });
+
+  if (geminiResult) {
+    aiUsed = true;
+    const cleanGeminiDocNum = geminiResult.docNumber
+      ? extractDocNumberFromSoValue(geminiResult.docNumber.replace(/^S[ốo]\s*[:\.]?\s*/i, ''))
+      : '';
+    if (!docNumber && cleanGeminiDocNum) {
+      docNumber = cleanGeminiDocNum;
+    }
+    if (!parentAgency && geminiResult.parentAgency?.trim()) {
+      parentAgency = geminiResult.parentAgency.replace(/\s+/g, ' ').trim();
+    }
+    if (!issuingAgency && geminiResult.issuingAgency?.trim()) {
+      issuingAgency = geminiResult.issuingAgency.replace(/\s+/g, ' ').trim();
+    }
+    if (!docName && geminiResult.docName?.trim()) {
+      docName = geminiResult.docName.replace(/\s+/g, ' ').trim();
+    }
+    if (!title && geminiResult.title?.trim()) {
+      title = geminiResult.title.replace(/\s+/g, ' ').trim();
+    }
+    if (!signer && geminiResult.signer?.trim()) {
+      const candSigner = cleanOcrStampNoiseFromName(geminiResult.signer.trim());
+      const normCandSigner = removeVietnameseDiacritics(candSigner);
+      if (candSigner && !DELEGATION_PREFIX_REGEX.test(normCandSigner) && !SIGNER_ROLE_REGEX.test(normCandSigner)) {
+        signer = candSigner;
+      }
+    }
+    if (!signerRole && geminiResult.signerRole?.trim()) {
+      signerRole = geminiResult.signerRole.replace(/\s+/g, ' ').trim();
+    }
+
+    if (!topRightDate && geminiResult.topRightDate) {
+      const validGTop = normalizeDateOnlyDdMmYyyy(geminiResult.topRightDate);
+      if (validGTop) {
+        const bbox = findLinesBBoxByQuery(page1Boxes, validGTop, 0, 0.44);
+        topRightDate = {
+          date: validGTop,
+          positionLabel: 'Góc trên bên phải (Trang 1)',
+          page: 1,
+          ...(bbox ? { bbox } : { estimated: true }),
+          rawText: geminiResult.topRightDate,
+        };
+      }
+    }
+    if (!signatureDate && geminiResult.signatureDate) {
+      const validGSig = normalizeDateOnlyDdMmYyyy(geminiResult.signatureDate);
+      if (validGSig) {
+        const sigBoxesForLoc = getBoxesForPage(signaturePage);
+        const bbox = findLinesBBoxByQuery(sigBoxesForLoc, validGSig, 0.25, 1);
+        signatureDate = {
+          date: validGSig,
+          positionLabel: `Khối chữ ký (Trang ${signaturePage})`,
+          page: signaturePage,
+          ...(bbox ? { bbox } : { estimated: true }),
+          rawText: geminiResult.signatureDate,
+        };
+      }
+    }
+  }
+
+  // 5. Xử lý kết quả đối chiếu ngày ở 2 vị trí
+  const d1 = topRightDate?.date || '';
+  const d2 = signatureDate?.date || '';
+  let dateComparisonStatus: DateComparisonStatus = 'missing';
+  let documentDate = '';
+  let issueDate = '';
+  let signDate = '';
+
+  if (d1 && d2) {
+    if (d1 === d2) {
+      dateComparisonStatus = 'matched';
+      documentDate = d1;
+      issueDate = d1;
+      signDate = d2;
+    } else {
+      dateComparisonStatus = 'mismatch';
+      documentDate = '';
+      issueDate = '';
+      signDate = d2;
+    }
+  } else if (d1) {
+    dateComparisonStatus = 'single';
+    documentDate = d1;
+    issueDate = d1;
+    signDate = '';
+  } else if (d2) {
+    dateComparisonStatus = 'single';
+    documentDate = d2;
+    issueDate = d2;
+    signDate = d2;
+  }
 
   const reviewReasons: string[] = [];
   if (usedOcr) {
@@ -2032,15 +2423,21 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   } else if (usedFallbackDocNumber) {
     reviewReasons.push(
       fallbackDocNumbers.length > 1
-        ? `Chưa xác định rõ dòng "Số:" ở góc trên bên trái; phát hiện nhiều số trong trang đầu (${fallbackDocNumbers.join(', ')}), vui lòng kiểm tra đúng số gốc.`
-        : 'Chưa xác định rõ dòng "Số:" ngay dưới khối cơ quan ở góc trên bên trái, vui lòng kiểm tra lại Số/ký hiệu đã trích xuất.'
+        ? `Chưa xác định rõ dòng "Số" ở góc trên bên trái; phát hiện nhiều số trong trang đầu (${fallbackDocNumbers.join(', ')}), vui lòng kiểm tra đúng số gốc.`
+        : 'Chưa xác định rõ dòng "Số" ngay dưới khối cơ quan ở góc trên bên trái, vui lòng kiểm tra lại Số/ký hiệu đã trích xuất.'
     );
   }
   if (headerAnalysis.agencyNeedsReview && headerAnalysis.agencyReviewReason) {
     reviewReasons.push(headerAnalysis.agencyReviewReason);
   }
   if (!docName && !title) reviewReasons.push('Chưa nhận diện được Tên văn bản hoặc Trích yếu.');
-  if (!issueDate) reviewReasons.push('Chưa nhận diện được Ngày ban hành.');
+  if (dateComparisonStatus === 'mismatch') {
+    reviewReasons.push(
+      `Ngày trên văn bản chưa thống nhất: ${topRightDate?.positionLabel} (${d1}) khác với ${signatureDate?.positionLabel} (${d2}). Cần quản trị viên xác nhận ngày.`
+    );
+  } else if (dateComparisonStatus === 'missing') {
+    reviewReasons.push('Chưa nhận diện được Ngày văn bản.');
+  }
   if (!signer) reviewReasons.push('Chưa nhận diện được Họ tên người ký.');
   if (signerCandidates.length > 1) {
     reviewReasons.push(`Phát hiện nhiều tên người ký (${signerCandidates.join(', ')}), vui lòng xác nhận người ký chính.`);
@@ -2052,53 +2449,58 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   }
   const relevantPages = Array.from(relevantPagesSet).sort((a, b) => a - b);
 
-  // 3. Ghi nhận vị trí trang và vùng chứa (bbox chuẩn hóa 0..1) cho từng trường để hỗ trợ "Xem vị trí"
-  const getBoxesForPage = (pNum: number): NormalizedBox[] => {
-    const pInfo = pages.find((p) => p.pageNumber === pNum);
-    if (pInfo && !isGarbledText(pInfo.fullText) && pInfo.boxes.length > 0) {
-      return pInfo.boxes;
-    }
-    return ocrBoxesByNum.get(pNum) || [];
-  };
-
+  // 6. Ghi nhận vị trí trang và vùng chứa (bbox chuẩn hóa 0..1) cho từng trường để hỗ trợ "Xem vị trí"
   const fieldLocations: Partial<Record<ExtractableFieldKey, FieldLocation>> = {};
 
   if (docNumber) {
-    const bbox = headerAnalysis.docNumberBBox || findLinesBBoxByQuery(page1Boxes, docNumber, 0, 0.45);
+    const bbox = headerAnalysis.docNumberBBox || findLinesBBoxByQuery(page1Boxes, docNumber, 0, 0.48);
     fieldLocations.docNumber = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
   } else {
     fieldLocations.docNumber = { page: 1, estimated: true };
   }
 
+  if (parentAgency) {
+    const bbox = headerAnalysis.parentAgencyBBox || findLinesBBoxByQuery(page1Boxes, parentAgency, 0, 0.35);
+    fieldLocations.parentAgency = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
+  }
+
   if (issuingAgency) {
-    const bbox = headerAnalysis.agencyBBox || findLinesBBoxByQuery(page1Boxes, issuingAgency, 0, 0.42);
+    const bbox = headerAnalysis.agencyBBox || findLinesBBoxByQuery(page1Boxes, issuingAgency, 0, 0.45);
     fieldLocations.issuingAgency = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
   } else {
     fieldLocations.issuingAgency = { page: 1, estimated: true };
   }
 
   if (docName) {
-    const bbox = findLinesBBoxByQuery(page1Boxes, docName, 0.08, 0.85);
+    const bbox = subjectRes.docNameBBox || findLinesBBoxByQuery(page1Boxes, docName, 0.08, 0.88);
     fieldLocations.docName = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
   }
 
   if (title) {
-    const bbox = findLinesBBoxByQuery(page1Boxes, title, 0.08, 0.85);
+    const bbox = subjectRes.titleBBox || findLinesBBoxByQuery(page1Boxes, title, 0.08, 0.88);
     fieldLocations.title = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
   }
 
-  if (issueDate) {
-    const [dd, mm, yyyy] = issueDate.split('/');
-    const topRightBoxes = page1Boxes.filter((b) => (b.y0 + b.y1) / 2 <= 0.40);
-    const dateLine = groupBoxesIntoLines(topRightBoxes).find((l) => {
-      const norm = removeVietnameseDiacritics(l.text).toLowerCase();
-      return (
-        norm.includes(issueDate) ||
-        (dd && mm && yyyy && (norm.includes(`ngay ${parseInt(dd, 10)} thang ${parseInt(mm, 10)} nam ${yyyy}`) || norm.includes(`${dd}/${mm}/${yyyy}`)))
-      );
-    });
-    const bbox = dateLine ? unionLineBBoxes([dateLine]) : undefined;
-    fieldLocations.issueDate = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
+  if (topRightDate) {
+    const loc: FieldLocation = {
+      page: topRightDate.page,
+      ...(topRightDate.bbox ? { bbox: topRightDate.bbox } : { estimated: true }),
+    };
+    fieldLocations.topRightDate = loc;
+    fieldLocations.issueDate = loc;
+  }
+
+  if (signatureDate) {
+    const loc: FieldLocation = {
+      page: signatureDate.page,
+      ...(signatureDate.bbox ? { bbox: signatureDate.bbox } : { estimated: true }),
+    };
+    fieldLocations.signatureDate = loc;
+    fieldLocations.signDate = loc;
+  }
+
+  if (documentDate) {
+    fieldLocations.documentDate = fieldLocations.topRightDate || fieldLocations.signatureDate;
   }
 
   const sigBoxes = getBoxesForPage(signaturePage);
@@ -2115,20 +2517,6 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     fieldLocations.signerRole = bbox ? { page: signaturePage, bbox } : { page: signaturePage, estimated: true };
   }
 
-  if (signDate) {
-    let foundSignLoc: FieldLocation | undefined;
-    const candidatePages = [signaturePage, ...Array.from({ length: pageCount }, (_, i) => i + 1).filter((p) => p !== signaturePage)];
-    for (const pNum of candidatePages) {
-      const pBoxes = getBoxesForPage(pNum);
-      const bbox = findLinesBBoxByQuery(pBoxes, signDate, 0, 1);
-      if (bbox) {
-        foundSignLoc = { page: pNum, bbox };
-        break;
-      }
-    }
-    fieldLocations.signDate = foundSignLoc || { page: signaturePage, estimated: true };
-  }
-
   const needsReview = reviewReasons.length > 0;
 
   const pageTexts: PdfPageContent[] = [];
@@ -2138,7 +2526,6 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
       text: (pageTextByNum.get(p) || '').trim(),
     });
   }
-  const taskSuggestions = extractPdfTaskSuggestions(pageTexts);
   const indexedPageCount = pageTexts.filter((p) => countMeaningfulChars(p.text) >= 10).length;
 
   return {
@@ -2148,20 +2535,25 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
       docNumber,
       docName,
       title,
+      documentDate,
       issueDate,
       signDate,
+      dateComparisonStatus,
+      topRightDate,
+      signatureDate,
       signer,
       signerRole,
+      parentAgency,
       issuingAgency,
       needsReview,
       reviewReasons,
       relevantPages,
       usedOcr,
+      aiUsed,
       ocrConfidence,
       pageCount,
       signerCandidates,
       fieldLocations,
-      taskSuggestions,
       indexedPageCount,
     },
   };

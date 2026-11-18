@@ -34,14 +34,18 @@ import {
   Paperclip,
   ListChecks,
   CalendarClock,
+  MessageSquareText,
 } from 'lucide-react';
 import { api } from '../api';
+import { DocumentChatDrawer } from './DocumentChatDrawer';
+import { PdfPreviewPane } from './PdfPreviewPane';
 import type {
   ArchiveDeletedResult,
   AttachmentGroup,
   BulkSyncDeletedResult,
   DocumentAuditAction,
   DocumentHistoryEntry,
+  DocumentQaCitation,
   DocumentRecord,
   DocumentTask,
   DocumentTaskStatus,
@@ -110,6 +114,18 @@ function getRecordStatusMeta(doc: DocumentRecord): { label: string; className: s
     label: 'Đã cấp số',
     className: SEMANTIC_STATUS_STYLES.outgoing.badge,
   };
+}
+
+function isDateConfirmationPending(doc: DocumentRecord): boolean {
+  if (doc.pendingDateConfirmation) return true;
+  if (doc.docCategory === 'incoming' && !doc.dateConfirmedAt) {
+    const normIssue = normalizeDateOnlyDdMmYyyy(doc.issueDate || '');
+    const normSign = normalizeDateOnlyDdMmYyyy(doc.signDate || '');
+    if (normIssue && normSign && normIssue !== normSign) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function getDriveStatusLabel(doc: DocumentRecord): string {
@@ -304,6 +320,8 @@ function getAuditActionMeta(action: DocumentAuditAction): { label: string; class
       return { label: 'Cập nhật tiến độ việc', className: 'bg-amber-50 text-amber-800 border-amber-200' };
     case 'reconcile_sync':
       return { label: 'Đối soát đồng bộ', className: 'bg-amber-50 text-amber-800 border-amber-200' };
+    case 'confirm_date':
+      return { label: 'Xác nhận ngày VB', className: 'bg-emerald-50 text-emerald-800 border-emerald-200' };
     default:
       return { label: action, className: 'bg-slate-100 text-slate-700 border-slate-200' };
   }
@@ -317,6 +335,7 @@ const AUDIT_FIELD_LABELS: Record<string, string> = {
   notes: 'Ghi chú',
   sequenceNumber: 'Số thứ tự',
   fullDocNumber: 'Số / Ký hiệu',
+  parentAgency: 'Cơ quan chủ quản',
   issuingAgency: 'Cơ quan ban hành',
   issueDate: 'Ngày ban hành',
   signDate: 'Ngày ký',
@@ -466,6 +485,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   const [editSigner, setEditSigner] = useState('');
   const [editSignerRole, setEditSignerRole] = useState('');
   const [editNotes, setEditNotes] = useState('');
+  const [editParentAgency, setEditParentAgency] = useState('');
   const [editIssuingAgency, setEditIssuingAgency] = useState('');
   const [editIssueDate, setEditIssueDate] = useState('');
   const [editSignDate, setEditSignDate] = useState('');
@@ -473,6 +493,11 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   const [editFullDocNumber, setEditFullDocNumber] = useState<string>('');
   const [editSubmitting, setEditSubmitting] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+
+  // Date confirmation state (Detail Modal)
+  const [confirmDateInput, setConfirmDateInput] = useState('');
+  const [confirmDateSubmitting, setConfirmDateSubmitting] = useState(false);
+  const [confirmDateError, setConfirmDateError] = useState<string | null>(null);
 
   // Cancel form state
   const [cancelReason, setCancelReason] = useState('');
@@ -574,6 +599,20 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
   const [attError, setAttError] = useState<string | null>(null);
   const [settingOfficialId, setSettingOfficialId] = useState<string | null>(null);
   const [retryingWordTemplate, setRetryingWordTemplate] = useState<boolean>(false);
+
+  const [chatDrawerOpen, setChatDrawerOpen] = useState<boolean>(false);
+  const [citationPdfModal, setCitationPdfModal] = useState<{
+    docId: string;
+    fullDocNumber: string;
+    docName: string;
+    page?: number;
+    blobUrl?: string;
+    driveUrl?: string;
+    fileName?: string;
+    excerpt?: string;
+    loading: boolean;
+    error?: string;
+  } | null>(null);
 
   const viewableBooks = useMemo(
     () => books.filter((b) => isSystemAdmin(currentUser) || hasBookPermission(currentUser, b.id, 'view')),
@@ -836,6 +875,87 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
     }
   };
 
+  useEffect(() => {
+    return () => {
+      if (citationPdfModal?.blobUrl) {
+        window.URL.revokeObjectURL(citationPdfModal.blobUrl);
+      }
+    };
+  }, [citationPdfModal?.blobUrl]);
+
+  const closeCitationPdfModal = () => {
+    if (citationPdfModal?.blobUrl) {
+      window.URL.revokeObjectURL(citationPdfModal.blobUrl);
+    }
+    setCitationPdfModal(null);
+  };
+
+  const handleOpenCitationPdfPage = async (citation: DocumentQaCitation) => {
+    if (citationPdfModal?.blobUrl) {
+      window.URL.revokeObjectURL(citationPdfModal.blobUrl);
+    }
+    const targetPage = citation.page && citation.page >= 1 ? citation.page : undefined;
+    setCitationPdfModal({
+      docId: citation.docId,
+      fullDocNumber: citation.fullDocNumber,
+      docName: citation.docName,
+      page: targetPage,
+      excerpt: citation.excerpt,
+      loading: true,
+    });
+
+    let authorizedDriveUrl: string | undefined;
+    let driveFileName: string | undefined;
+    try {
+      const linkRes = await api.openDocumentFile(citation.docId, citation.attachmentId);
+      if (linkRes?.url) {
+        authorizedDriveUrl = targetPage ? `${linkRes.url}#page=${targetPage}` : linkRes.url;
+        driveFileName = linkRes.fileName;
+      }
+    } catch {
+      // ignore if Drive link unavailable
+    }
+
+    try {
+      const streamRes = await fetch(
+        api.getDocumentPdfStreamUrl(citation.docId, citation.attachmentId),
+        { credentials: 'include' }
+      );
+      if (streamRes.ok) {
+        const blob = await streamRes.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        setCitationPdfModal((prev) =>
+          prev && prev.docId === citation.docId
+            ? {
+                ...prev,
+                blobUrl,
+                driveUrl: authorizedDriveUrl,
+                fileName: driveFileName || `${citation.fullDocNumber}.pdf`,
+                loading: false,
+              }
+            : prev
+        );
+        return;
+      }
+    } catch {
+      // Fallback to Drive URL view
+    }
+
+    setCitationPdfModal((prev) =>
+      prev && prev.docId === citation.docId
+        ? {
+            ...prev,
+            driveUrl: authorizedDriveUrl,
+            fileName: driveFileName,
+            loading: false,
+            error: authorizedDriveUrl
+              ? undefined
+              : 'Không thể tải trực tiếp luồng PDF hoặc tệp chưa có liên kết Google Drive.',
+          }
+        : prev
+    );
+  };
+
   const handleUploadMultiAttachment = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!detailModalDoc || attUploading) return;
@@ -949,6 +1069,33 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
       setDetailTaskError(err?.message || 'Không thể cập nhật trạng thái việc.');
     } finally {
       setUpdatingDetailTaskId(null);
+    }
+  };
+
+  useEffect(() => {
+    setConfirmDateInput('');
+    setConfirmDateError(null);
+  }, [detailModalDoc?.id]);
+
+  const handleConfirmDocumentDate = async (docId: string, rawDate: string) => {
+    if (confirmDateSubmitting) return;
+    const normalized = normalizeDateOnlyDdMmYyyy(rawDate.trim());
+    if (!normalized) {
+      setConfirmDateError('Vui lòng nhập ngày thống nhất hợp lệ (dd/mm/yyyy).');
+      return;
+    }
+    setConfirmDateSubmitting(true);
+    setConfirmDateError(null);
+    try {
+      const res = await api.confirmDocumentDate(docId, normalized);
+      setDetailModalDoc(res.document);
+      onDocumentUpdated(res.document);
+      setConfirmDateInput('');
+      onRefresh();
+    } catch (err: any) {
+      setConfirmDateError(err?.message || 'Không thể xác nhận ngày văn bản.');
+    } finally {
+      setConfirmDateSubmitting(false);
     }
   };
 
@@ -1231,6 +1378,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
     setEditSigner(doc.signer);
     setEditSignerRole(doc.signerRole);
     setEditNotes(doc.notes || '');
+    setEditParentAgency(doc.parentAgency || '');
     setEditIssuingAgency(doc.issuingAgency || '');
     setEditIssueDate(normalizeDateOnlyDdMmYyyy(doc.issueDate || ''));
     setEditSignDate(normalizeDateOnlyDdMmYyyy(doc.signDate || ''));
@@ -1251,6 +1399,17 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
     const docBookId = getDocBookId(editModalDoc);
     const canManageBook = isSystemAdmin(currentUser) || hasBookPermission(currentUser, docBookId, 'manage_book');
 
+    if (editModalDoc.docCategory === 'incoming') {
+      if (editIssueDate.trim() && !normalizeDateOnlyDdMmYyyy(editIssueDate.trim())) {
+        setEditError('Ngày văn bản không hợp lệ (định dạng chuẩn dd/mm/yyyy).');
+        return;
+      }
+      if (editSignDate.trim() && !normalizeDateOnlyDdMmYyyy(editSignDate.trim())) {
+        setEditError('Ngày ký không hợp lệ (định dạng chuẩn dd/mm/yyyy).');
+        return;
+      }
+    }
+
     setEditSubmitting(true);
     setEditError(null);
     try {
@@ -1263,9 +1422,15 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
       };
 
       if (editModalDoc.docCategory === 'incoming') {
+        const cleanIssue = normalizeDateOnlyDdMmYyyy(editIssueDate.trim());
+        const cleanSign = normalizeDateOnlyDdMmYyyy(editSignDate.trim());
+        payload.parentAgency = editParentAgency.trim();
         payload.issuingAgency = editIssuingAgency.trim();
-        payload.issueDate = normalizeDateOnlyDdMmYyyy(editIssueDate.trim());
-        payload.signDate = normalizeDateOnlyDdMmYyyy(editSignDate.trim());
+        payload.issueDate = cleanIssue;
+        payload.signDate = cleanSign;
+        if (editModalDoc.pendingDateConfirmation && cleanIssue && canManageBook) {
+          payload.confirmUnifiedDate = true;
+        }
         payload.needsReview = false;
       }
 
@@ -1840,6 +2005,18 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
             <span>{currentScopeBookName}</span>
           </span>
 
+          {viewableBooks.length > 0 && (
+            <button
+              type="button"
+              onClick={() => setChatDrawerOpen(true)}
+              className="flex-1 sm:flex-initial justify-center flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold bg-sky-800 hover:bg-sky-900 text-white rounded-lg shadow-xs transition-colors whitespace-nowrap"
+              title="Đặt câu hỏi bằng tiếng Việt để tra cứu văn bản có dẫn nguồn"
+            >
+              <MessageSquareText className="w-4 h-4 shrink-0" />
+              <span>Hỏi về văn bản</span>
+            </button>
+          )}
+
           {canExportScope && (
             <button
               type="button"
@@ -1856,7 +2033,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
               ) : (
                 <>
                   <FileSpreadsheet className="w-4 h-4 shrink-0" />
-                  <span>Tải Excel .xlsx</span>
+                  <span>Tải Excel</span>
                 </>
               )}
             </button>
@@ -1883,22 +2060,30 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         </div>
       )}
 
-      {/* Registry Sub-navigation: Danh sách hiệu lực / VB đã xóa / Lịch sử thao tác */}
-      <div className="flex items-center gap-2 overflow-x-auto pb-1">
+      {/* Registry Sub-navigation: Tab nhẹ, chỉ tô màu nổi bật ở tab đang mở */}
+      <div
+        role="tablist"
+        aria-label="Phân khu sổ theo dõi"
+        className="flex items-center gap-1 sm:gap-2 border-b border-slate-200 overflow-x-auto"
+      >
         <button
           type="button"
+          role="tab"
+          aria-selected={registrySection === 'active'}
           onClick={() => setRegistrySection('active')}
-          className={`inline-flex items-center gap-2 px-3.5 py-2 min-h-[40px] rounded-lg text-xs font-bold border transition-colors shrink-0 ${
+          className={`inline-flex items-center gap-2 px-3.5 py-2.5 min-h-[42px] text-xs border-b-2 -mb-px transition-colors shrink-0 whitespace-nowrap rounded-t-lg ${
             registrySection === 'active'
-              ? 'bg-sky-900 text-white border-sky-900 shadow-xs'
-              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              ? 'border-sky-700 text-sky-900 bg-sky-50/70 font-bold'
+              : 'border-transparent text-slate-600 hover:text-slate-900 hover:bg-slate-50 font-semibold'
           }`}
         >
-          <FileText className="w-3.5 h-3.5 shrink-0" />
-          <span>Sổ văn bản hiệu lực</span>
+          <FileText className={`w-3.5 h-3.5 shrink-0 ${registrySection === 'active' ? 'text-sky-700' : 'text-slate-400'}`} />
+          <span>Văn bản</span>
           <span
-            className={`font-mono text-[11px] px-1.5 py-0.5 rounded ${
-              registrySection === 'active' ? 'bg-sky-800 text-sky-100' : 'bg-slate-100 text-slate-700'
+            className={`font-mono tabular-nums text-[11px] px-1.5 py-0.5 rounded ${
+              registrySection === 'active'
+                ? 'bg-sky-100 text-sky-900'
+                : 'bg-slate-100 text-slate-600'
             }`}
           >
             {documents.length}
@@ -1907,47 +2092,55 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
         <button
           type="button"
+          role="tab"
+          aria-selected={registrySection === 'deleted'}
           onClick={() => setRegistrySection('deleted')}
-          className={`inline-flex items-center gap-2 px-3.5 py-2 min-h-[40px] rounded-lg text-xs font-bold border transition-colors shrink-0 ${
+          className={`inline-flex items-center gap-2 px-3.5 py-2.5 min-h-[42px] text-xs border-b-2 -mb-px transition-colors shrink-0 whitespace-nowrap rounded-t-lg ${
             registrySection === 'deleted'
-              ? 'bg-rose-800 text-white border-rose-800 shadow-xs'
-              : 'bg-white text-slate-700 border-slate-200 hover:bg-rose-50/50'
+              ? 'border-rose-700 text-rose-900 bg-rose-50/70 font-bold'
+              : 'border-transparent text-slate-600 hover:text-slate-900 hover:bg-slate-50 font-semibold'
           }`}
         >
-          <Trash2 className="w-3.5 h-3.5 shrink-0" />
+          <Trash2 className={`w-3.5 h-3.5 shrink-0 ${registrySection === 'deleted' ? 'text-rose-700' : 'text-slate-400'}`} />
           <span>VB đã xóa</span>
           <span
-            className={`font-mono text-[11px] px-1.5 py-0.5 rounded ${
-              registrySection === 'deleted' ? 'bg-rose-700 text-rose-100' : 'bg-slate-100 text-slate-700'
+            className={`font-mono tabular-nums text-[11px] px-1.5 py-0.5 rounded ${
+              registrySection === 'deleted'
+                ? 'bg-rose-100 text-rose-900'
+                : 'bg-slate-100 text-slate-600'
             }`}
           >
             {unarchivedDeletedInBook.length}
           </span>
           {pendingExcelSyncCount > 0 && (
             <span
-              className="inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300"
+              className="inline-flex items-center gap-1 text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 tabular-nums"
               title="Có văn bản chờ đồng bộ sang sheet VB đã xóa trên Google Trang tính"
             >
-              Chờ đồng bộ Google Trang tính: {pendingExcelSyncCount}
+              Chờ đồng bộ: {pendingExcelSyncCount}
             </span>
           )}
         </button>
 
         <button
           type="button"
+          role="tab"
+          aria-selected={registrySection === 'history'}
           onClick={() => setRegistrySection('history')}
-          className={`inline-flex items-center gap-2 px-3.5 py-2 min-h-[40px] rounded-lg text-xs font-bold border transition-colors shrink-0 ${
+          className={`inline-flex items-center gap-2 px-3.5 py-2.5 min-h-[42px] text-xs border-b-2 -mb-px transition-colors shrink-0 whitespace-nowrap rounded-t-lg ${
             registrySection === 'history'
-              ? 'bg-sky-900 text-white border-sky-900 shadow-xs'
-              : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+              ? 'border-sky-700 text-sky-900 bg-sky-50/70 font-bold'
+              : 'border-transparent text-slate-600 hover:text-slate-900 hover:bg-slate-50 font-semibold'
           }`}
         >
-          <History className="w-3.5 h-3.5 shrink-0" />
+          <History className={`w-3.5 h-3.5 shrink-0 ${registrySection === 'history' ? 'text-sky-700' : 'text-slate-400'}`} />
           <span>Lịch sử thao tác</span>
           {historyTotal > 0 && (
             <span
-              className={`font-mono text-[11px] px-1.5 py-0.5 rounded ${
-                registrySection === 'history' ? 'bg-sky-800 text-sky-100' : 'bg-slate-100 text-slate-700'
+              className={`font-mono tabular-nums text-[11px] px-1.5 py-0.5 rounded ${
+                registrySection === 'history'
+                  ? 'bg-sky-100 text-sky-900'
+                  : 'bg-slate-100 text-slate-600'
               }`}
             >
               {historyTotal}
@@ -1958,368 +2151,329 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
       {registrySection === 'active' && (
         <>
-      {/* Compact Primary Filter Bar + Expandable Bộ lọc */}
-      <div className="bg-white border border-slate-200 rounded-xl p-3.5 sm:p-4 shadow-xs space-y-3">
-        {/* Row 1: Tìm kiếm + Tìm trong PDF + Nhóm văn bản + Nút Bộ lọc */}
-        <div className="flex flex-col lg:flex-row lg:items-center gap-2.5">
-          <div className="relative flex-1 min-w-0">
-            <Search className="w-4 h-4 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-            <input
-              type="text"
-              aria-label="Tìm kiếm văn bản"
-              value={searchTerm}
-              onChange={(e) => setSearchTerm(e.target.value)}
-              placeholder={
-                pdfContentMode
-                  ? 'Tìm từ khóa trong nội dung bên trong tệp PDF...'
-                  : 'Tìm số VB, tên VB, cơ quan, tên tệp...'
-              }
-              className="w-full min-h-[44px] h-11 sm:h-10 pl-9 pr-9 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600"
-            />
-            {searchTerm && (
-              <button
-                type="button"
-                aria-label="Xóa từ khóa tìm kiếm"
-                onClick={() => setSearchTerm('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-slate-700"
-              >
-                <X className="w-4 h-4" />
-              </button>
-            )}
-          </div>
-
-          <button
-            type="button"
-            onClick={() => setPdfContentMode((prev) => !prev)}
-            className={`inline-flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-[40px] px-3 py-2 rounded-lg border text-xs font-semibold transition-colors shrink-0 whitespace-nowrap ${
-              pdfContentMode
-                ? 'bg-purple-700 text-white border-purple-700 shadow-2xs'
-                : 'bg-white text-slate-700 border-slate-300 hover:bg-purple-50 hover:text-purple-900'
-            }`}
-          >
-            <FileText className="w-3.5 h-3.5 shrink-0" />
-            <span>Tìm trong nội dung PDF</span>
-          </button>
-
-          <div
-            role="group"
-            aria-label="Chọn nhóm văn bản"
-            className="grid grid-cols-3 sm:inline-flex bg-slate-100 p-1 rounded-lg border border-slate-200 shrink-0"
-          >
-            <button
-              type="button"
-              onClick={() => setSelectedCategory('all')}
-              className={`min-h-[38px] px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap ${
-                selectedCategory === 'all'
-                  ? 'bg-white text-slate-900 shadow-2xs'
-                  : 'text-slate-600 hover:text-slate-900'
-              }`}
-            >
-              Tất cả
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedCategory('outgoing')}
-              className={`min-h-[38px] px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap inline-flex items-center justify-center gap-1.5 ${
-                selectedCategory === 'outgoing'
-                  ? 'bg-blue-700 text-white shadow-2xs'
-                  : 'text-blue-800 hover:bg-blue-50'
-              }`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${selectedCategory === 'outgoing' ? 'bg-white' : 'bg-blue-600'}`} />
-              <span>Văn bản đi</span>
-            </button>
-            <button
-              type="button"
-              onClick={() => setSelectedCategory('incoming')}
-              className={`min-h-[38px] px-3 py-1.5 rounded-md text-xs font-semibold transition-colors whitespace-nowrap inline-flex items-center justify-center gap-1.5 ${
-                selectedCategory === 'incoming'
-                  ? 'bg-purple-700 text-white shadow-2xs'
-                  : 'text-purple-800 hover:bg-purple-50'
-              }`}
-            >
-              <span className={`w-1.5 h-1.5 rounded-full ${selectedCategory === 'incoming' ? 'bg-white' : 'bg-purple-600'}`} />
-              <span>Văn bản đến</span>
-            </button>
-          </div>
-
-          <button
-            type="button"
-            onClick={() => setShowAdvancedFilters((prev) => !prev)}
-            className={`inline-flex items-center justify-center gap-1.5 min-h-[44px] sm:min-h-[40px] px-3.5 py-2 rounded-lg border text-xs font-semibold transition-colors shrink-0 whitespace-nowrap ${
-              showAdvancedFilters || activeExtraFilterCount > 0
-                ? 'bg-blue-50 text-blue-900 border-blue-300'
-                : 'bg-white text-slate-700 border-slate-300 hover:bg-slate-50'
-            }`}
-          >
-            <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
-            <span>Bộ lọc</span>
-            {activeExtraFilterCount > 0 && (
-              <span className="font-mono text-[11px] font-bold px-1.5 py-0.5 rounded bg-blue-700 text-white">
-                {activeExtraFilterCount}
-              </span>
-            )}
-          </button>
-        </div>
-
-        {/* Row 2: Năm văn bản (Năm hiện tại + 2 năm trước, Năm cũ hơn, Tất cả các năm, Chưa xác định năm) */}
+      {/* Compact Single-Row Desktop / Two-Row Mobile Toolbar + Expandable Bộ lọc */}
+      <div className="bg-white border border-slate-200 rounded-xl p-3 sm:p-3.5 shadow-xs space-y-2.5">
         {(() => {
           const quickYears = [currentVnYear, currentVnYear - 1, currentVnYear - 2];
           const olderYears = availableYears.filter((y) => !quickYears.includes(y));
-          const isOlderYearSelected =
-            selectedYear !== 'all' &&
-            selectedYear !== 'unknown' &&
-            !quickYears.includes(parseInt(selectedYear, 10));
+          const parsedSelectedYear =
+            selectedYear !== 'all' && selectedYear !== 'unknown'
+              ? parseInt(selectedYear, 10)
+              : NaN;
+          const extraSelectedYear =
+            !Number.isNaN(parsedSelectedYear) &&
+            !quickYears.includes(parsedSelectedYear) &&
+            !olderYears.includes(parsedSelectedYear)
+              ? [parsedSelectedYear]
+              : [];
+          const allOlderYears = Array.from(new Set([...olderYears, ...extraSelectedYear])).sort(
+            (a, b) => b - a
+          );
 
-          const selectYearVal = (val: string) => {
-            activeYearManualRef.current = true;
-            setSelectedYear(val);
-          };
+          const hasActiveFilter =
+            Boolean(searchTerm.trim()) ||
+            selectedCategory !== 'all' ||
+            activeExtraFilterCount > 0 ||
+            filteredDocuments.length !== bookYearTotalCount;
 
           return (
-            <div className="flex flex-wrap items-center gap-1.5 pt-1">
-              <span className="text-xs font-bold text-slate-700 mr-1 whitespace-nowrap">Năm văn bản:</span>
-              {quickYears.map((yr) => {
-                const active = selectedYear === String(yr);
-                return (
-                  <button
-                    key={yr}
-                    type="button"
-                    onClick={() => selectYearVal(String(yr))}
-                    className={`min-h-[34px] px-2.5 py-1 rounded-md border text-xs font-semibold transition-colors tabular-nums whitespace-nowrap ${
-                      active
-                        ? 'bg-blue-700 text-white border-blue-700 shadow-2xs'
-                        : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
+            <>
+              <div className="flex flex-col md:flex-row md:items-center gap-2 min-w-0">
+                {/* Search input + Phạm vi tìm kiếm */}
+                <div className="flex items-center flex-1 min-w-0 bg-slate-50 border border-slate-200 rounded-lg focus-within:bg-white focus-within:ring-2 focus-within:ring-sky-600 focus-within:border-sky-600 overflow-hidden">
+                  <div className="relative flex-1 min-w-0 flex items-center">
+                    <Search className="w-4 h-4 ml-3 text-slate-400 shrink-0 pointer-events-none" />
+                    <input
+                      type="text"
+                      aria-label="Tìm kiếm văn bản"
+                      value={searchTerm}
+                      onChange={(e) => setSearchTerm(e.target.value)}
+                      placeholder={
+                        pdfContentMode
+                          ? 'Tìm nội dung bên trong tệp PDF...'
+                          : 'Tìm số/ký hiệu, tên văn bản, cơ quan...'
+                      }
+                      className="w-full min-w-0 min-h-[42px] sm:min-h-[38px] h-10 sm:h-9 px-2.5 text-base sm:text-xs bg-transparent border-0 focus:outline-hidden"
+                    />
+                    {searchTerm && (
+                      <button
+                        type="button"
+                        aria-label="Xóa từ khóa tìm kiếm"
+                        title="Xóa từ khóa tìm kiếm"
+                        onClick={() => setSearchTerm('')}
+                        className="p-1.5 mr-1 text-slate-400 hover:text-slate-700 shrink-0"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    )}
+                  </div>
+
+                  <span className="h-5 w-px bg-slate-200 shrink-0" aria-hidden="true" />
+
+                  <select
+                    aria-label="Phạm vi tìm kiếm"
+                    title="Chọn phạm vi tìm kiếm"
+                    value={pdfContentMode ? 'pdf' : 'metadata'}
+                    onChange={(e) => setPdfContentMode(e.target.value === 'pdf')}
+                    className={`min-h-[42px] sm:min-h-[38px] h-10 sm:h-9 pl-2.5 pr-2 text-xs font-semibold bg-transparent border-0 focus:outline-hidden cursor-pointer shrink-0 max-w-[140px] sm:max-w-none ${
+                      pdfContentMode ? 'text-purple-800 bg-purple-50/70' : 'text-slate-700'
                     }`}
                   >
-                    {yr}
-                  </button>
-                );
-              })}
+                    <option value="metadata">Thông tin hồ sơ</option>
+                    <option value="pdf">Nội dung PDF</option>
+                  </select>
+                </div>
 
-              {(olderYears.length > 0 || isOlderYearSelected) && (
-                <select
-                  aria-label="Năm cũ hơn"
-                  value={isOlderYearSelected ? selectedYear : ''}
-                  onChange={(e) => {
-                    if (e.target.value) selectYearVal(e.target.value);
-                  }}
-                  className={`min-h-[34px] px-2.5 py-1 rounded-md border text-xs font-semibold cursor-pointer ${
-                    isOlderYearSelected
-                      ? 'bg-blue-50 text-blue-900 border-blue-400'
-                      : 'bg-slate-50 text-slate-700 border-slate-200'
-                  }`}
-                >
-                  <option value="">Năm cũ hơn...</option>
-                  {Array.from(
-                    new Set([
-                      ...olderYears,
-                      ...(isOlderYearSelected ? [parseInt(selectedYear, 10)] : []),
-                    ])
-                  )
-                    .filter((y) => !Number.isNaN(y))
-                    .sort((a, b) => b - a)
-                    .map((yr) => (
+                {/* Quick filters row on mobile, inline on desktop: Năm · Nhóm văn bản · Bộ lọc */}
+                <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.15fr)_auto] md:flex md:items-center gap-2 shrink-0 min-w-0">
+                  <select
+                    aria-label="Năm văn bản"
+                    title="Lọc theo năm văn bản"
+                    value={selectedYear}
+                    onChange={(e) => {
+                      activeYearManualRef.current = true;
+                      setSelectedYear(e.target.value);
+                    }}
+                    className="w-full md:w-auto min-w-0 min-h-[42px] sm:min-h-[38px] h-10 sm:h-9 px-2.5 text-sm sm:text-xs font-semibold text-slate-800 bg-slate-50 hover:bg-white border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600 cursor-pointer tabular-nums"
+                  >
+                    {quickYears.map((yr) => (
                       <option key={yr} value={String(yr)}>
                         Năm {yr}
                       </option>
                     ))}
-                </select>
+                    {allOlderYears.map((yr) => (
+                      <option key={yr} value={String(yr)}>
+                        Năm {yr}
+                      </option>
+                    ))}
+                    <option value="all">Tất cả các năm</option>
+                    <option value="unknown">Chưa xác định năm</option>
+                  </select>
+
+                  <select
+                    aria-label="Nhóm văn bản"
+                    title="Lọc theo nhóm văn bản"
+                    value={selectedCategory}
+                    onChange={(e) => setSelectedCategory(e.target.value as 'all' | 'outgoing' | 'incoming')}
+                    className={`w-full md:w-auto min-w-0 min-h-[42px] sm:min-h-[38px] h-10 sm:h-9 px-2.5 text-sm sm:text-xs font-semibold border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-sky-600 cursor-pointer ${
+                      selectedCategory === 'outgoing'
+                        ? 'bg-blue-50 text-blue-900 border-blue-200'
+                        : selectedCategory === 'incoming'
+                        ? 'bg-purple-50 text-purple-900 border-purple-200'
+                        : 'bg-slate-50 hover:bg-white text-slate-800 border-slate-200'
+                    }`}
+                  >
+                    <option value="all">Tất cả nhóm VB</option>
+                    <option value="outgoing">Văn bản đi</option>
+                    <option value="incoming">Văn bản đến</option>
+                  </select>
+
+                  <button
+                    type="button"
+                    aria-expanded={showAdvancedFilters}
+                    onClick={() => setShowAdvancedFilters((prev) => !prev)}
+                    className={`inline-flex items-center justify-center gap-1.5 min-h-[42px] sm:min-h-[38px] h-10 sm:h-9 px-3 rounded-lg border text-xs font-semibold transition-colors shrink-0 whitespace-nowrap tabular-nums ${
+                      showAdvancedFilters || activeExtraFilterCount > 0
+                        ? 'bg-sky-50 text-sky-900 border-sky-300'
+                        : 'bg-white text-slate-700 border-slate-200 hover:bg-slate-50'
+                    }`}
+                  >
+                    <SlidersHorizontal className="w-3.5 h-3.5 shrink-0" />
+                    <span>
+                      {activeExtraFilterCount > 0 ? `Bộ lọc (${activeExtraFilterCount})` : 'Bộ lọc'}
+                    </span>
+                  </button>
+                </div>
+              </div>
+
+              {/* Collapsible Bộ lọc nâng cao */}
+              {showAdvancedFilters && (
+                <div className="pt-3 border-t border-slate-100 space-y-3">
+                  <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2.5">
+                    <div className="space-y-1 min-w-0">
+                      <label className="text-[11px] font-bold text-slate-600 block">Tháng ban hành</label>
+                      <select
+                        aria-label="Lọc theo tháng"
+                        value={selectedMonth}
+                        onChange={(e) => setSelectedMonth(e.target.value)}
+                        className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                      >
+                        <option value="all">Mọi tháng</option>
+                        {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
+                          <option key={m} value={m}>
+                            Tháng {m}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1 min-w-0">
+                      <label className="text-[11px] font-bold text-slate-600 block">Loại văn bản</label>
+                      <select
+                        aria-label="Lọc theo loại văn bản"
+                        value={selectedType}
+                        onChange={(e) => setSelectedType(e.target.value)}
+                        className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                      >
+                        <option value="all">Tất cả loại VB</option>
+                        <option value="VBD">Văn bản đến (VBD)</option>
+                        {documentTypes.map((t) => (
+                          <option key={t.code} value={t.code}>
+                            {t.name} ({t.code})
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1 min-w-0">
+                      <label className="text-[11px] font-bold text-slate-600 block">Người ký</label>
+                      <select
+                        aria-label="Lọc theo người ký"
+                        value={selectedSigner}
+                        onChange={(e) => setSelectedSigner(e.target.value)}
+                        className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                      >
+                        <option value="all">Mọi người ký</option>
+                        {availableSigners.map((s) => (
+                          <option key={s} value={s}>
+                            {s}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+
+                    <div className="space-y-1 min-w-0">
+                      <label className="text-[11px] font-bold text-slate-600 block">Trạng thái hồ sơ</label>
+                      <select
+                        aria-label="Lọc trạng thái hồ sơ"
+                        value={selectedStatus}
+                        onChange={(e) => setSelectedStatus(e.target.value)}
+                        className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                      >
+                        <option value="all">Tất cả hồ sơ</option>
+                        <option value="active">Hiệu lực</option>
+                        <option value="cancelled">Đã hủy</option>
+                      </select>
+                    </div>
+
+                    <div className="space-y-1 min-w-0">
+                      <label className="text-[11px] font-bold text-slate-600 block">Trạng thái tệp</label>
+                      <select
+                        aria-label="Lọc trạng thái tệp Drive"
+                        value={selectedDriveStatus}
+                        onChange={(e) => setSelectedDriveStatus(e.target.value)}
+                        className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                      >
+                        <option value="all">Tất cả trạng thái tệp</option>
+                        <option value="saved">Đã lưu lên Drive</option>
+                        <option value="uploading">Đang lưu</option>
+                        <option value="failed">Lưu tệp thất bại</option>
+                        <option value="none">Không đính kèm</option>
+                      </select>
+                    </div>
+
+                    <div className="space-y-1 min-w-0">
+                      <label className="text-[11px] font-bold text-slate-600 block">Sắp xếp</label>
+                      <select
+                        aria-label="Sắp xếp danh sách"
+                        value={sortBy}
+                        onChange={(e: any) => setSortBy(e.target.value)}
+                        className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-sky-600 font-medium text-slate-700"
+                      >
+                        <option value="newest">Mới nhất trước</option>
+                        <option value="oldest">Cũ nhất trước</option>
+                        <option value="number_asc">Số TT tăng dần</option>
+                        <option value="number_desc">Số TT giảm dần</option>
+                      </select>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-end pt-1">
+                    <button
+                      type="button"
+                      disabled={activeExtraFilterCount === 0}
+                      onClick={() => {
+                        setSelectedMonth('all');
+                        setSelectedType('all');
+                        setSelectedSigner('all');
+                        setSelectedStatus('all');
+                        setSelectedDriveStatus('all');
+                        setSortBy('newest');
+                      }}
+                      className="inline-flex items-center gap-1.5 min-h-[34px] px-3 py-1 rounded-md text-xs font-semibold text-sky-800 hover:bg-sky-50 border border-sky-200 disabled:opacity-45 disabled:pointer-events-none transition-colors"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                      <span>Xóa bộ lọc</span>
+                    </button>
+                  </div>
+                </div>
               )}
 
-              <button
-                type="button"
-                onClick={() => selectYearVal('all')}
-                className={`min-h-[34px] px-2.5 py-1 rounded-md border text-xs font-semibold transition-colors whitespace-nowrap ${
-                  selectedYear === 'all'
-                    ? 'bg-slate-800 text-white border-slate-800'
-                    : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                }`}
-              >
-                Tất cả các năm
-              </button>
+              {/* Single compact result count line + Mobile cards/table switch */}
+              <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs text-slate-600">
+                <div className="min-w-0 truncate">
+                  {pdfContentMode ? (
+                    searchTerm.trim() && pdfSearchResults ? (
+                      <span>
+                        <strong className="text-purple-900 font-mono tabular-nums">
+                          {pdfSearchResults.total}
+                        </strong>{' '}
+                        kết quả trong nội dung PDF
+                      </span>
+                    ) : (
+                      <span>
+                        Đang tìm trong nội dung PDF ·{' '}
+                        <strong className="text-slate-900 font-mono tabular-nums">
+                          {filteredDocuments.length}
+                        </strong>{' '}
+                        hồ sơ trong sổ
+                      </span>
+                    )
+                  ) : hasActiveFilter ? (
+                    <span>
+                      <strong className="text-sky-800 font-mono tabular-nums">
+                        {filteredDocuments.length}
+                      </strong>{' '}
+                      kết quả sau khi lọc
+                    </span>
+                  ) : (
+                    <span>
+                      <strong className="text-slate-900 font-mono tabular-nums">
+                        {filteredDocuments.length}
+                      </strong>{' '}
+                      kết quả
+                    </span>
+                  )}
+                </div>
 
-              <button
-                type="button"
-                onClick={() => selectYearVal('unknown')}
-                className={`min-h-[34px] px-2.5 py-1 rounded-md border text-xs font-semibold transition-colors whitespace-nowrap ${
-                  selectedYear === 'unknown'
-                    ? 'bg-amber-600 text-white border-amber-600'
-                    : 'bg-slate-50 text-slate-700 border-slate-200 hover:bg-slate-100'
-                }`}
-              >
-                Chưa xác định năm
-              </button>
-            </div>
+                <div className="flex md:hidden items-center shrink-0">
+                  <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
+                    <button
+                      type="button"
+                      onClick={() => setMobileViewMode('cards')}
+                      className={`min-h-[32px] px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
+                        mobileViewMode === 'cards' ? 'bg-white text-sky-800 shadow-2xs' : 'text-slate-600'
+                      }`}
+                    >
+                      <LayoutList className="w-3.5 h-3.5" />
+                      <span>Thẻ</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setMobileViewMode('table')}
+                      className={`min-h-[32px] px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
+                        mobileViewMode === 'table' ? 'bg-white text-sky-800 shadow-2xs' : 'text-slate-600'
+                      }`}
+                    >
+                      <Table className="w-3.5 h-3.5" />
+                      <span>Bảng</span>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </>
           );
         })()}
-
-        {/* Collapsible Bộ lọc nâng cao (Tháng, Loại VB, Người ký, Trạng thái HS, Trạng thái tệp, Sắp xếp) */}
-        {showAdvancedFilters && (
-          <div className="pt-3 border-t border-slate-100 space-y-3">
-            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-6 gap-2.5">
-              <div className="space-y-1 min-w-0">
-                <label className="text-[11px] font-bold text-slate-600 block">Tháng ban hành</label>
-                <select
-                  aria-label="Lọc theo tháng"
-                  value={selectedMonth}
-                  onChange={(e) => setSelectedMonth(e.target.value)}
-                  className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600"
-                >
-                  <option value="all">Mọi tháng</option>
-                  {Array.from({ length: 12 }, (_, i) => i + 1).map((m) => (
-                    <option key={m} value={m}>
-                      Tháng {m}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1 min-w-0">
-                <label className="text-[11px] font-bold text-slate-600 block">Loại văn bản</label>
-                <select
-                  aria-label="Lọc theo loại văn bản"
-                  value={selectedType}
-                  onChange={(e) => setSelectedType(e.target.value)}
-                  className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600"
-                >
-                  <option value="all">Tất cả loại VB</option>
-                  <option value="VBD">Văn bản đến (VBD)</option>
-                  {documentTypes.map((t) => (
-                    <option key={t.code} value={t.code}>
-                      {t.name} ({t.code})
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1 min-w-0">
-                <label className="text-[11px] font-bold text-slate-600 block">Người ký</label>
-                <select
-                  aria-label="Lọc theo người ký"
-                  value={selectedSigner}
-                  onChange={(e) => setSelectedSigner(e.target.value)}
-                  className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600"
-                >
-                  <option value="all">Mọi người ký</option>
-                  {availableSigners.map((s) => (
-                    <option key={s} value={s}>
-                      {s}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="space-y-1 min-w-0">
-                <label className="text-[11px] font-bold text-slate-600 block">Trạng thái hồ sơ</label>
-                <select
-                  aria-label="Lọc trạng thái hồ sơ"
-                  value={selectedStatus}
-                  onChange={(e) => setSelectedStatus(e.target.value)}
-                  className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600"
-                >
-                  <option value="all">Tất cả hồ sơ</option>
-                  <option value="active">Hiệu lực</option>
-                  <option value="cancelled">Đã hủy</option>
-                </select>
-              </div>
-
-              <div className="space-y-1 min-w-0">
-                <label className="text-[11px] font-bold text-slate-600 block">Trạng thái tệp</label>
-                <select
-                  aria-label="Lọc trạng thái tệp Drive"
-                  value={selectedDriveStatus}
-                  onChange={(e) => setSelectedDriveStatus(e.target.value)}
-                  className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600"
-                >
-                  <option value="all">Tất cả trạng thái tệp</option>
-                  <option value="saved">Đã lưu lên Drive</option>
-                  <option value="uploading">Đang lưu</option>
-                  <option value="failed">Lưu tệp thất bại</option>
-                  <option value="none">Không đính kèm</option>
-                </select>
-              </div>
-
-              <div className="space-y-1 min-w-0">
-                <label className="text-[11px] font-bold text-slate-600 block">Sắp xếp</label>
-                <select
-                  aria-label="Sắp xếp danh sách"
-                  value={sortBy}
-                  onChange={(e: any) => setSortBy(e.target.value)}
-                  className="w-full min-h-[40px] h-10 px-2.5 text-base sm:text-xs bg-slate-50 border border-slate-200 rounded-lg focus:bg-white focus:outline-hidden focus:ring-2 focus:ring-blue-600 font-medium text-slate-700"
-                >
-                  <option value="newest">Mới nhất trước</option>
-                  <option value="oldest">Cũ nhất trước</option>
-                  <option value="number_asc">Số TT tăng dần</option>
-                  <option value="number_desc">Số TT giảm dần</option>
-                </select>
-              </div>
-            </div>
-
-            {activeExtraFilterCount > 0 && (
-              <div className="flex justify-end">
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSelectedMonth('all');
-                    setSelectedType('all');
-                    setSelectedSigner('all');
-                    setSelectedStatus('all');
-                    setSelectedDriveStatus('all');
-                    setSortBy('newest');
-                  }}
-                  className="text-xs font-semibold text-blue-700 hover:underline"
-                >
-                  Đặt lại bộ lọc phụ
-                </button>
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* Sub-bar: Tổng của sổ theo năm + Số kết quả sau khi lọc + Mobile cards/table switch */}
-        <div className="pt-2.5 border-t border-slate-100 flex flex-col sm:flex-row sm:items-center justify-between gap-2 text-xs text-slate-600">
-          <div className="flex items-center gap-3 flex-wrap min-w-0">
-            <span>
-              Tổng sổ{' '}
-              {selectedYear === 'all'
-                ? 'tất cả các năm'
-                : selectedYear === 'unknown'
-                ? 'chưa xác định năm'
-                : `năm ${selectedYear}`}
-              : <strong className="text-slate-900 font-mono tabular-nums">{bookYearTotalCount}</strong> văn bản
-            </span>
-            <span className="text-slate-300">·</span>
-            <span>
-              Sau khi lọc: <strong className="text-blue-800 font-mono tabular-nums">{filteredDocuments.length}</strong> kết quả
-            </span>
-          </div>
-
-          <div className="flex md:hidden items-center justify-end gap-2">
-            <div className="flex items-center bg-slate-100 p-0.5 rounded-lg border border-slate-200">
-              <button
-                type="button"
-                onClick={() => setMobileViewMode('cards')}
-                className={`min-h-[34px] px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
-                  mobileViewMode === 'cards' ? 'bg-white text-blue-800 shadow-2xs' : 'text-slate-600'
-                }`}
-              >
-                <LayoutList className="w-3.5 h-3.5" />
-                <span>Thẻ</span>
-              </button>
-              <button
-                type="button"
-                onClick={() => setMobileViewMode('table')}
-                className={`min-h-[34px] px-2.5 py-1 rounded text-[11px] font-semibold transition-colors flex items-center gap-1 ${
-                  mobileViewMode === 'table' ? 'bg-white text-blue-800 shadow-2xs' : 'text-slate-600'
-                }`}
-              >
-                <Table className="w-3.5 h-3.5" />
-                <span>Bảng</span>
-              </button>
-            </div>
-          </div>
-        </div>
       </div>
 
       {/* PDF Content Search Results Panel */}
@@ -2422,120 +2576,148 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
 
       {/* Mobile Default Card View (No horizontal scroll) */}
       {mobileViewMode === 'cards' && (
-        <div className="md:hidden space-y-3">
+        <div className="md:hidden space-y-2.5">
           {paginatedActiveDocuments.length === 0 ? (
             <div className="bg-white border border-slate-200 rounded-xl p-8 text-center text-slate-400">
               <p className="font-semibold text-slate-600 text-sm">Chưa có văn bản nào phù hợp</p>
               <span className="text-xs text-slate-400 mt-1 block">Hãy đổi tiêu chí tìm kiếm hoặc cấp số mới.</span>
             </div>
           ) : (
-            paginatedActiveDocuments.map((doc) => {
+            paginatedActiveDocuments.map((doc, idx) => {
+              const rowStt = (safeActivePage - 1) * activePageSize + idx + 1;
               const isCancelled = doc.status === 'cancelled';
               const isIncoming = doc.docCategory === 'incoming';
               const categoryStyle = isIncoming ? SEMANTIC_STATUS_STYLES.incoming : SEMANTIC_STATUS_STYLES.outgoing;
-              const recordStatus = getRecordStatusMeta(doc);
               const displayIssueDate = normalizeDateOnlyDdMmYyyy(doc.issueDate) || '—';
               const bookObj = bookMap.get(getDocBookId(doc));
               const unitDisplay = isIncoming
                 ? doc.issuingAgency || 'Cơ quan ngoài'
                 : bookObj?.unitName || settings?.unitName || 'Đoàn trường';
+              const pendingDate = isDateConfirmationPending(doc);
 
               return (
                 <div
                   key={doc.id}
-                  className={`bg-white border rounded-xl p-3.5 sm:p-4 shadow-2xs space-y-3 min-w-0 ${
+                  data-testid="mobile-doc-card"
+                  className={`bg-white border rounded-xl p-3.5 shadow-2xs space-y-2.5 min-w-0 ${
                     isCancelled ? 'border-rose-200 bg-rose-50/20' : 'border-slate-200'
                   }`}
                 >
-                  <div className="flex items-start justify-between gap-2">
+                  {/* Top priority header: STT · Số/ký hiệu · Văn bản đi/đến · Trạng thái */}
+                  <div className="flex items-start justify-between gap-2 min-w-0">
                     <div className="flex items-center gap-1.5 flex-wrap min-w-0">
-                      <span className={`text-[11px] font-bold px-2 py-0.5 rounded border ${categoryStyle.badge}`}>
-                        {isIncoming ? 'Văn bản đến' : `Văn bản đi · ${doc.typeName || doc.typeCode}`}
+                      <span
+                        data-testid="mobile-row-stt"
+                        className="font-mono tabular-nums text-[11px] font-bold px-1.5 py-0.5 rounded bg-slate-100 text-slate-700 border border-slate-200 shrink-0"
+                      >
+                        #{rowStt}
                       </span>
-                      {doc.needsReview && (
-                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                      <span className={`font-mono font-bold text-sm break-all ${categoryStyle.text}`}>
+                        {doc.fullDocNumber}
+                      </span>
+                      <span
+                        className={`text-[11px] font-semibold px-2 py-0.5 rounded border shrink-0 ${categoryStyle.badge}`}
+                      >
+                        {isIncoming ? 'Văn bản đến' : 'Văn bản đi'}
+                      </span>
+                    </div>
+
+                    <div className="flex items-center gap-1 flex-wrap justify-end shrink-0">
+                      {isCancelled && (
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.danger.badge}`}>
+                          Đã hủy
+                        </span>
+                      )}
+                      {!isCancelled && pendingDate && (
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                          Chờ xác nhận ngày
+                        </span>
+                      )}
+                      {!isCancelled && !pendingDate && doc.needsReview && (
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
                           Cần kiểm tra
                         </span>
                       )}
-                      {isCancelled && (
-                        <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${recordStatus.className}`}>
-                          {recordStatus.label}
+                      {doc.driveStatus === 'uploading' && (
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                          Đang lưu
+                        </span>
+                      )}
+                      {doc.driveStatus === 'failed' && (
+                        <span className={`text-[10px] font-semibold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.danger.badge}`}>
+                          Lưu tệp thất bại
                         </span>
                       )}
                     </div>
                   </div>
 
-                  <div className="flex items-center gap-2 min-w-0">
-                    <span className={`font-mono font-bold text-sm break-all ${categoryStyle.text}`}>
-                      {doc.fullDocNumber}
-                    </span>
-                  </div>
-
+                  {/* Clickable Tên văn bản */}
                   <div className="min-w-0">
-                    <h3 className={`text-sm font-bold text-slate-900 leading-snug break-words ${isCancelled ? 'line-through text-slate-400' : ''}`}>
+                    <button
+                      type="button"
+                      onClick={() => setDetailModalDoc(doc)}
+                      className={`text-left text-sm font-bold text-slate-900 hover:text-sky-800 leading-snug break-words w-full ${
+                        isCancelled ? 'line-through text-slate-400' : ''
+                      }`}
+                    >
                       {doc.docName || doc.title}
-                    </h3>
+                    </button>
                     <p className="text-[11px] text-slate-600 mt-1 break-words">
-                      <span className="text-slate-400">Cơ quan / Đơn vị:</span>{' '}
-                      <strong className="text-slate-800">{unitDisplay}</strong> ·{' '}
-                      <span className="text-slate-400">Ngày BH:</span>{' '}
-                      <strong className="font-mono text-slate-800">{displayIssueDate}</strong>
+                      <span className="text-slate-700 font-medium">{unitDisplay}</span> ·{' '}
+                      <span className="font-mono text-slate-700 tabular-nums">
+                        {pendingDate && displayIssueDate === '—' ? 'Chờ xác nhận' : displayIssueDate}
+                      </span>
                     </p>
                   </div>
 
-                  {/* Drive File Status Badge */}
-                  <div className="flex items-center justify-between gap-2 px-2.5 py-2 rounded-lg border border-slate-200 bg-slate-50/70 text-[11px] flex-wrap">
-                    <span
-                      className={`font-semibold px-2 py-0.5 rounded border ${
-                        doc.driveStatus === 'saved'
-                          ? SEMANTIC_STATUS_STYLES.saved.badge
-                          : doc.driveStatus === 'failed'
-                          ? SEMANTIC_STATUS_STYLES.danger.badge
-                          : doc.driveStatus === 'uploading'
-                          ? SEMANTIC_STATUS_STYLES.pending.badge
-                          : 'text-slate-600 bg-white border-slate-200'
-                      }`}
-                    >
-                      {getDriveStatusLabel(doc)}
-                    </span>
-                    <span className="text-[11px] text-slate-500 truncate min-w-0">
-                      {bookObj?.name || doc.bookName}
-                    </span>
-                  </div>
+                  {/* Footer: File summary + Icon actions */}
+                  <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs min-w-0">
+                    <div className="flex items-center gap-2 min-w-0">
+                      {doc.driveStatus === 'saved' ? (
+                        <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 shrink-0">
+                          <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                          <span>Đã lưu Drive</span>
+                        </span>
+                      ) : doc.driveStatus === 'none' || !doc.driveStatus ? (
+                        <span className="text-[11px] text-slate-400 shrink-0">Không đính kèm</span>
+                      ) : null}
+                      {(bookObj?.name || doc.bookName) && (
+                        <span className="text-[11px] text-slate-400 truncate min-w-0">
+                          {bookObj?.name || doc.bookName}
+                        </span>
+                      )}
+                    </div>
 
-                  {/* Card Actions: Xem chi tiết + Mở tệp + ⋯ */}
-                  <div className="pt-2 border-t border-slate-100 flex items-center justify-between gap-2 text-xs">
-                    <div className="flex items-center gap-2 flex-wrap">
-                      <button
-                        type="button"
-                        onClick={() => setDetailModalDoc(doc)}
-                        className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-1.5 rounded-lg bg-slate-100 hover:bg-slate-200 text-slate-800 font-semibold transition-colors whitespace-nowrap"
-                      >
-                        <Eye className="w-3.5 h-3.5 text-blue-700" />
-                        <span>Xem chi tiết</span>
-                      </button>
-
+                    <div className="flex items-center gap-1.5 shrink-0">
                       {doc.driveStatus === 'saved' && doc.driveFileUrl && (
                         <button
                           type="button"
                           onClick={() => handleOpenDriveFile(doc)}
                           disabled={openingFileId === doc.id}
-                          className="inline-flex items-center gap-1.5 min-h-[40px] px-3 py-1.5 rounded-lg bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 font-semibold transition-colors whitespace-nowrap"
+                          title={doc.driveFileName ? `Mở tệp: ${doc.driveFileName}` : 'Mở tệp trên Google Drive'}
+                          aria-label={`Mở tệp ${doc.fullDocNumber}`}
+                          className="inline-flex items-center justify-center min-w-[40px] min-h-[40px] rounded-lg border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 disabled:opacity-50 transition-colors"
                         >
-                          <ExternalLink className="w-3.5 h-3.5" />
-                          <span>Mở tệp</span>
+                          {openingFileId === doc.id ? (
+                            <Loader2 className="w-4 h-4 animate-spin" />
+                          ) : (
+                            <ExternalLink className="w-4 h-4" />
+                          )}
                         </button>
                       )}
-                    </div>
 
-                    <button
-                      type="button"
-                      aria-label={`Thao tác khác cho ${doc.fullDocNumber}`}
-                      onClick={(e) => toggleActionMenu(e, doc)}
-                      className="inline-flex items-center justify-center min-w-[40px] min-h-[40px] rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 shrink-0"
-                    >
-                      <MoreHorizontal className="w-4 h-4" />
-                    </button>
+                      <button
+                        type="button"
+                        aria-label={`Thao tác khác cho ${doc.fullDocNumber}`}
+                        aria-haspopup="menu"
+                        aria-expanded={openMenu?.doc.id === doc.id}
+                        title="Thao tác khác"
+                        onClick={(e) => toggleActionMenu(e, doc)}
+                        className="inline-flex items-center justify-center min-w-[40px] min-h-[40px] rounded-lg border border-slate-200 bg-white hover:bg-slate-50 text-slate-700 shrink-0"
+                      >
+                        <MoreHorizontal className="w-4 h-4" />
+                      </button>
+                    </div>
                   </div>
                 </div>
               );
@@ -2553,14 +2735,14 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
         <div className="overflow-x-auto">
           <table className="w-full text-left border-collapse">
             <thead>
-              <tr className="bg-sky-900 text-white text-[11px] font-bold uppercase tracking-wider divide-x divide-sky-800">
-                <th className="py-3 px-3.5 w-48">Số / Ký hiệu</th>
-                <th className="py-3 px-4 min-w-[240px]">Tên văn bản</th>
-                <th className="py-3 px-3 w-32 text-center">Ngày ban hành</th>
+              <tr className="bg-slate-50 border-b border-slate-200 text-slate-700 text-[11px] font-bold uppercase tracking-wider">
+                <th className="py-3 px-2.5 w-16 text-center whitespace-nowrap">STT</th>
+                <th className="py-3 px-3 w-48 whitespace-nowrap">Số / Ký hiệu</th>
+                <th className="py-3 px-3.5 min-w-[240px]">Tên văn bản</th>
+                <th className="py-3 px-3 w-32 text-center whitespace-nowrap">Ngày ban hành</th>
                 <th className="py-3 px-3 w-44">Cơ quan / Đơn vị</th>
-                <th className="py-3 px-3 w-36 text-center">Trạng thái</th>
-                <th className="py-3 px-3 w-44 text-center">Tệp</th>
-                <th className="py-3 px-3 w-48 text-center">Thao tác</th>
+                <th className="py-3 px-3 w-40 text-center whitespace-nowrap">Trạng thái</th>
+                <th className="py-3 px-2.5 w-24 text-center whitespace-nowrap">Thao tác</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100 text-xs text-slate-700">
@@ -2572,50 +2754,60 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                   </td>
                 </tr>
               ) : (
-                paginatedActiveDocuments.map((doc) => {
+                paginatedActiveDocuments.map((doc, idx) => {
+                  const rowStt = (safeActivePage - 1) * activePageSize + idx + 1;
                   const isCancelled = doc.status === 'cancelled';
                   const isIncoming = doc.docCategory === 'incoming';
                   const categoryStyle = isIncoming ? SEMANTIC_STATUS_STYLES.incoming : SEMANTIC_STATUS_STYLES.outgoing;
-                  const recordStatus = getRecordStatusMeta(doc);
                   const displayIssueDate = normalizeDateOnlyDdMmYyyy(doc.issueDate) || '—';
                   const bookObj = bookMap.get(getDocBookId(doc));
                   const agencyOrUnit = isIncoming
                     ? doc.issuingAgency || 'Chưa xác định'
                     : bookObj?.unitName || settings?.unitName || 'Đoàn trường';
+                  const pendingDate = isDateConfirmationPending(doc);
 
                   return (
                     <tr
                       key={doc.id}
-                      className={`hover:bg-blue-50/30 transition-colors ${
-                        isCancelled ? 'bg-rose-50/30' : ''
+                      data-testid="desktop-doc-row"
+                      className={`hover:bg-sky-50/40 transition-colors ${
+                        isCancelled ? 'bg-rose-50/25' : ''
                       }`}
                     >
-                      {/* 1. Số / Ký hiệu */}
-                      <td className="py-3 px-3.5 align-top">
+                      {/* 1. STT */}
+                      <td
+                        data-testid="desktop-row-stt"
+                        className="py-3 px-2.5 text-center font-mono tabular-nums font-semibold text-slate-600 align-top whitespace-nowrap"
+                      >
+                        {rowStt}
+                      </td>
+
+                      {/* 2. Số / Ký hiệu + Nhãn Văn bản đi / Văn bản đến duy nhất */}
+                      <td className="py-3 px-3 align-top">
                         <div className="space-y-1">
-                          <div className={`inline-flex items-center gap-1.5 font-mono font-bold px-2.5 py-0.5 rounded border shadow-2xs ${categoryStyle.badge}`}>
-                            <span className={`w-1.5 h-1.5 rounded-full ${categoryStyle.dot}`} />
-                            <span>{doc.fullDocNumber}</span>
+                          <div className="font-mono font-bold text-slate-900 whitespace-nowrap">
+                            {doc.fullDocNumber}
                           </div>
                           <div className="flex items-center gap-1.5 flex-wrap">
-                            <span className={`text-[11px] font-semibold ${categoryStyle.text}`}>
-                              {isIncoming ? 'Văn bản đến' : `Văn bản đi · ${doc.typeName}`}
+                            <span
+                              className={`inline-flex items-center gap-1 text-[11px] font-semibold px-2 py-0.5 rounded border ${categoryStyle.badge}`}
+                            >
+                              <span className={`w-1.5 h-1.5 rounded-full ${categoryStyle.dot}`} />
+                              <span>{isIncoming ? 'Văn bản đến' : 'Văn bản đi'}</span>
                             </span>
-                            {doc.needsReview && (
-                              <span className={`text-[10px] font-bold px-1.5 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
-                                Cần kiểm tra
-                              </span>
+                            {!isIncoming && doc.typeName && (
+                              <span className="text-[11px] text-slate-500">{doc.typeName}</span>
                             )}
                           </div>
                         </div>
                       </td>
 
-                      {/* 2. Tên văn bản */}
-                      <td className="py-3 px-4 align-top max-w-md">
+                      {/* 3. Tên văn bản (bấm để mở chi tiết) */}
+                      <td className="py-3 px-3.5 align-top max-w-md">
                         <button
                           type="button"
                           onClick={() => setDetailModalDoc(doc)}
-                          className={`text-left font-semibold text-slate-900 hover:text-blue-800 transition-colors leading-snug ${
+                          className={`text-left font-semibold text-slate-900 hover:text-sky-800 hover:underline transition-colors leading-snug ${
                             isCancelled ? 'line-through text-slate-400' : ''
                           }`}
                         >
@@ -2633,12 +2825,18 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         )}
                       </td>
 
-                      {/* 3. Ngày ban hành */}
+                      {/* 4. Ngày ban hành */}
                       <td className="py-3 px-3 text-center font-mono whitespace-nowrap text-slate-800 align-top tabular-nums">
-                        {displayIssueDate}
+                        {pendingDate && displayIssueDate === '—' ? (
+                          <span className="text-[11px] font-sans font-semibold text-amber-800">
+                            Chờ xác nhận
+                          </span>
+                        ) : (
+                          displayIssueDate
+                        )}
                       </td>
 
-                      {/* 4. Cơ quan / Đơn vị */}
+                      {/* 5. Cơ quan / Đơn vị */}
                       <td className="py-3 px-3 align-top">
                         <div className="font-medium text-slate-800 text-xs">{agencyOrUnit}</div>
                         {bookObj && (
@@ -2648,65 +2846,79 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                         )}
                       </td>
 
-                      {/* 5. Trạng thái (Hồ sơ) */}
-                      <td className="py-3 px-3 text-center whitespace-nowrap align-top">
-                        <span className={`inline-block text-[11px] font-semibold px-2.5 py-0.5 rounded border ${recordStatus.className}`}>
-                          {recordStatus.label}
-                        </span>
-                      </td>
-
-                      {/* 6. Tệp (Trạng thái Drive) */}
+                      {/* 6. Trạng thái (Nhãn màu nhẹ cho trạng thái cần chú ý + trạng thái tệp gọn) */}
                       <td className="py-3 px-3 text-center align-top">
-                        {doc.driveStatus === 'saved' ? (
-                          <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.saved.badge}`}>
-                            Đã lưu lên Drive
-                          </span>
-                        ) : doc.driveStatus === 'failed' || doc.driveStatus === 'uploading' ? (
-                          <span
-                            className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border ${
-                              doc.driveStatus === 'uploading'
-                                ? SEMANTIC_STATUS_STYLES.pending.badge
-                                : SEMANTIC_STATUS_STYLES.danger.badge
-                            }`}
-                            title={doc.driveError || ''}
-                          >
-                            {getDriveStatusLabel(doc)}
-                          </span>
-                        ) : (
-                          <span className="text-[11px] text-slate-400">Không đính kèm</span>
-                        )}
+                        <div className="inline-flex flex-col items-center gap-1">
+                          {isCancelled && (
+                            <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.danger.badge}`}>
+                              Đã hủy
+                            </span>
+                          )}
+                          {!isCancelled && pendingDate && (
+                            <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                              Chờ xác nhận ngày
+                            </span>
+                          )}
+                          {!isCancelled && !pendingDate && doc.needsReview && (
+                            <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                              Cần kiểm tra
+                            </span>
+                          )}
+                          {doc.driveStatus === 'saved' ? (
+                            <span className="inline-flex items-center gap-1 text-[11px] font-medium text-emerald-700 whitespace-nowrap">
+                              <span className="w-1.5 h-1.5 rounded-full bg-emerald-500" />
+                              <span>Đã lưu Drive</span>
+                            </span>
+                          ) : doc.driveStatus === 'uploading' ? (
+                            <span className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                              Đang lưu
+                            </span>
+                          ) : doc.driveStatus === 'failed' ? (
+                            <span
+                              className={`inline-block text-[11px] font-semibold px-2 py-0.5 rounded border whitespace-nowrap ${SEMANTIC_STATUS_STYLES.danger.badge}`}
+                              title={doc.driveError || ''}
+                            >
+                              Lưu tệp thất bại
+                            </span>
+                          ) : (
+                            !isCancelled &&
+                            !pendingDate &&
+                            !doc.needsReview && (
+                              <span className="text-[11px] text-slate-400 whitespace-nowrap">
+                                Không đính kèm
+                              </span>
+                            )
+                          )}
+                        </div>
                       </td>
 
-                      {/* 7. Thao tác: Xem chi tiết + Mở tệp + ⋯ */}
-                      <td className="py-3 px-3 text-center whitespace-nowrap align-top">
-                        <div className="inline-flex items-center justify-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => setDetailModalDoc(doc)}
-                            className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-slate-100 hover:bg-slate-200 text-slate-800 text-[11px] font-semibold transition-colors whitespace-nowrap"
-                          >
-                            <Eye className="w-3.5 h-3.5 text-blue-700" />
-                            <span>Xem chi tiết</span>
-                          </button>
-
+                      {/* 7. Thao tác: Chỉ nút biểu tượng Mở tệp (khi có tệp) + ⋯ */}
+                      <td className="py-3 px-2.5 text-center whitespace-nowrap align-top">
+                        <div className="inline-flex items-center justify-center gap-1">
                           {doc.driveStatus === 'saved' && doc.driveFileUrl && (
                             <button
                               type="button"
                               onClick={() => handleOpenDriveFile(doc)}
                               disabled={openingFileId === doc.id}
-                              className="inline-flex items-center gap-1 px-2.5 py-1.5 rounded-md bg-emerald-50 hover:bg-emerald-100 border border-emerald-200 text-emerald-800 text-[11px] font-semibold transition-colors whitespace-nowrap"
-                              title={doc.driveFileName || 'Mở tệp'}
+                              title={doc.driveFileName ? `Mở tệp: ${doc.driveFileName}` : 'Mở tệp trên Google Drive'}
+                              aria-label={`Mở tệp ${doc.fullDocNumber}`}
+                              className="inline-flex items-center justify-center w-8 h-8 rounded-md border border-emerald-200 bg-emerald-50 hover:bg-emerald-100 text-emerald-700 disabled:opacity-50 transition-colors"
                             >
-                              <ExternalLink className="w-3.5 h-3.5" />
-                              <span>Mở tệp</span>
+                              {openingFileId === doc.id ? (
+                                <Loader2 className="w-4 h-4 animate-spin" />
+                              ) : (
+                                <ExternalLink className="w-4 h-4" />
+                              )}
                             </button>
                           )}
 
                           <button
                             type="button"
                             aria-label={`Thao tác khác cho ${doc.fullDocNumber}`}
+                            aria-haspopup="menu"
+                            aria-expanded={openMenu?.doc.id === doc.id}
                             onClick={(e) => toggleActionMenu(e, doc)}
-                            className="inline-flex items-center justify-center w-8 h-8 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-600"
+                            className="inline-flex items-center justify-center w-8 h-8 rounded-md border border-slate-200 bg-white hover:bg-slate-50 text-slate-600 transition-colors"
                             title="Thao tác khác"
                           >
                             <MoreHorizontal className="w-4 h-4" />
@@ -2736,6 +2948,20 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
           }}
           className="z-50 w-52 bg-white border border-slate-200 rounded-xl shadow-lg py-1.5 text-xs text-slate-700 animate-scaleUp"
         >
+          <button
+            type="button"
+            role="menuitem"
+            onClick={() => {
+              const target = openMenu.doc;
+              setOpenMenu(null);
+              setDetailModalDoc(target);
+            }}
+            className="w-full px-3.5 py-2 text-left hover:bg-slate-50 flex items-center gap-2 font-semibold text-slate-900 border-b border-slate-100 mb-1 pb-2"
+          >
+            <Eye className="w-3.5 h-3.5 text-sky-700 shrink-0" />
+            <span>Xem chi tiết</span>
+          </button>
+
           <button
             type="button"
             role="menuitem"
@@ -3558,20 +3784,33 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 </div>
 
                 <div>
-                  <span className="text-slate-400 block">Ngày ban hành:</span>
-                  <span className="font-semibold font-mono text-slate-900">{issueDateDisplay}</span>
+                  <span className="text-slate-400 block">Ngày văn bản:</span>
+                  {isDateConfirmationPending(detailModalDoc) ? (
+                    <span className={`inline-block mt-0.5 text-[11px] font-bold px-2 py-0.5 rounded border ${SEMANTIC_STATUS_STYLES.pending.badge}`}>
+                      Chờ quản trị viên xác nhận ngày
+                    </span>
+                  ) : (
+                    <span className="font-semibold font-mono text-slate-900 tabular-nums">{issueDateDisplay}</span>
+                  )}
+                  {detailModalDoc.dateConfirmedBy && (
+                    <span className="block text-[11px] text-emerald-700 mt-0.5">
+                      Đã xác nhận bởi {detailModalDoc.dateConfirmedBy}
+                    </span>
+                  )}
                 </div>
                 <div>
                   <span className="text-slate-400 block">
                     {isIncomingDetail ? 'Ngày tiếp nhận:' : 'Ngày cấp vào sổ:'}
                   </span>
-                  <span className="font-semibold font-mono text-slate-900">{receivedDateDisplay}</span>
+                  <span className="font-semibold font-mono text-slate-900 tabular-nums">{receivedDateDisplay}</span>
                 </div>
 
-                <div>
-                  <span className="text-slate-400 block">Ngày ký:</span>
-                  <span className="font-semibold font-mono text-slate-900">{signDateDisplay}</span>
-                </div>
+                {signDateDisplay !== '—' && signDateDisplay !== issueDateDisplay && (
+                  <div>
+                    <span className="text-slate-400 block">Ngày ký ghi nhận:</span>
+                    <span className="font-semibold font-mono text-slate-900 tabular-nums">{signDateDisplay}</span>
+                  </div>
+                )}
 
                 <div>
                   <span className="text-slate-400 block">Cơ quan ban hành / Đơn vị:</span>
@@ -3580,6 +3819,11 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                       ? detailModalDoc.issuingAgency || 'Chưa xác định'
                       : bookObj?.unitName || settings?.unitName || 'Đoàn Trường THPT Nguyễn Chí Thanh'}
                   </span>
+                  {detailModalDoc.docCategory === 'incoming' && detailModalDoc.parentAgency && (
+                    <span className="block text-[11px] text-slate-500 mt-0.5">
+                      Cơ quan chủ quản: {detailModalDoc.parentAgency}
+                    </span>
+                  )}
                 </div>
 
                 <div>
@@ -3590,6 +3834,102 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                     {detailModalDoc.issuedBy} ({detailModalDoc.issuedByUsername})
                   </span>
                 </div>
+
+                {isDateConfirmationPending(detailModalDoc) && detailModalDoc.status === 'active' && (() => {
+                  const docBookId = getDocBookId(detailModalDoc);
+                  const canConfirmDate =
+                    isSystemAdmin(currentUser) || hasBookPermission(currentUser, docBookId, 'manage_book');
+                  const sourceTop = detailModalDoc.dateMismatchSources?.topRight;
+                  const sourceSig = detailModalDoc.dateMismatchSources?.signature;
+                  const fallbackDate1 = sourceTop?.date || normalizeDateOnlyDdMmYyyy(detailModalDoc.issueDate || '');
+                  const fallbackDate2 = sourceSig?.date || normalizeDateOnlyDdMmYyyy(detailModalDoc.signDate || '');
+                  return (
+                    <div className="sm:col-span-2 p-3.5 bg-amber-50 border border-amber-300 rounded-xl space-y-2.5">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="font-bold text-amber-950 flex items-center gap-1.5">
+                          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                          <span>Ngày trên văn bản chưa thống nhất</span>
+                        </span>
+                        <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-amber-200 text-amber-950 border border-amber-300">
+                          Chờ quản trị viên xác nhận ngày
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-xs">
+                        {fallbackDate1 && (
+                          <div className="bg-white border border-amber-200 rounded-lg px-2.5 py-2 flex items-center justify-between gap-2">
+                            <div>
+                              <span className="text-[11px] text-slate-500 block">
+                                {sourceTop?.positionLabel || 'Đầu trang 1 (góc phải)'}
+                                {sourceTop?.page ? ` · Tr.${sourceTop.page}` : ''}
+                              </span>
+                              <strong className="font-mono text-slate-900 tabular-nums">{fallbackDate1}</strong>
+                            </div>
+                            {canConfirmDate && (
+                              <button
+                                type="button"
+                                disabled={confirmDateSubmitting}
+                                onClick={() => handleConfirmDocumentDate(detailModalDoc.id, fallbackDate1)}
+                                className="px-2.5 py-1 bg-sky-700 hover:bg-sky-800 text-white text-[11px] font-semibold rounded disabled:opacity-50"
+                              >
+                                Chọn &amp; Xác nhận
+                              </button>
+                            )}
+                          </div>
+                        )}
+                        {fallbackDate2 && fallbackDate2 !== fallbackDate1 && (
+                          <div className="bg-white border border-amber-200 rounded-lg px-2.5 py-2 flex items-center justify-between gap-2">
+                            <div>
+                              <span className="text-[11px] text-slate-500 block">
+                                {sourceSig?.positionLabel || 'Khối chữ ký'}
+                                {sourceSig?.page ? ` · Tr.${sourceSig.page}` : ''}
+                              </span>
+                              <strong className="font-mono text-slate-900 tabular-nums">{fallbackDate2}</strong>
+                            </div>
+                            {canConfirmDate && (
+                              <button
+                                type="button"
+                                disabled={confirmDateSubmitting}
+                                onClick={() => handleConfirmDocumentDate(detailModalDoc.id, fallbackDate2)}
+                                className="px-2.5 py-1 bg-sky-700 hover:bg-sky-800 text-white text-[11px] font-semibold rounded disabled:opacity-50"
+                              >
+                                Chọn &amp; Xác nhận
+                              </button>
+                            )}
+                          </div>
+                        )}
+                      </div>
+
+                      {canConfirmDate ? (
+                        <div className="flex flex-col sm:flex-row sm:items-center gap-2">
+                          <input
+                            type="text"
+                            value={confirmDateInput}
+                            onChange={(e) => setConfirmDateInput(e.target.value)}
+                            placeholder="Hoặc nhập ngày thống nhất (dd/mm/yyyy)"
+                            className="flex-1 min-h-[38px] px-2.5 bg-white border border-amber-300 rounded-lg font-mono text-xs text-slate-900 tabular-nums"
+                          />
+                          <button
+                            type="button"
+                            disabled={confirmDateSubmitting || !confirmDateInput.trim()}
+                            onClick={() => handleConfirmDocumentDate(detailModalDoc.id, confirmDateInput)}
+                            className="px-3.5 py-2 bg-emerald-700 hover:bg-emerald-800 disabled:opacity-50 text-white font-semibold rounded-lg text-xs shrink-0"
+                          >
+                            {confirmDateSubmitting ? 'Đang xác nhận...' : 'Xác nhận ngày thống nhất'}
+                          </button>
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-amber-900">
+                          Chỉ Quản trị viên hệ thống hoặc Quản trị sổ mới có quyền xác nhận ngày thống nhất cho hồ sơ này.
+                        </p>
+                      )}
+
+                      {confirmDateError && (
+                        <p className="text-[11px] text-rose-700 font-semibold">{confirmDateError}</p>
+                      )}
+                    </div>
+                  );
+                })()}
 
                 <div className="sm:col-span-2">
                   <span className="text-slate-400 block">Người ký &amp; Chức vụ:</span>
@@ -3679,7 +4019,7 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                             {getDriveStatusLabel(detailModalDoc)}
                           </span>
 
-                          {detailModalDoc.wordGenerationStatus === 'failed' && detailModalDoc.templateId && canRetryOrAttachDoc(detailModalDoc) && (
+                          {(detailModalDoc.wordGenerationStatus === 'failed' || detailModalDoc.driveStatus === 'failed') && detailModalDoc.templateId && canRetryOrAttachDoc(detailModalDoc) && (
                             <button
                               type="button"
                               disabled={retryingWordTemplate}
@@ -3857,6 +4197,11 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                                               {att.fileSize ? ` · ${formatFileSize(att.fileSize)}` : ''}
                                               {att.uploadedAt ? ` · ${new Date(att.uploadedAt).toLocaleString('vi-VN')}` : ''}
                                             </p>
+                                            {att.driveStatus === 'saved' && att.driveFolderPath && (
+                                              <p className="text-[11px] text-slate-500 font-mono truncate" title={att.driveFolderPath}>
+                                                Thư mục Drive: {att.driveFolderPath}
+                                              </p>
+                                            )}
                                           </div>
 
                                           <div className="flex flex-wrap items-center gap-1.5 shrink-0">
@@ -4283,37 +4628,62 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 </div>
 
                 {editModalDoc.docCategory === 'incoming' && (
-                  <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
-                    <div className="space-y-1">
-                      <label className="font-bold text-slate-700">Cơ quan ban hành</label>
-                      <input
-                        type="text"
-                        value={editIssuingAgency}
-                        onChange={(e) => setEditIssuingAgency(e.target.value)}
-                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="font-bold text-slate-700">Ngày ban hành</label>
-                      <input
-                        type="text"
-                        value={editIssueDate}
-                        onChange={(e) => setEditIssueDate(e.target.value)}
-                        onBlur={(e) => setEditIssueDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
-                        placeholder="dd/mm/yyyy"
-                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                      />
-                    </div>
-                    <div className="space-y-1">
-                      <label className="font-bold text-slate-700">Ngày ký</label>
-                      <input
-                        type="text"
-                        value={editSignDate}
-                        onChange={(e) => setEditSignDate(e.target.value)}
-                        onBlur={(e) => setEditSignDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
-                        placeholder="dd/mm/yyyy"
-                        className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-xs"
-                      />
+                  <div className="space-y-3">
+                    {isDateConfirmationPending(editModalDoc) && (
+                      <div className="p-2.5 bg-amber-50 border border-amber-300 rounded-lg text-[11px] text-amber-950">
+                        <strong>Hồ sơ đang chờ xác nhận ngày thống nhất.</strong>{' '}
+                        {canManageThisBook
+                          ? 'Nhập Ngày văn bản hợp lệ bên dưới và bấm Lưu để xác nhận ngày thống nhất.'
+                          : 'Chỉ Quản trị viên hệ thống hoặc Quản trị sổ mới có quyền chốt ngày thống nhất.'}
+                      </div>
+                    )}
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                      <div className="space-y-1">
+                        <label className="font-bold text-slate-700">Cơ quan ban hành</label>
+                        <input
+                          type="text"
+                          value={editIssuingAgency}
+                          onChange={(e) => setEditIssuingAgency(e.target.value)}
+                          className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="font-bold text-slate-700">Cơ quan chủ quản (nếu có)</label>
+                        <input
+                          type="text"
+                          value={editParentAgency}
+                          onChange={(e) => setEditParentAgency(e.target.value)}
+                          className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg text-base sm:text-xs"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="font-bold text-slate-700">Ngày văn bản (dd/mm/yyyy)</label>
+                        <input
+                          type="text"
+                          value={editIssueDate}
+                          onChange={(e) => setEditIssueDate(e.target.value)}
+                          onBlur={(e) => {
+                            const norm = normalizeDateOnlyDdMmYyyy(e.target.value);
+                            if (norm) setEditIssueDate(norm);
+                          }}
+                          placeholder="dd/mm/yyyy"
+                          className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg font-mono tabular-nums text-base sm:text-xs"
+                        />
+                      </div>
+                      <div className="space-y-1">
+                        <label className="font-bold text-slate-700">Ngày ký (nếu khác)</label>
+                        <input
+                          type="text"
+                          value={editSignDate}
+                          onChange={(e) => setEditSignDate(e.target.value)}
+                          onBlur={(e) => {
+                            const norm = normalizeDateOnlyDdMmYyyy(e.target.value);
+                            if (norm) setEditSignDate(norm);
+                          }}
+                          placeholder="dd/mm/yyyy"
+                          className="w-full min-h-[42px] sm:min-h-[36px] px-2.5 bg-white border border-slate-300 rounded-lg font-mono tabular-nums text-base sm:text-xs"
+                        />
+                      </div>
                     </div>
                   </div>
                 )}
@@ -5078,6 +5448,119 @@ export const DocumentRegistryView: React.FC<DocumentRegistryViewProps> = ({
                 </button>
               </div>
             </form>
+          </div>
+        </div>
+      )}
+      {/* Grounded Document Q&A Drawer */}
+      <DocumentChatDrawer
+        open={chatDrawerOpen}
+        onClose={() => setChatDrawerOpen(false)}
+        viewableBooks={viewableBooks}
+        defaultBookId={activeBookId}
+        onOpenDocumentDetail={(docId) => {
+          setChatDrawerOpen(false);
+          handleOpenDetailByDocId(docId);
+        }}
+        onOpenCitationPdfPage={handleOpenCitationPdfPage}
+      />
+
+      {/* Exact-page Citation PDF Viewer Modal */}
+      {citationPdfModal && (
+        <div className="fixed inset-0 z-50 bg-slate-900/60 backdrop-blur-xs flex items-center justify-center p-3 sm:p-4">
+          <div className="bg-white rounded-2xl shadow-2xl border border-slate-200 max-w-5xl w-full h-[90vh] flex flex-col overflow-hidden">
+            <div className="px-4 py-3 bg-sky-950 text-white flex items-center justify-between gap-3 shrink-0">
+              <div className="min-w-0">
+                <div className="flex items-center gap-2 text-xs font-mono text-sky-200">
+                  <span>{citationPdfModal.fullDocNumber}</span>
+                  {citationPdfModal.page && (
+                    <span className="px-2 py-0.5 rounded bg-sky-800 text-white font-bold">
+                      Trang {citationPdfModal.page}
+                    </span>
+                  )}
+                </div>
+                <h3 className="text-sm font-bold truncate mt-0.5">{citationPdfModal.docName}</h3>
+              </div>
+              <div className="flex items-center gap-2 shrink-0">
+                <button
+                  type="button"
+                  onClick={() => {
+                    const targetId = citationPdfModal.docId;
+                    closeCitationPdfModal();
+                    handleOpenDetailByDocId(targetId);
+                  }}
+                  className="px-3 py-1.5 rounded-lg bg-sky-800 hover:bg-sky-700 text-xs font-semibold"
+                >
+                  Xem hồ sơ
+                </button>
+                {citationPdfModal.driveUrl && (
+                  <a
+                    href={citationPdfModal.driveUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1 px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-700 text-xs font-semibold"
+                  >
+                    <ExternalLink className="w-3.5 h-3.5" />
+                    <span>Mở trên Drive</span>
+                  </a>
+                )}
+                <button
+                  type="button"
+                  onClick={closeCitationPdfModal}
+                  className="p-1.5 text-sky-200 hover:text-white rounded-lg"
+                  aria-label="Đóng trình xem PDF"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
+            </div>
+
+            {citationPdfModal.excerpt && (
+              <div className="px-4 py-2 bg-sky-50 border-b border-sky-200 text-xs text-sky-950 shrink-0">
+                <strong className="font-bold">Đoạn trích căn cứ: </strong>
+                <span className="italic">"{citationPdfModal.excerpt}"</span>
+              </div>
+            )}
+
+            <div className="flex-1 min-h-0 bg-slate-100 overflow-hidden flex flex-col">
+              {citationPdfModal.loading ? (
+                <div className="flex-1 flex items-center justify-center text-xs text-slate-600 gap-2">
+                  <Loader2 className="w-5 h-5 animate-spin text-sky-700" />
+                  <span>Đang mở tài liệu PDF{citationPdfModal.page ? ` tại trang ${citationPdfModal.page}` : ''}...</span>
+                </div>
+              ) : citationPdfModal.blobUrl ? (
+                <div className="flex-1 min-h-0 p-2 sm:p-3 overflow-y-auto">
+                  <PdfPreviewPane
+                    pdfUrl={citationPdfModal.blobUrl}
+                    fileName={citationPdfModal.fileName}
+                    relevantPages={citationPdfModal.page ? [citationPdfModal.page] : []}
+                    jumpToPage={citationPdfModal.page ?? 1}
+                  />
+                </div>
+              ) : citationPdfModal.driveUrl ? (
+                <div className="flex-1 flex flex-col items-center justify-center p-6 text-center space-y-3">
+                  <FileText className="w-10 h-10 text-sky-700" />
+                  <p className="text-sm font-bold text-slate-900">
+                    Mở tệp PDF trực tiếp trên Google Drive{citationPdfModal.page ? ` (Trang ${citationPdfModal.page})` : ''}
+                  </p>
+                  <p className="text-xs text-slate-600 max-w-md">
+                    Sổ này đang dùng chế độ liên kết Google Drive trực tiếp. Nhấn nút bên dưới để mở đúng trang PDF trong tab mới.
+                  </p>
+                  <a
+                    href={citationPdfModal.driveUrl}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 px-4 py-2.5 rounded-lg bg-sky-800 hover:bg-sky-900 text-white text-xs font-bold shadow-xs"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    <span>Mở trang {citationPdfModal.page || 1} PDF trên Google Drive</span>
+                  </a>
+                </div>
+              ) : (
+                <div className="flex-1 flex items-center justify-center p-6 text-center text-xs text-rose-700">
+                  {citationPdfModal.error || 'Không mở được tệp PDF.'}
+                </div>
+              )}
+            </div>
           </div>
         </div>
       )}

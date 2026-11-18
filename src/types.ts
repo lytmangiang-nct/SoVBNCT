@@ -16,6 +16,8 @@ export type BookPermission =
   | 'cancel'
   | 'delete'
   | 'export'
+  | 'import_archive'
+  | 'close_book'
   | 'manage_book';
 
 export interface DocumentTypeConfig {
@@ -136,7 +138,11 @@ export type DocumentAuditAction =
   | 'attachment_set_official'
   | 'task_create'
   | 'task_update'
-  | 'reconcile_sync';
+  | 'reconcile_sync'
+  | 'confirm_date'
+  | 'archive_import'
+  | 'book_close'
+  | 'book_amendment';
 
 export type AttachmentGroup = 'word_draft' | 'signed_pdf' | 'appendix';
 
@@ -388,7 +394,10 @@ export interface SystemAuditLog {
     | 'book_create'
     | 'book_update'
     | 'history_cleanup'
-    | 'deleted_list_archive';
+    | 'deleted_list_archive'
+    | 'archive_import'
+    | 'book_close'
+    | 'book_amendment';
   bookId?: string;
   bookCode?: string;
   targetUserId?: string;
@@ -411,6 +420,7 @@ export interface DocumentRecord {
   receivedDate?: string; // dd/mm/yyyy ngày tiếp nhận theo giờ Việt Nam
   createdAt: string; // ISO
   docCategory?: DocumentCategory; // 'outgoing' (Đoàn trường ban hành) | 'incoming' (Văn bản đến PDF)
+  parentAgency?: string; // Cơ quan chủ quản cấp trên (nếu có)
   issuingAgency?: string; // Cơ quan ban hành gốc (đối với văn bản đến)
   typeCode: string;
   typeName: string;
@@ -470,20 +480,29 @@ export interface DocumentRecord {
   driveFolderPath?: string;
   driveUploadedAt?: string;
   driveError?: string;
-  // Incoming PDF provenance & review flags
+  // Incoming PDF provenance, date confirmation & review flags
   sourceType?: 'pdf_url' | 'pdf_upload';
   sourceUrl?: string;
   fileSha256?: string;
   needsReview?: boolean;
   reviewReasons?: string[];
   relevantPages?: number[];
+  pendingDateConfirmation?: boolean;
+  dateComparisonStatus?: DateComparisonStatus;
+  dateMismatchSources?: {
+    topRight?: ExtractedDateSource;
+    signature?: ExtractedDateSource;
+  };
+  dateConfirmedBy?: string;
+  dateConfirmedByUserId?: string;
+  dateConfirmedAt?: string;
   // Multi-attachment & versioning
   attachments?: DocumentAttachment[];
   // Auto Word generation from template
   templateId?: string;
   wordGenerationStatus?: 'none' | 'generated' | 'failed';
   wordGenerationError?: string;
-  // Indexed PDF page contents & extracted task suggestions
+  // Indexed PDF page contents (and optional legacy task suggestions)
   pdfPageContents?: PdfPageContent[];
   pdfContentVersion?: number;
   pdfTextStatus?: 'indexed' | 'no_text';
@@ -523,13 +542,28 @@ export interface NormalizedBBox {
   y1: number;
 }
 
+export type DateComparisonStatus = 'single' | 'matched' | 'mismatch' | 'missing';
+
+export interface ExtractedDateSource {
+  date: string; // dd/MM/yyyy
+  positionLabel: string;
+  page: number;
+  bbox?: NormalizedBBox;
+  estimated?: boolean;
+  rawText?: string;
+}
+
 export type ExtractableFieldKey =
   | 'docNumber'
+  | 'parentAgency'
   | 'issuingAgency'
   | 'docName'
   | 'title'
+  | 'documentDate'
   | 'issueDate'
   | 'signDate'
+  | 'topRightDate'
+  | 'signatureDate'
   | 'signer'
   | 'signerRole';
 
@@ -543,15 +577,21 @@ export interface PdfExtractionResult {
   docNumber: string;
   docName: string;
   title: string;
+  documentDate?: string;
   issueDate: string;
   signDate: string;
+  dateComparisonStatus?: DateComparisonStatus;
+  topRightDate?: ExtractedDateSource | null;
+  signatureDate?: ExtractedDateSource | null;
   signer: string;
   signerRole: string;
+  parentAgency?: string;
   issuingAgency: string;
   needsReview: boolean;
   reviewReasons: string[];
   relevantPages: number[];
   usedOcr: boolean;
+  aiUsed?: boolean;
   ocrConfidence?: number;
   pageCount: number;
   signerCandidates?: string[];
@@ -767,5 +807,278 @@ export interface ArchiveDeletedResult {
   documents: DocumentRecord[];
   message: string;
 }
+
+// ==========================================
+// 1. CHAT TRA CỨU CÓ DẪN NGUỒN (GROUNDED Q&A)
+// ==========================================
+export type DocumentQaCitationSourceType = 'pdf_page' | 'record_metadata';
+
+export interface DocumentQaCitation {
+  docId: string;
+  bookId: string;
+  bookCode?: string;
+  bookName: string;
+  docCategory?: DocumentCategory;
+  typeCode: string;
+  typeName: string;
+  fullDocNumber: string;
+  docName: string;
+  issueDate?: string;
+  issuingAgency?: string;
+  sourceType: DocumentQaCitationSourceType;
+  page?: number;
+  excerpt: string;
+  attachmentId?: string;
+  hasPdfFile?: boolean;
+  hasDriveFile?: boolean;
+}
+
+export interface DocumentQaResponse {
+  question: string;
+  answer: string;
+  insufficientEvidence: boolean;
+  mismatchNote?: string;
+  citations: DocumentQaCitation[];
+  searchedBooks: Array<{ id: string; code: string; name: string }>;
+  usedAi: boolean;
+  indexedPdfCount: number;
+  totalSearchedDocs: number;
+}
+
+// ==========================================
+// 2. NHẬP KHO VĂN BẢN CŨ TỪ EXCEL & DRIVE
+// ==========================================
+export type ArchiveImportRowStatus =
+  | 'ready'
+  | 'possible_duplicate'
+  | 'missing_info'
+  | 'unmatched_file'
+  | 'ambiguous_file';
+
+export interface ArchiveDriveCandidate {
+  fileId: string;
+  fileName: string;
+  webViewLink: string;
+  mimeType?: string;
+  folderPath?: string;
+}
+
+export interface ArchiveImportColumnMapping {
+  docCategory?: string;
+  fullDocNumber?: string;
+  docName?: string;
+  issueDate?: string;
+  year?: string;
+  issuingAgency?: string;
+  signer?: string;
+  signerRole?: string;
+  typeCode?: string;
+  parentAgency?: string;
+  title?: string;
+  notes?: string;
+  driveLinkOrFileName?: string;
+}
+
+export interface ArchiveImportEditableRow {
+  rowNumber: number;
+  docCategory: 'outgoing' | 'incoming';
+  fullDocNumber: string;
+  docName: string;
+  issueDate: string;
+  year: string;
+  issuingAgency: string;
+  signer: string;
+  signerRole?: string;
+  typeCode?: string;
+  parentAgency?: string;
+  title?: string;
+  notes?: string;
+  driveLinkOrFileName: string;
+  driveHyperlink?: string;
+  selectedDriveFileId?: string;
+}
+
+export interface ArchiveImportPreviewRow extends ArchiveImportEditableRow {
+  rowId: string;
+  rowFingerprint: string;
+  status: ArchiveImportRowStatus;
+  errors: string[];
+  warnings: string[];
+  yearMismatchWarning?: string;
+  alreadyCommittedDocId?: string;
+  duplicateMatches: Array<{
+    docId: string;
+    fullDocNumber: string;
+    docName: string;
+    issueDate: string;
+    issuingAgency?: string;
+    status: DocumentStatus;
+  }>;
+  batchDuplicateRows: number[];
+  driveMatchStatus:
+    | 'matched_by_id'
+    | 'matched_exact_name'
+    | 'matched_suggested_name'
+    | 'ambiguous'
+    | 'not_found'
+    | 'access_denied'
+    | 'none';
+  matchedDriveFile?: ArchiveDriveCandidate;
+  driveCandidates: ArchiveDriveCandidate[];
+  resolvedTypeCode?: string;
+  parsedSequenceNumber?: number;
+  seriesUpdateInfo?: string;
+}
+
+export interface ArchiveImportPreviewResponse {
+  bookId: string;
+  bookName: string;
+  bookCode: string;
+  folderId: string;
+  folderSource: 'custom' | 'book' | 'none';
+  driveScanError?: string;
+  driveFileCount: number;
+  summary: {
+    total: number;
+    ready: number;
+    possibleDuplicate: number;
+    missingInfo: number;
+    unmatchedFile: number;
+    ambiguousFile: number;
+  };
+  rows: ArchiveImportPreviewRow[];
+}
+
+export interface ArchiveParseExcelResponse {
+  fileName: string;
+  sheets: Array<{
+    name: string;
+    rowCount: number;
+    headers: string[];
+    suggestedMapping: ArchiveImportColumnMapping;
+    rows: Array<Record<string, { value: string; hyperlink?: string }>>;
+  }>;
+}
+
+export interface ArchiveImportCommitRowResult {
+  rowId: string;
+  rowNumber: number;
+  fullDocNumber: string;
+  docName: string;
+  status: 'imported' | 'skipped_duplicate' | 'error';
+  docId?: string;
+  message: string;
+}
+
+export interface ArchiveImportCommitResponse {
+  batchId: string;
+  totalRequested: number;
+  importedCount: number;
+  skippedDuplicateCount: number;
+  errorCount: number;
+  results: ArchiveImportCommitRowResult[];
+  createdDocuments: DocumentRecord[];
+  bookUpdated?: RegistryBook;
+}
+
+// ==========================================
+// 3. CHỐT SỔ & BÀN GIAO CUỐI NĂM
+// ==========================================
+export type ClosingMetricKey =
+  | 'outgoing'
+  | 'incoming'
+  | 'cancelled'
+  | 'missingFile'
+  | 'unsyncedSheets';
+
+export interface ClosingSummaryCounts {
+  totalActiveAndCancelled: number;
+  outgoing: number;
+  incoming: number;
+  cancelled: number;
+  missingFile: number;
+  unsyncedSheets: number;
+  pendingDateConfirmation: number;
+}
+
+export interface ClosingSnapshotDocument {
+  docId: string;
+  bookId: string;
+  bookCode: string;
+  bookName: string;
+  docCategory: DocumentCategory;
+  typeCode: string;
+  typeName: string;
+  sequenceNumber: number;
+  fullDocNumber: string;
+  docName: string;
+  title: string;
+  issueDate: string;
+  signDate?: string;
+  year: number;
+  issuingAgency?: string;
+  parentAgency?: string;
+  signer: string;
+  signerRole: string;
+  issuedBy: string;
+  status: DocumentStatus;
+  cancelReason?: string;
+  driveStatus: DriveUploadStatus;
+  driveFileId?: string;
+  driveFileName?: string;
+  driveFileUrl?: string;
+  syncStatus: SyncStatus;
+  pendingDateConfirmation?: boolean;
+  notes?: string;
+  createdAt: string;
+}
+
+export interface ClosingAmendmentChange {
+  docId?: string;
+  fullDocNumber?: string;
+  fieldLabel: string;
+  beforeValue: string;
+  afterValue: string;
+}
+
+export interface ClosingAmendmentRecord {
+  id: string;
+  reason: string;
+  amendedBy: string;
+  amendedByUserId: string;
+  amendedByUsername: string;
+  amendedAt: string;
+  amendedAtVietnam: string;
+  changes: ClosingAmendmentChange[];
+}
+
+export interface YearEndClosingSnapshot {
+  id: string;
+  closingCode: string;
+  bookId: string;
+  bookCode: string;
+  bookName: string;
+  year: number;
+  closedBy: string;
+  closedByUserId: string;
+  closedByUsername: string;
+  closedAt: string;
+  closedAtVietnam: string;
+  note?: string;
+  summary: ClosingSummaryCounts;
+  documents: ClosingSnapshotDocument[];
+  amendments: ClosingAmendmentRecord[];
+}
+
+export interface ClosingPreviewResponse {
+  bookId: string;
+  bookCode: string;
+  bookName: string;
+  year: number;
+  summary: ClosingSummaryCounts;
+  documents: ClosingSnapshotDocument[];
+  existingSnapshotsCount: number;
+}
+
 
 

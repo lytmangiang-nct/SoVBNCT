@@ -107,43 +107,59 @@ export function buildStandardDriveFileName(
   return `${baseName}${ext}`;
 }
 
+function isRealCalendarDate(dNum: number, mNum: number, yNum: number): boolean {
+  if (
+    !Number.isFinite(dNum) ||
+    !Number.isFinite(mNum) ||
+    !Number.isFinite(yNum) ||
+    dNum < 1 ||
+    dNum > 31 ||
+    mNum < 1 ||
+    mNum > 12 ||
+    yNum < 1900 ||
+    yNum > 2100
+  ) {
+    return false;
+  }
+  const probe = new Date(Date.UTC(yNum, mNum - 1, dNum));
+  return (
+    probe.getUTCFullYear() === yNum &&
+    probe.getUTCMonth() === mNum - 1 &&
+    probe.getUTCDate() === dNum
+  );
+}
+
+export function isValidCalendarDateDdMmYyyy(raw: string | undefined | null): boolean {
+  const m = (raw || '').trim().match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+  if (!m) return false;
+  return isRealCalendarDate(parseInt(m[1], 10), parseInt(m[2], 10), parseInt(m[3], 10));
+}
+
 /**
  * Normalizes any date or date-time string into date-only "dd/MM/yyyy" (no HH:mm or HH:mm:ss).
- * Returns '' if input is empty.
+ * Validates actual calendar dates (e.g. rejects 31/02/2026) and returns '' if empty or invalid when parsed.
  */
 export function normalizeDateOnlyDdMmYyyy(raw: string | undefined | null): string {
   const trimmed = (raw || '').trim();
   if (!trimmed) return '';
 
   const formatValid = (dNum: number, mNum: number, yNum: number): string => {
-    if (
-      !Number.isFinite(dNum) ||
-      !Number.isFinite(mNum) ||
-      !Number.isFinite(yNum) ||
-      dNum < 1 ||
-      dNum > 31 ||
-      mNum < 1 ||
-      mNum > 12 ||
-      yNum < 1900 ||
-      yNum > 2100
-    ) {
+    if (!isRealCalendarDate(dNum, mNum, yNum)) {
       return '';
     }
     return `${String(dNum).padStart(2, '0')}/${String(mNum).padStart(2, '0')}/${yNum}`;
   };
 
-  // 1. "ngày 14 tháng 11 năm 2026" (with optional trailing time)
-  const vnText = trimmed.match(/ng[àa]y\s+(\d{1,2})\s+th[áa]ng\s+(\d{1,2})\s+n[ăa]m\s+(\d{4})/i);
+  // 1. "ngày 14 tháng 11 năm 2026" or "ngày10 tháng 11 năm 2026" (handles missing/extra spaces)
+  const vnText = trimmed.match(/ng[àa]y\s*(\d{1,2})\s*th[áa]ng\s*(\d{1,2})\s*n[ăa]m\s*(\d{4})/i);
   if (vnText) {
-    const valid = formatValid(parseInt(vnText[1], 10), parseInt(vnText[2], 10), parseInt(vnText[3], 10));
-    if (valid) return valid;
+    return formatValid(parseInt(vnText[1], 10), parseInt(vnText[2], 10), parseInt(vnText[3], 10));
   }
 
   // 2. ISO yyyy-MM-dd or yyyy/MM/dd (with optional T... or HH:mm:ss)
   const isoMatch = trimmed.match(/^(\d{4})[\/\-](\d{1,2})[\/\-](\d{1,2})(?:[T\s,]+.*)?$/);
   if (isoMatch) {
-    const valid = formatValid(parseInt(isoMatch[3], 10), parseInt(isoMatch[2], 10), parseInt(isoMatch[1], 10));
-    if (valid) return valid;
+    return formatValid(parseInt(isoMatch[3], 10), parseInt(isoMatch[2], 10), parseInt(isoMatch[1], 10));
   }
 
   // 3. dd/MM/yyyy, dd-MM-yyyy, dd.MM.yyyy (with optional HH:mm or HH:mm:ss)
@@ -151,12 +167,10 @@ export function normalizeDateOnlyDdMmYyyy(raw: string | undefined | null): strin
   if (dmyMatch) {
     const rawYear = dmyMatch[3];
     const yNum = rawYear.length === 2 ? parseInt(`20${rawYear}`, 10) : parseInt(rawYear, 10);
-    const valid = formatValid(parseInt(dmyMatch[1], 10), parseInt(dmyMatch[2], 10), yNum);
-    if (valid) return valid;
+    return formatValid(parseInt(dmyMatch[1], 10), parseInt(dmyMatch[2], 10), yNum);
   }
 
-  // Fallback: strip any trailing time component if present
-  return trimmed.replace(/[\s,T]+\d{1,2}:\d{2}(?::\d{2})?(?:\s*(?:AM|PM|UTC|GMT|[+-]\d{2}:?\d{2}))?$/i, '').trim();
+  return '';
 }
 
 /**

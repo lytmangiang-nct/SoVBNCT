@@ -1,5 +1,5 @@
 import crypto from 'crypto';
-import type { GoogleDriveConfig } from '../src/types.js';
+import type { ArchiveDriveCandidate, GoogleDriveConfig } from '../src/types.js';
 import {
   buildStandardDriveFileName,
   DEFAULT_MAX_WORD_MB,
@@ -187,19 +187,46 @@ export function parseServiceAccountJson(rawJson: string): {
   }
 }
 
+export const UNKNOWN_DRIVE_YEAR_FOLDER = 'Chưa xác định năm';
+
+export interface DriveFolderCacheEntry {
+  bookFolderId?: string;
+  yearFolderId?: string;
+  categoryFolderId: string;
+  folderPath: string;
+  updatedAt: string;
+}
+
+export function normalizeDriveArchiveYearLabel(year?: number | string | null): string {
+  if (typeof year === 'number' && Number.isFinite(year) && year >= 1900 && year <= 2100) {
+    return String(Math.trunc(year));
+  }
+  if (typeof year === 'string') {
+    const trimmed = year.trim();
+    if (!trimmed || trimmed === 'unknown' || trimmed.toLowerCase() === 'chưa xác định năm') {
+      return UNKNOWN_DRIVE_YEAR_FOLDER;
+    }
+    if (/^\d{4}$/.test(trimmed)) {
+      const n = parseInt(trimmed, 10);
+      if (n >= 1900 && n <= 2100) return String(n);
+    }
+  }
+  return UNKNOWN_DRIVE_YEAR_FOLDER;
+}
+
 export function buildDriveFolderHierarchy(
   bookName: string,
-  year: number,
+  year: number | string | null | undefined,
   docCategory: 'outgoing' | 'incoming'
 ): { bookFolder: string; yearFolder: string; categoryFolder: string; displayPath: string } {
   const cleanBook = (bookName || 'Sổ văn bản').trim();
-  const yearStr = String(year || new Date().getFullYear());
+  const yearStr = normalizeDriveArchiveYearLabel(year);
   const cat = docCategory === 'incoming' ? 'Văn bản đến' : 'Văn bản đi';
   return {
     bookFolder: cleanBook,
     yearFolder: yearStr,
     categoryFolder: cat,
-    displayPath: `${cleanBook} → ${yearStr} → ${cat}`,
+    displayPath: `${cleanBook}/${yearStr}/${cat}`,
   };
 }
 
@@ -619,16 +646,90 @@ export interface DriveUploadResult {
   deduplicated?: boolean;
 }
 
-async function getServiceAccountFolderName(accessToken: string, folderId: string): Promise<string> {
+function getGoogleDriveApiBaseUrl(): string {
+  const custom = (process.env.GOOGLE_DRIVE_API_BASE || '').trim().replace(/\/+$/, '');
+  return custom || 'https://www.googleapis.com';
+}
+
+// Khóa đồng bộ hóa theo key trong cùng tiến trình để nhiều người tải lên đồng thời không tạo trùng thư mục
+const inFlightFolderCreations = new Map<string, Promise<any>>();
+const folderKeyQueues = new Map<string, Promise<void>>();
+
+async function runSerializedByKey<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = folderKeyQueues.get(key) || Promise.resolve();
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => {
+    release = resolve;
+  });
+  folderKeyQueues.set(
+    key,
+    previous
+      .catch(() => {})
+      .then(() => gate)
+  );
+  await previous.catch(() => {});
+  try {
+    return await fn();
+  } finally {
+    release();
+    if (folderKeyQueues.get(key) === gate) {
+      folderKeyQueues.delete(key);
+    }
+  }
+}
+
+async function runCoalescedByKey<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const existing = inFlightFolderCreations.get(key) as Promise<T> | undefined;
+  if (existing) {
+    return existing;
+  }
+  const promise = fn().finally(() => {
+    if (inFlightFolderCreations.get(key) === promise) {
+      inFlightFolderCreations.delete(key);
+    }
+  });
+  inFlightFolderCreations.set(key, promise);
+  return promise;
+}
+
+async function getServiceAccountFolderMeta(
+  accessToken: string,
+  folderId: string
+): Promise<{ id: string; name: string; mimeType?: string; trashed?: boolean; parents?: string[] } | null> {
+  const apiBase = getGoogleDriveApiBaseUrl();
   const res = await fetch(
-    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=id,name`,
+    `${apiBase}/drive/v3/files/${encodeURIComponent(folderId)}?supportsAllDrives=true&fields=id,name,mimeType,trashed,parents`,
     {
       headers: { Authorization: `Bearer ${accessToken}` },
     }
   );
-  if (!res.ok) return '';
-  const data: any = await res.json().catch(() => ({}));
-  return typeof data.name === 'string' ? data.name : '';
+  if (!res.ok) return null;
+  const data: any = await res.json().catch(() => null);
+  if (!data || !data.id) return null;
+  return data;
+}
+
+async function getServiceAccountFolderName(accessToken: string, folderId: string): Promise<string> {
+  const meta = await getServiceAccountFolderMeta(accessToken, folderId);
+  return typeof meta?.name === 'string' ? meta.name : '';
+}
+
+async function verifyCachedServiceAccountFolder(
+  accessToken: string,
+  folderId: string | undefined,
+  expectedName: string,
+  expectedParentId?: string
+): Promise<boolean> {
+  const cleanId = (folderId || '').trim();
+  if (!cleanId) return false;
+  const meta = await getServiceAccountFolderMeta(accessToken, cleanId);
+  if (!meta || meta.trashed) return false;
+  if (meta.mimeType !== 'application/vnd.google-apps.folder') return false;
+  if ((meta.name || '').trim().toLowerCase() !== expectedName.trim().toLowerCase()) return false;
+  if (expectedParentId && Array.isArray(meta.parents) && meta.parents.length > 0) {
+    if (!meta.parents.includes(expectedParentId)) return false;
+  }
+  return true;
 }
 
 async function ensureServiceAccountSubfolder(
@@ -636,57 +737,125 @@ async function ensureServiceAccountSubfolder(
   parentId: string,
   folderName: string
 ): Promise<string> {
-  const safeName = folderName.replace(/'/g, "\\'");
-  const q = `'${parentId}' in parents and name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
-  const listUrl = `https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name)&q=${encodeURIComponent(
-    q
-  )}`;
+  const cleanName = folderName.trim();
+  const coalesceKey = `sa_sub::${parentId}::${cleanName.toLowerCase()}`;
 
-  const listRes = await fetch(listUrl, {
-    headers: { Authorization: `Bearer ${accessToken}` },
-  });
-  if (listRes.ok) {
-    const listData: any = await listRes.json().catch(() => ({}));
-    if (listData?.files?.[0]?.id) {
-      return listData.files[0].id;
-    }
-  }
+  return runCoalescedByKey(coalesceKey, () =>
+    runSerializedByKey(coalesceKey, async () => {
+      const apiBase = getGoogleDriveApiBaseUrl();
+      const safeName = cleanName.replace(/'/g, "\\'");
+      const q = `'${parentId}' in parents and name = '${safeName}' and mimeType = 'application/vnd.google-apps.folder' and trashed = false`;
+      const listUrl = `${apiBase}/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name)&q=${encodeURIComponent(
+        q
+      )}`;
 
-  const createRes = await fetch(
-    'https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&fields=id,name',
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        name: folderName,
-        mimeType: 'application/vnd.google-apps.folder',
-        parents: [parentId],
-      }),
-    }
+      const listRes = await fetch(listUrl, {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      });
+      if (!listRes.ok) {
+        const listErr: any = await listRes.json().catch(() => ({}));
+        throw new Error(
+          `Không thể kiểm tra thư mục "${cleanName}" trên Google Drive (${listRes.status}): ${
+            listErr?.error?.message || listRes.statusText
+          }`
+        );
+      }
+      const listData: any = await listRes.json().catch(() => ({}));
+      if (listData?.files?.[0]?.id) {
+        return listData.files[0].id;
+      }
+
+      const createRes = await fetch(
+        `${apiBase}/drive/v3/files?supportsAllDrives=true&fields=id,name`,
+        {
+          method: 'POST',
+          headers: {
+            Authorization: `Bearer ${accessToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            name: cleanName,
+            mimeType: 'application/vnd.google-apps.folder',
+            parents: [parentId],
+          }),
+        }
+      );
+      const createData: any = await createRes.json().catch(() => ({}));
+      if (!createRes.ok || !createData.id) {
+        throw new Error(
+          `Không thể tạo thư mục "${cleanName}" trên Google Drive: ${
+            createData?.error?.message || createRes.statusText
+          }`
+        );
+      }
+      return createData.id;
+    })
   );
-  const createData: any = await createRes.json().catch(() => ({}));
-  if (!createRes.ok || !createData.id) {
-    throw new Error(`Không thể tạo thư mục "${folderName}" trên Google Drive: ${createData?.error?.message || createRes.statusText}`);
-  }
-  return createData.id;
 }
 
 async function resolveServiceAccountTargetFolder(
   accessToken: string,
   rootFolderId: string,
-  hierarchy: { bookFolder: string; yearFolder: string; categoryFolder: string }
-): Promise<string> {
-  const rootName = await getServiceAccountFolderName(accessToken, rootFolderId);
-  let currentParentId = rootFolderId;
-  if (rootName.trim().toLowerCase() !== hierarchy.bookFolder.trim().toLowerCase()) {
-    currentParentId = await ensureServiceAccountSubfolder(accessToken, currentParentId, hierarchy.bookFolder);
+  hierarchy: { bookFolder: string; yearFolder: string; categoryFolder: string; displayPath: string },
+  cachedEntry?: DriveFolderCacheEntry
+): Promise<{
+  bookFolderId?: string;
+  yearFolderId: string;
+  categoryFolderId: string;
+}> {
+  if (cachedEntry?.categoryFolderId) {
+    const catOk = await verifyCachedServiceAccountFolder(
+      accessToken,
+      cachedEntry.categoryFolderId,
+      hierarchy.categoryFolder,
+      cachedEntry.yearFolderId
+    );
+    if (catOk) {
+      return {
+        bookFolderId: cachedEntry.bookFolderId,
+        yearFolderId: cachedEntry.yearFolderId || '',
+        categoryFolderId: cachedEntry.categoryFolderId,
+      };
+    }
   }
-  currentParentId = await ensureServiceAccountSubfolder(accessToken, currentParentId, hierarchy.yearFolder);
-  currentParentId = await ensureServiceAccountSubfolder(accessToken, currentParentId, hierarchy.categoryFolder);
-  return currentParentId;
+
+  let bookParentId = rootFolderId;
+  let bookFolderId: string | undefined;
+  if (
+    cachedEntry?.bookFolderId &&
+    (await verifyCachedServiceAccountFolder(accessToken, cachedEntry.bookFolderId, hierarchy.bookFolder, rootFolderId))
+  ) {
+    bookParentId = cachedEntry.bookFolderId;
+    bookFolderId = cachedEntry.bookFolderId;
+  } else {
+    const rootName = await getServiceAccountFolderName(accessToken, rootFolderId);
+    if (rootName.trim().toLowerCase() !== hierarchy.bookFolder.trim().toLowerCase()) {
+      bookParentId = await ensureServiceAccountSubfolder(accessToken, rootFolderId, hierarchy.bookFolder);
+      bookFolderId = bookParentId;
+    }
+  }
+
+  let yearFolderId = '';
+  if (
+    cachedEntry?.yearFolderId &&
+    (await verifyCachedServiceAccountFolder(accessToken, cachedEntry.yearFolderId, hierarchy.yearFolder, bookParentId))
+  ) {
+    yearFolderId = cachedEntry.yearFolderId;
+  } else {
+    yearFolderId = await ensureServiceAccountSubfolder(accessToken, bookParentId, hierarchy.yearFolder);
+  }
+
+  const categoryFolderId = await ensureServiceAccountSubfolder(
+    accessToken,
+    yearFolderId,
+    hierarchy.categoryFolder
+  );
+
+  return {
+    bookFolderId,
+    yearFolderId,
+    categoryFolderId,
+  };
 }
 
 async function findExistingFileServiceAccount(
@@ -694,9 +863,10 @@ async function findExistingFileServiceAccount(
   folderId: string,
   docId: string
 ): Promise<{ id: string; name: string; webViewLink: string } | null> {
+  const apiBase = getGoogleDriveApiBaseUrl();
   const safeDocId = docId.replace(/'/g, "\\'");
   const q = `'${folderId}' in parents and trashed = false and appProperties has { key='nctDocId' and value='${safeDocId}' }`;
-  const url = `https://www.googleapis.com/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name,webViewLink)&q=${encodeURIComponent(
+  const url = `${apiBase}/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name,webViewLink)&q=${encodeURIComponent(
     q
   )}`;
 
@@ -718,7 +888,7 @@ export async function uploadWordToGoogleDrive(params: {
   config: ReturnType<typeof resolveEffectiveDriveConfig>;
   docId: string;
   bookName?: string;
-  year?: number;
+  year?: number | string | null;
   docCategory?: 'outgoing' | 'incoming';
   fullDocNumber: string;
   docName: string;
@@ -729,12 +899,15 @@ export async function uploadWordToGoogleDrive(params: {
   replaceMode?: boolean;
   previousFileId?: string;
   keepPreviousFile?: boolean;
+  cacheKey?: string;
+  folderCache?: Record<string, DriveFolderCacheEntry>;
+  onFolderCacheUpdate?: (key: string, entry: DriveFolderCacheEntry) => void;
 }): Promise<DriveUploadResult> {
   const {
     config,
     docId,
     bookName = 'Đoàn trường',
-    year = new Date().getFullYear(),
+    year,
     docCategory = 'outgoing',
     fullDocNumber,
     docName,
@@ -745,6 +918,9 @@ export async function uploadWordToGoogleDrive(params: {
     replaceMode,
     previousFileId,
     keepPreviousFile,
+    cacheKey,
+    folderCache,
+    onFolderCacheUpdate,
   } = params;
 
   if (!config.isConfigured || !config.folderId) {
@@ -752,6 +928,8 @@ export async function uploadWordToGoogleDrive(params: {
   }
 
   const hierarchy = buildDriveFolderHierarchy(bookName, year, docCategory);
+  const effectiveCacheKey =
+    cacheKey || `${config.folderId}::${hierarchy.bookFolder}::${hierarchy.yearFolder}::${hierarchy.categoryFolder}`;
 
   const requiredExt =
     getSupportedAttachmentExtension(originalFileName) ||
@@ -762,70 +940,133 @@ export async function uploadWordToGoogleDrive(params: {
       ? sanitizeCustomDriveFileName(overrideFileName, requiredExt)
       : buildStandardDriveFileName(fullDocNumber, docName, originalFileName);
 
+  const saveCacheEntry = (resolved: {
+    bookFolderId?: string;
+    yearFolderId?: string;
+    categoryFolderId?: string;
+    folderPath?: string;
+  }) => {
+    const cleanCatId = (resolved.categoryFolderId || '').trim();
+    if (!cleanCatId) return;
+    const entry: DriveFolderCacheEntry = {
+      bookFolderId: resolved.bookFolderId || undefined,
+      yearFolderId: resolved.yearFolderId || undefined,
+      categoryFolderId: cleanCatId,
+      folderPath: resolved.folderPath || hierarchy.displayPath,
+      updatedAt: new Date().toISOString(),
+    };
+    if (folderCache) {
+      folderCache[effectiveCacheKey] = entry;
+    }
+    if (onFolderCacheUpdate) {
+      onFolderCacheUpdate(effectiveCacheKey, entry);
+    }
+  };
+
   if (config.authMode === 'apps_script') {
-    // Step 1: Check existing file by docId first (skip when replacing or adding versioned attachments)
-    if (!replaceMode && !keepPreviousFile) {
-      const checkRes = await fetch(config.appsScriptUrl, {
+    const runAppsScriptFlow = async (): Promise<DriveUploadResult> => {
+      const currentCached = folderCache ? folderCache[effectiveCacheKey] : undefined;
+
+      // Step 1: Check existing file by docId first (skip when replacing or adding versioned attachments)
+      if (!replaceMode && !keepPreviousFile) {
+        const checkRes = await fetch(config.appsScriptUrl, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            action: 'find',
+            folderId: config.folderId,
+            bookName: hierarchy.bookFolder,
+            year: hierarchy.yearFolder,
+            categoryFolder: hierarchy.categoryFolder,
+            cachedBookFolderId: currentCached?.bookFolderId || '',
+            cachedYearFolderId: currentCached?.yearFolderId || '',
+            cachedCategoryFolderId: currentCached?.categoryFolderId || '',
+            docId,
+            expectedFileName: finalFileName,
+          }),
+        });
+        const checkData = await parseAppsScriptJsonResponse(checkRes);
+        if (checkData.result === 'success') {
+          const checkFolderId = checkData.targetFolderId || checkData.folderId;
+          if (checkFolderId && checkFolderId !== config.folderId) {
+            saveCacheEntry({
+              bookFolderId: checkData.bookFolderId,
+              yearFolderId: checkData.yearFolderId,
+              categoryFolderId: checkFolderId,
+              folderPath: checkData.folderPath,
+            });
+          }
+          if (checkData.found && checkData.fileId) {
+            return {
+              fileId: checkData.fileId,
+              fileName: checkData.fileName || finalFileName,
+              webViewLink: checkData.webViewLink || `https://drive.google.com/file/d/${checkData.fileId}/view`,
+              folderId: checkFolderId || currentCached?.categoryFolderId || config.folderId,
+              folderPath: checkData.folderPath || hierarchy.displayPath,
+              deduplicated: true,
+            };
+          }
+        }
+      }
+
+      const freshCached = folderCache ? folderCache[effectiveCacheKey] : currentCached;
+
+      // Step 2: Upload new file into Tên sổ / Năm / Văn bản đi | Văn bản đến
+      const uploadRes = await fetch(config.appsScriptUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          action: 'find',
+          action: 'upload',
           folderId: config.folderId,
           bookName: hierarchy.bookFolder,
           year: hierarchy.yearFolder,
           categoryFolder: hierarchy.categoryFolder,
+          cachedBookFolderId: freshCached?.bookFolderId || '',
+          cachedYearFolderId: freshCached?.yearFolderId || '',
+          cachedCategoryFolderId: freshCached?.categoryFolderId || '',
           docId,
-          expectedFileName: finalFileName,
+          fullDocNumber,
+          docName,
+          fileName: finalFileName,
+          mimeType,
+          replaceMode: Boolean(replaceMode || keepPreviousFile),
+          keepPreviousFile: Boolean(keepPreviousFile),
+          previousFileId: keepPreviousFile ? '' : previousFileId || '',
+          fileBase64: buffer.toString('base64'),
         }),
       });
-      const checkData = await parseAppsScriptJsonResponse(checkRes);
-      if (checkData.result === 'success' && checkData.found && checkData.fileId) {
-        return {
-          fileId: checkData.fileId,
-          fileName: checkData.fileName || finalFileName,
-          webViewLink: checkData.webViewLink || `https://drive.google.com/file/d/${checkData.fileId}/view`,
-          folderId: checkData.folderId || config.folderId,
-          folderPath: checkData.folderPath || hierarchy.displayPath,
-          deduplicated: true,
-        };
+
+      const uploadData = await parseAppsScriptJsonResponse(uploadRes);
+      if (uploadData.result !== 'success' || !uploadData.fileId) {
+        throw new Error(uploadData.error || 'Lưu tệp lên Google Drive qua Apps Script thất bại.');
       }
-    }
 
-    // Step 2: Upload new file into Tên sổ → Năm → Văn bản đi / Văn bản đến
-    const uploadRes = await fetch(config.appsScriptUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        action: 'upload',
-        folderId: config.folderId,
-        bookName: hierarchy.bookFolder,
-        year: hierarchy.yearFolder,
-        categoryFolder: hierarchy.categoryFolder,
-        docId,
-        fullDocNumber,
-        docName,
-        fileName: finalFileName,
-        mimeType,
-        replaceMode: Boolean(replaceMode || keepPreviousFile),
-        keepPreviousFile: Boolean(keepPreviousFile),
-        previousFileId: keepPreviousFile ? '' : previousFileId || '',
-        fileBase64: buffer.toString('base64'),
-      }),
-    });
+      const resolvedFolderId = uploadData.targetFolderId || uploadData.folderId || freshCached?.categoryFolderId || config.folderId;
+      const resolvedFolderPath = uploadData.folderPath || hierarchy.displayPath;
+      if (resolvedFolderId && (uploadData.targetFolderId || uploadData.folderId)) {
+        saveCacheEntry({
+          bookFolderId: uploadData.bookFolderId,
+          yearFolderId: uploadData.yearFolderId,
+          categoryFolderId: resolvedFolderId,
+          folderPath: resolvedFolderPath,
+        });
+      }
 
-    const uploadData = await parseAppsScriptJsonResponse(uploadRes);
-    if (uploadData.result !== 'success' || !uploadData.fileId) {
-      throw new Error(uploadData.error || 'Lưu tệp lên Google Drive qua Apps Script thất bại.');
-    }
-
-    return {
-      fileId: uploadData.fileId,
-      fileName: uploadData.fileName || finalFileName,
-      webViewLink: uploadData.webViewLink || `https://drive.google.com/file/d/${uploadData.fileId}/view`,
-      folderId: uploadData.folderId || config.folderId,
-      folderPath: uploadData.folderPath || hierarchy.displayPath,
-      deduplicated: Boolean(uploadData.deduplicated),
+      return {
+        fileId: uploadData.fileId,
+        fileName: uploadData.fileName || finalFileName,
+        webViewLink: uploadData.webViewLink || `https://drive.google.com/file/d/${uploadData.fileId}/view`,
+        folderId: resolvedFolderId,
+        folderPath: resolvedFolderPath,
+        deduplicated: Boolean(uploadData.deduplicated),
+      };
     };
+
+    // Nếu thư mục đích chưa có trong cache, tuần tự hóa lần tạo/tìm thư mục đầu tiên để tránh tạo trùng thư mục khi nhiều người tải cùng lúc
+    if (!folderCache?.[effectiveCacheKey]?.categoryFolderId) {
+      return runSerializedByKey(`apps_script_init::${effectiveCacheKey}`, runAppsScriptFlow);
+    }
+    return runAppsScriptFlow();
   }
 
   // Service Account mode (Google Drive API v3)
@@ -835,9 +1076,23 @@ export async function uploadWordToGoogleDrive(params: {
   }
 
   const accessToken = await getServiceAccountAccessToken(parsed);
+  const apiBase = getGoogleDriveApiBaseUrl();
 
-  // Resolve/create folder layout: Tên sổ → Năm → Văn bản đi / Văn bản đến
-  const targetFolderId = await resolveServiceAccountTargetFolder(accessToken, config.folderId, hierarchy);
+  // Resolve/create folder layout: Tên sổ / Năm / Văn bản đi | Văn bản đến (có cache ID + khóa đồng bộ)
+  const cachedEntry = folderCache ? folderCache[effectiveCacheKey] : undefined;
+  const resolvedFolders = await resolveServiceAccountTargetFolder(
+    accessToken,
+    config.folderId,
+    hierarchy,
+    cachedEntry
+  );
+  const targetFolderId = resolvedFolders.categoryFolderId;
+  saveCacheEntry({
+    bookFolderId: resolvedFolders.bookFolderId,
+    yearFolderId: resolvedFolders.yearFolderId,
+    categoryFolderId: targetFolderId,
+    folderPath: hierarchy.displayPath,
+  });
 
   // Step 1: Deduplication lookup by appProperties.nctDocId (skip when replacing or keeping separate versions)
   if (!replaceMode && !keepPreviousFile) {
@@ -845,7 +1100,7 @@ export async function uploadWordToGoogleDrive(params: {
     if (existing) {
       if (existing.name !== finalFileName) {
         await fetch(
-          `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(existing.id)}?supportsAllDrives=true`,
+          `${apiBase}/drive/v3/files/${encodeURIComponent(existing.id)}?supportsAllDrives=true`,
           {
             method: 'PATCH',
             headers: {
@@ -868,7 +1123,7 @@ export async function uploadWordToGoogleDrive(params: {
   } else if (replaceMode && previousFileId && !keepPreviousFile) {
     // Move previous file to trash when replacing via Service Account (best-effort)
     await fetch(
-      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(previousFileId)}?supportsAllDrives=true`,
+      `${apiBase}/drive/v3/files/${encodeURIComponent(previousFileId)}?supportsAllDrives=true`,
       {
         method: 'PATCH',
         headers: {
@@ -905,7 +1160,7 @@ export async function uploadWordToGoogleDrive(params: {
   const multipartPayload = Buffer.concat([prefix, buffer, suffix]);
 
   const uploadRes = await fetch(
-    'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,webViewLink',
+    `${apiBase}/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,webViewLink`,
     {
       method: 'POST',
       headers: {
@@ -1038,5 +1293,304 @@ export async function checkGoogleDriveFileStatus(
       status: 'unverified',
       message: err?.message || 'Lỗi kết nối khi kiểm tra tệp trên Google Drive.',
     };
+  }
+}
+
+export function extractGoogleDriveFileId(input: string): string {
+  const raw = (input || '').trim();
+  if (!raw) return '';
+  if (/\/folders\//i.test(raw)) return '';
+
+  const fileDMatch = raw.match(/\/(?:file|document|spreadsheets|presentation)\/d\/([a-zA-Z0-9_-]{12,})/);
+  if (fileDMatch) return fileDMatch[1];
+
+  const idParamMatch = raw.match(/[?&]id=([a-zA-Z0-9_-]{12,})/);
+  if (idParamMatch) return idParamMatch[1];
+
+  // Raw Drive ID without path separators, spaces, or file extensions
+  if (/^[a-zA-Z0-9_-]{18,}$/.test(raw) && !raw.includes('http') && !raw.includes('.')) {
+    return raw;
+  }
+
+  return '';
+}
+
+export interface DriveFileMetadataLookupResult {
+  status: 'ok' | 'not_found' | 'access_denied' | 'unverified';
+  file?: ArchiveDriveCandidate;
+  message?: string;
+}
+
+export async function getDriveFileMetadata(
+  config: ResolvedGoogleDriveConfig,
+  fileId: string
+): Promise<DriveFileMetadataLookupResult> {
+  const cleanId = (fileId || '').trim();
+  if (!cleanId) {
+    return { status: 'not_found', message: 'Thiếu mã tệp Google Drive.' };
+  }
+  if (!config.enabled || (config.authMode === 'service_account' && !config.serviceAccountJson) || (config.authMode === 'apps_script' && !config.appsScriptUrl)) {
+    return { status: 'unverified', message: config.missingReason || 'Chưa cấu hình kết nối Google Drive.' };
+  }
+
+  try {
+    if (config.authMode === 'service_account') {
+      const { parsed, error } = parseServiceAccountJson(config.serviceAccountJson);
+      if (!parsed || error) {
+        return { status: 'unverified', message: error || 'Khóa Service Account không hợp lệ.' };
+      }
+      const accessToken = await getServiceAccountAccessToken(parsed);
+      const res = await fetch(
+        `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cleanId)}?supportsAllDrives=true&fields=id,name,mimeType,webViewLink,trashed`,
+        {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        }
+      );
+      if (res.status === 404) {
+        return { status: 'not_found', message: 'Không tìm thấy tệp trên Google Drive (404).' };
+      }
+      if (res.status === 401 || res.status === 403) {
+        return { status: 'access_denied', message: 'Thiếu quyền truy cập tệp này trên Google Drive.' };
+      }
+      if (!res.ok) {
+        return { status: 'unverified', message: `Google Drive trả về mã ${res.status}.` };
+      }
+      const data: any = await res.json().catch(() => ({}));
+      if (data?.trashed) {
+        return { status: 'not_found', message: 'Tệp đã bị chuyển vào thùng rác trên Google Drive.' };
+      }
+      return {
+        status: 'ok',
+        file: {
+          fileId: String(data.id || cleanId),
+          fileName: String(data.name || cleanId),
+          webViewLink: String(data.webViewLink || `https://drive.google.com/file/d/${cleanId}/view`),
+          mimeType: data.mimeType ? String(data.mimeType) : undefined,
+        },
+      };
+    }
+
+    // Apps Script mode: try get_file first, fallback to check_file
+    const res = await fetch(config.appsScriptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'get_file',
+        folderId: config.folderId || cleanId,
+        fileId: cleanId,
+      }),
+    });
+    const data = await parseAppsScriptJsonResponse(res);
+    if (data.result === 'success' && data.status === 'ok' && data.file) {
+      return {
+        status: 'ok',
+        file: {
+          fileId: String(data.file.fileId || cleanId),
+          fileName: String(data.file.fileName || cleanId),
+          webViewLink: String(data.file.webViewLink || `https://drive.google.com/file/d/${cleanId}/view`),
+          mimeType: data.file.mimeType ? String(data.file.mimeType) : undefined,
+        },
+      };
+    }
+    if (data.result === 'success' && (data.status === 'access_denied' || data.status === 'not_found')) {
+      return {
+        status: data.status,
+        message: data.error || data.message || (data.status === 'access_denied' ? 'Không có quyền truy cập tệp Drive.' : 'Không tìm thấy tệp trên Google Drive.'),
+      };
+    }
+
+    // Backward compatible fallback to check_file on older Apps Script deployments
+    const errText = String(data.error || '').toLowerCase();
+    if (errText.includes('thao tác không hợp lệ') || errText.includes('get_file')) {
+      const checkRes = await fetch(config.appsScriptUrl, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'check_file',
+          folderId: config.folderId || cleanId,
+          fileId: cleanId,
+        }),
+      });
+      const checkData = await parseAppsScriptJsonResponse(checkRes);
+      if (checkData.result === 'success' && checkData.exists) {
+        return {
+          status: 'ok',
+          file: {
+            fileId: cleanId,
+            fileName: String(checkData.fileName || cleanId),
+            webViewLink: String(checkData.webViewLink || `https://drive.google.com/file/d/${cleanId}/view`),
+          },
+        };
+      }
+      if (checkData.status === 'access_denied') {
+        return { status: 'access_denied', message: checkData.message || 'Thiếu quyền truy cập tệp Drive.' };
+      }
+      return { status: 'not_found', message: checkData.message || 'Không tìm thấy tệp trên Google Drive.' };
+    }
+
+    if (errText.includes('permission') || errText.includes('access') || errText.includes('quyền')) {
+      return { status: 'access_denied', message: data.error };
+    }
+    if (errText.includes('not found') || errText.includes('no item') || errText.includes('không tìm thấy')) {
+      return { status: 'not_found', message: 'Không tìm thấy tệp trên Google Drive.' };
+    }
+    return { status: 'unverified', message: data.error || 'Chưa xác minh được tệp trên Google Drive.' };
+  } catch (err: any) {
+    return {
+      status: 'unverified',
+      message: err?.message || 'Lỗi kết nối Google Drive khi lấy thông tin tệp.',
+    };
+  }
+}
+
+export async function listDriveFilesInFolder(
+  config: ResolvedGoogleDriveConfig,
+  folderIdOverride?: string,
+  maxDepth: number = 4
+): Promise<{ files: ArchiveDriveCandidate[]; error?: string }> {
+  const rootFolderId = (folderIdOverride || config.folderId || '').trim();
+  if (!rootFolderId) {
+    return { files: [], error: 'Chưa chỉ định thư mục Google Drive để quét tệp.' };
+  }
+  if (!config.enabled) {
+    return { files: [], error: config.missingReason || 'Chưa bật tích hợp Google Drive.' };
+  }
+
+  try {
+    if (config.authMode === 'service_account') {
+      const { parsed, error } = parseServiceAccountJson(config.serviceAccountJson);
+      if (!parsed || error) {
+        return { files: [], error: error || 'Cấu hình Tài khoản dịch vụ không hợp lệ.' };
+      }
+      const accessToken = await getServiceAccountAccessToken(parsed);
+      const collected: ArchiveDriveCandidate[] = [];
+      const queue: Array<{ id: string; path: string; depth: number }> = [
+        { id: rootFolderId, path: config.folderName || '', depth: 1 },
+      ];
+      const visitedFolders = new Set<string>();
+
+      while (queue.length > 0 && collected.length < 3000) {
+        const current = queue.shift()!;
+        if (visitedFolders.has(current.id)) continue;
+        visitedFolders.add(current.id);
+
+        let pageToken = '';
+        do {
+          const q = `'${current.id.replace(/'/g, "\\'")}' in parents and trashed = false`;
+          const url = new URL('https://www.googleapis.com/drive/v3/files');
+          url.searchParams.set('q', q);
+          url.searchParams.set('pageSize', '1000');
+          url.searchParams.set('supportsAllDrives', 'true');
+          url.searchParams.set('includeItemsFromAllDrives', 'true');
+          url.searchParams.set('fields', 'nextPageToken,files(id,name,mimeType,webViewLink)');
+          if (pageToken) url.searchParams.set('pageToken', pageToken);
+
+          const res = await fetch(url.toString(), {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+          if (!res.ok) {
+            if (current.depth === 1) {
+              const errJson: any = await res.json().catch(() => ({}));
+              return {
+                files: collected,
+                error: `Không thể quét thư mục Drive (${res.status}): ${errJson?.error?.message || res.statusText}`,
+              };
+            }
+            break;
+          }
+          const data: any = await res.json().catch(() => ({}));
+          const items: any[] = Array.isArray(data.files) ? data.files : [];
+          for (const item of items) {
+            if (item.mimeType === 'application/vnd.google-apps.folder') {
+              if (current.depth < maxDepth) {
+                const subPath = current.path ? `${current.path}/${item.name}` : String(item.name || '');
+                queue.push({ id: String(item.id), path: subPath, depth: current.depth + 1 });
+              }
+            } else {
+              collected.push({
+                fileId: String(item.id),
+                fileName: String(item.name || ''),
+                webViewLink: String(item.webViewLink || `https://drive.google.com/file/d/${item.id}/view`),
+                mimeType: item.mimeType ? String(item.mimeType) : undefined,
+                folderPath: current.path || undefined,
+              });
+            }
+          }
+          pageToken = data.nextPageToken ? String(data.nextPageToken) : '';
+        } while (pageToken && collected.length < 3000);
+      }
+
+      return { files: collected };
+    }
+
+    if (!config.appsScriptUrl) {
+      return { files: [], error: 'Chưa cấu hình URL Google Apps Script.' };
+    }
+
+    const res = await fetch(config.appsScriptUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        action: 'list_files',
+        folderId: rootFolderId,
+        maxDepth,
+      }),
+    });
+    const data = await parseAppsScriptJsonResponse(res);
+    if (data.result !== 'success' || !Array.isArray(data.files)) {
+      return {
+        files: [],
+        error:
+          data.error ||
+          'Apps Script chưa hỗ trợ liệt kê tệp trong thư mục (cần cập nhật mẫu Apps Script mới hoặc dán trực tiếp liên kết Drive vào từng dòng).',
+      };
+    }
+    return {
+      files: data.files.map((f: any) => ({
+        fileId: String(f.fileId || f.id || ''),
+        fileName: String(f.fileName || f.name || ''),
+        webViewLink: String(f.webViewLink || `https://drive.google.com/file/d/${f.fileId || f.id}/view`),
+        mimeType: f.mimeType ? String(f.mimeType) : undefined,
+        folderPath: f.folderPath ? String(f.folderPath) : undefined,
+      })),
+    };
+  } catch (err: any) {
+    return {
+      files: [],
+      error: err?.message || 'Lỗi khi quét danh sách tệp trong thư mục Google Drive.',
+    };
+  }
+}
+
+export async function downloadDriveFileBuffer(
+  config: ResolvedGoogleDriveConfig,
+  fileId: string
+): Promise<{ ok: boolean; buffer?: Buffer; mimeType?: string; error?: string }> {
+  const cleanId = (fileId || '').trim();
+  if (!cleanId) return { ok: false, error: 'Thiếu mã tệp Google Drive.' };
+  if (!config.enabled || config.authMode !== 'service_account' || !config.serviceAccountJson) {
+    return { ok: false, error: 'Tải trực tiếp nội dung tệp chỉ hỗ trợ ở chế độ Service Account.' };
+  }
+  try {
+    const { parsed, error } = parseServiceAccountJson(config.serviceAccountJson);
+    if (!parsed || error) return { ok: false, error: error || 'Cấu hình Service Account không hợp lệ.' };
+    const accessToken = await getServiceAccountAccessToken(parsed);
+    const res = await fetch(
+      `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(cleanId)}?alt=media&supportsAllDrives=true`,
+      {
+        headers: { Authorization: `Bearer ${accessToken}` },
+      }
+    );
+    if (!res.ok) {
+      return { ok: false, error: `Không thể tải tệp từ Drive (${res.status}).` };
+    }
+    const arr = await res.arrayBuffer();
+    return {
+      ok: true,
+      buffer: Buffer.from(arr),
+      mimeType: res.headers.get('content-type') || 'application/pdf',
+    };
+  } catch (err: any) {
+    return { ok: false, error: err?.message || 'Lỗi tải tệp từ Google Drive.' };
   }
 }

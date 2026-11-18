@@ -19,16 +19,13 @@ import {
   RotateCcw,
   Send,
   Upload,
-  CalendarClock,
-  ListChecks,
 } from 'lucide-react';
 import { api } from '../api';
 import type {
   DocumentRecord,
-  DocumentTask,
   ExtractableFieldKey,
+  ExtractedDateSource,
   PdfAnalyzeResponse,
-  PdfTaskSuggestion,
   RegistryBook,
   SystemSettings,
   User,
@@ -39,7 +36,7 @@ import {
   formatFileSize,
   normalizeDateOnlyDdMmYyyy,
 } from '../utils/fileNaming';
-import { DEFAULT_BOOK_ID, getUserDisplayName, hasBookPermission } from '../utils/permissions';
+import { DEFAULT_BOOK_ID, getUserDisplayName, hasBookPermission, isSystemAdmin } from '../utils/permissions';
 import { SEMANTIC_STATUS_STYLES } from '../utils/documentColors';
 import { PdfPreviewPane, type PdfHighlightTarget } from './PdfPreviewPane';
 
@@ -100,8 +97,8 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   const [fullDocNumber, setFullDocNumber] = useState('');
   const [docName, setDocName] = useState('');
   const [title, setTitle] = useState('');
-  const [issueDate, setIssueDate] = useState('');
-  const [signDate, setSignDate] = useState('');
+  const [documentDate, setDocumentDate] = useState('');
+  const [parentAgency, setParentAgency] = useState('');
   const [issuingAgency, setIssuingAgency] = useState('');
   const [signer, setSigner] = useState('');
   const [signerRole, setSignerRole] = useState('');
@@ -130,16 +127,6 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   const [retryingDrive, setRetryingDrive] = useState(false);
   const [retryDriveError, setRetryDriveError] = useState<string | null>(null);
 
-  // Extracted deadlines & tasks suggestions
-  type EditableTaskSuggestion = PdfTaskSuggestion & { selected: boolean; assigneeUserId: string };
-  const [assignees, setAssignees] = useState<
-    Array<{ id: string; username: string; fullName: string; displayName: string; role: string }>
-  >([]);
-  const [editableSuggestions, setEditableSuggestions] = useState<EditableTaskSuggestion[]>([]);
-  const [confirmedTasksBySugId, setConfirmedTasksBySugId] = useState<Record<string, DocumentTask>>({});
-  const [savingTaskSugId, setSavingTaskSugId] = useState<string | null>(null);
-  const [taskActionError, setTaskActionError] = useState<string | null>(null);
-
   const importableBooks = useMemo(
     () => accessibleBooks.filter((b) => hasBookPermission(currentUser, b.id, 'import_incoming')),
     [accessibleBooks, currentUser]
@@ -147,6 +134,8 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
 
   const canImportActiveBook = hasBookPermission(currentUser, activeBook.id, 'import_incoming');
   const canViewActiveBook = hasBookPermission(currentUser, activeBook.id, 'view');
+  const canManageActiveBook =
+    isSystemAdmin(currentUser) || hasBookPermission(currentUser, activeBook.id, 'manage_book');
 
   const driveConfig =
     activeBook.id !== DEFAULT_BOOK_ID
@@ -165,7 +154,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     return buildStandardDriveFileName(fullDocNumber, docName || title, '.pdf');
   }, [fullDocNumber, docName, title, isEditingFileName, customFileName]);
 
-  // Live check suspected duplicate when user edits fullDocNumber / issuingAgency / issueDate
+  // Live check suspected duplicate when user edits fullDocNumber / issuingAgency / documentDate
   useEffect(() => {
     if (!analysis || savedDoc) return;
     if (!fullDocNumber.trim()) {
@@ -175,7 +164,11 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
 
     const timer = setTimeout(async () => {
       try {
-        const refDate = issueDate || signDate;
+        const refDate =
+          normalizeDateOnlyDdMmYyyy(documentDate) ||
+          analysis.extraction.topRightDate?.date ||
+          analysis.extraction.signatureDate?.date ||
+          '';
         const yearMatch = refDate.match(/(\d{4})$/);
         const parsedYear = yearMatch ? parseInt(yearMatch[1], 10) : undefined;
         const res = await api.checkDuplicate({
@@ -193,30 +186,25 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     }, 350);
 
     return () => clearTimeout(timer);
-  }, [analysis, savedDoc, activeBook.id, fullDocNumber, issuingAgency, issueDate, signDate]);
-
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .getTaskAssignees(activeBook.id)
-      .then((res) => {
-        if (!cancelled) setAssignees(res.assignees || []);
-      })
-      .catch(() => {
-        if (!cancelled) setAssignees([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [activeBook.id]);
+  }, [analysis, savedDoc, activeBook.id, fullDocNumber, issuingAgency, documentDate]);
 
   const applyAnalysisResult = (res: PdfAnalyzeResponse) => {
     setAnalysis(res);
     setFullDocNumber(res.extraction.docNumber || '');
     setDocName(res.extraction.docName || '');
     setTitle(res.extraction.title || '');
-    setIssueDate(normalizeDateOnlyDdMmYyyy(res.extraction.issueDate || ''));
-    setSignDate(normalizeDateOnlyDdMmYyyy(res.extraction.signDate || ''));
+    const compStatus = res.extraction.dateComparisonStatus;
+    const initialDate =
+      compStatus === 'mismatch'
+        ? ''
+        : normalizeDateOnlyDdMmYyyy(
+            res.extraction.documentDate ||
+              res.extraction.issueDate ||
+              res.extraction.signDate ||
+              ''
+          );
+    setDocumentDate(initialDate);
+    setParentAgency(res.extraction.parentAgency || '');
     setIssuingAgency(res.extraction.issuingAgency || '');
     setSigner(res.extraction.signer || '');
     setSignerRole(res.extraction.signerRole || '');
@@ -232,16 +220,6 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     setSavedStageToken(null);
     setRetryDriveError(null);
     setHighlightBox(null);
-    const rawSugs = Array.isArray(res.extraction.taskSuggestions) ? res.extraction.taskSuggestions : [];
-    setEditableSuggestions(
-      rawSugs.map((s) => ({
-        ...s,
-        selected: true,
-        assigneeUserId: currentUser.id,
-      }))
-    );
-    setConfirmedTasksBySugId({});
-    setTaskActionError(null);
     setActiveMobilePane('form');
     setJumpToPage(res.extraction.relevantPages?.[0] || 1);
     setIdempotencyKey(generateKey());
@@ -256,6 +234,18 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       bbox: loc.bbox,
       label,
       estimated: Boolean(loc.estimated || !loc.bbox),
+      nonce: Date.now(),
+    });
+    setActiveMobilePane('pdf');
+  };
+
+  const handleLocateDateSource = (src: ExtractedDateSource, label: string) => {
+    setJumpToPage(src.page);
+    setHighlightBox({
+      page: src.page,
+      bbox: src.bbox,
+      label,
+      estimated: Boolean(src.estimated || !src.bbox),
       nonce: Date.now(),
     });
     setActiveMobilePane('pdf');
@@ -371,6 +361,28 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       return;
     }
 
+    const compStatus = analysis.extraction.dateComparisonStatus;
+    const isMismatch = compStatus === 'mismatch';
+    const rawDateTrimmed = documentDate.trim();
+    const cleanDocDate = normalizeDateOnlyDdMmYyyy(rawDateTrimmed);
+    if (rawDateTrimmed && !cleanDocDate) {
+      setSubmitError('Ngày văn bản không hợp lệ (định dạng chuẩn dd/mm/yyyy).');
+      return;
+    }
+
+    const effectiveUnifiedDate = isMismatch
+      ? canManageActiveBook
+        ? cleanDocDate
+        : ''
+      : cleanDocDate;
+
+    const mismatchSourcesPayload = isMismatch
+      ? {
+          topRight: analysis.extraction.topRightDate || undefined,
+          signature: analysis.extraction.signatureDate || undefined,
+        }
+      : undefined;
+
     setSubmitting(true);
     try {
       const res = await api.importPdfDocument({
@@ -379,8 +391,13 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
         fullDocNumber: fullDocNumber.trim(),
         docName: docName.trim(),
         title: title.trim(),
-        issueDate: normalizeDateOnlyDdMmYyyy(issueDate.trim()),
-        signDate: normalizeDateOnlyDdMmYyyy(signDate.trim()),
+        documentDate: effectiveUnifiedDate,
+        issueDate: effectiveUnifiedDate,
+        signDate: effectiveUnifiedDate,
+        dateComparisonStatus: compStatus,
+        dateMismatchSources: mismatchSourcesPayload,
+        confirmUnifiedDate: Boolean(isMismatch && canManageActiveBook && effectiveUnifiedDate),
+        parentAgency: parentAgency.trim() || undefined,
         issuingAgency: issuingAgency.trim(),
         signer: signer.trim(),
         signerRole: signerRole.trim(),
@@ -403,31 +420,6 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       if (!res.driveSaved && res.uploadError) {
         setRetryDriveError(res.uploadError);
       }
-
-      const selectedSuggestions = editableSuggestions.filter((s) => s.selected && s.taskTitle.trim());
-      if (selectedSuggestions.length > 0) {
-        const createdMap: Record<string, DocumentTask> = {};
-        for (const s of selectedSuggestions) {
-          try {
-            const taskRes = await api.createTask({
-              docId: res.document.id,
-              suggestionId: s.id,
-              title: s.taskTitle.trim(),
-              dueDate: s.dueDate.trim(),
-              rawDeadlineText: s.rawDeadlineText,
-              needsConfirmation: Boolean(s.needsConfirmation && !s.dueDate.trim()),
-              recipient: s.recipient?.trim(),
-              sourceExcerpt: s.sourceExcerpt,
-              sourcePage: s.page,
-              assigneeUserId: s.assigneeUserId || currentUser.id,
-            });
-            createdMap[s.id] = taskRes.task;
-          } catch {
-            // Cho phép xác nhận thủ công ngay bên dưới nếu tạo tự động lỗi
-          }
-        }
-        setConfirmedTasksBySugId((prev) => ({ ...prev, ...createdMap }));
-      }
     } catch (err: any) {
       if (err.code === 'FILENAME_CONFLICT' && err.existingDocument) {
         setFilenameConflict({
@@ -445,31 +437,6 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
       }
     } finally {
       setSubmitting(false);
-    }
-  };
-
-  const handleConfirmSingleSuggestion = async (docId: string, sug: EditableTaskSuggestion) => {
-    if (savingTaskSugId) return;
-    setSavingTaskSugId(sug.id);
-    setTaskActionError(null);
-    try {
-      const res = await api.createTask({
-        docId,
-        suggestionId: sug.id,
-        title: sug.taskTitle.trim(),
-        dueDate: sug.dueDate.trim(),
-        rawDeadlineText: sug.rawDeadlineText,
-        needsConfirmation: Boolean(sug.needsConfirmation && !sug.dueDate.trim()),
-        recipient: sug.recipient?.trim(),
-        sourceExcerpt: sug.sourceExcerpt,
-        sourcePage: sug.page,
-        assigneeUserId: sug.assigneeUserId || currentUser.id,
-      });
-      setConfirmedTasksBySugId((prev) => ({ ...prev, [sug.id]: res.task }));
-    } catch (err: any) {
-      setTaskActionError(err?.message || 'Không thể lưu việc cần làm từ đề xuất này.');
-    } finally {
-      setSavingTaskSugId(null);
     }
   };
 
@@ -520,9 +487,8 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     setLiveSuspectedDuplicate(null);
     setIgnoreDuplicatePdf(false);
     setIgnoreSuspectedDuplicate(false);
-    setEditableSuggestions([]);
-    setConfirmedTasksBySugId({});
-    setTaskActionError(null);
+    setParentAgency('');
+    setDocumentDate('');
     setActiveMobilePane('form');
     setIdempotencyKey(generateKey());
     if (fileInputRef.current) fileInputRef.current.value = '';
@@ -648,11 +614,20 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </p>
                 <div className="flex flex-wrap items-center gap-3 text-[11px] text-slate-600">
                   <span>
-                    Ngày ban hành: <strong className="font-mono text-slate-800">{savedDoc.issueDate || 'Chưa xác định'}</strong>
+                    Ngày văn bản:{' '}
+                    {savedDoc.pendingDateConfirmation ? (
+                      <strong className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 font-semibold">
+                        Chờ quản trị viên xác nhận ngày
+                      </strong>
+                    ) : (
+                      <strong className="font-mono text-slate-800 tabular-nums">
+                        {savedDoc.issueDate || 'Chưa xác định'}
+                      </strong>
+                    )}
                   </span>
                   <span>·</span>
                   <span>
-                    Ngày tiếp nhận: <strong className="font-mono text-slate-800">{savedDoc.receivedDate || 'Hôm nay'}</strong>
+                    Ngày tiếp nhận: <strong className="font-mono text-slate-800 tabular-nums">{savedDoc.receivedDate || 'Hôm nay'}</strong>
                   </span>
                 </div>
               </div>
@@ -741,71 +716,6 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   <FileUp className="w-3.5 h-3.5" />
                   <span>Chọn lại tệp PDF &amp; Thử lưu lại</span>
                 </button>
-              </div>
-            </div>
-          )}
-
-          {/* Task Suggestions Confirmed / Pending Confirmation after saving PDF */}
-          {editableSuggestions.length > 0 && (
-            <div className="bg-white border border-slate-200 rounded-lg p-3.5 space-y-2.5 text-xs">
-              <div className="flex items-center justify-between gap-2 flex-wrap">
-                <span className="font-bold text-slate-900 flex items-center gap-1.5">
-                  <ListChecks className="w-4 h-4 text-sky-700" />
-                  <span>Việc cần làm trích xuất từ PDF ({editableSuggestions.length})</span>
-                </span>
-                <span className="text-[11px] text-slate-500">
-                  Mục đã lưu sẽ xuất hiện ngay trong tab Việc của tôi
-                </span>
-              </div>
-              {taskActionError && (
-                <p className="text-rose-700 font-medium">{taskActionError}</p>
-              )}
-              <div className="space-y-2">
-                {editableSuggestions.map((sug) => {
-                  const confirmed = confirmedTasksBySugId[sug.id];
-                  return (
-                    <div
-                      key={sug.id}
-                      className="border border-slate-200 rounded-lg p-2.5 flex flex-col sm:flex-row sm:items-center justify-between gap-2 bg-slate-50/70"
-                    >
-                      <div className="space-y-0.5 min-w-0">
-                        <div className="flex flex-wrap items-center gap-1.5">
-                          <strong className="text-slate-900">{sug.taskTitle}</strong>
-                          {sug.dueDate ? (
-                            <span className="font-mono text-[11px] px-1.5 py-0.5 rounded bg-sky-50 text-sky-800 border border-sky-200">
-                              Hạn: {sug.dueDate}
-                            </span>
-                          ) : (
-                            <span className="text-[11px] px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 font-semibold">
-                              Cần xác nhận{sug.rawDeadlineText ? ` (${sug.rawDeadlineText})` : ''}
-                            </span>
-                          )}
-                          <span className="text-[11px] text-slate-500">Trang {sug.page}</span>
-                        </div>
-                        {sug.recipient && (
-                          <p className="text-[11px] text-slate-600">Nơi nhận: {sug.recipient}</p>
-                        )}
-                      </div>
-                      <div className="shrink-0">
-                        {confirmed ? (
-                          <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-emerald-100 text-emerald-900 border border-emerald-200 font-semibold">
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Đã giao: {confirmed.assigneeName}</span>
-                          </span>
-                        ) : (
-                          <button
-                            type="button"
-                            disabled={savingTaskSugId === sug.id}
-                            onClick={() => handleConfirmSingleSuggestion(savedDoc.id, sug)}
-                            className="inline-flex items-center gap-1.5 px-3 py-1.5 bg-sky-700 hover:bg-sky-800 text-white font-semibold rounded-md disabled:opacity-50"
-                          >
-                            <span>{savingTaskSugId === sug.id ? 'Đang lưu...' : 'Xác nhận & Lưu việc'}</span>
-                          </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
               </div>
             </div>
           )}
@@ -1172,27 +1082,27 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </span>
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1 flex-wrap">
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
-                      Số / Ký hiệu gốc <span className="text-rose-600">*</span>
-                    </label>
-                    {renderLocateButton('docNumber', 'Số/ký hiệu')}
-                  </div>
-                  <input
-                    type="text"
-                    value={fullDocNumber}
-                    onChange={(e) => {
-                      setFullDocNumber(e.target.value);
-                      setIsEditingFileName(false);
-                    }}
-                    placeholder="Ví dụ: 1234/SGDĐT-GDTrH"
-                    required
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
-                  />
+              <div className="space-y-1 min-w-0">
+                <div className="flex items-center justify-between gap-1 flex-wrap">
+                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
+                    Số / Ký hiệu gốc <span className="text-rose-600">*</span>
+                  </label>
+                  {renderLocateButton('docNumber', 'Số/ký hiệu')}
                 </div>
+                <input
+                  type="text"
+                  value={fullDocNumber}
+                  onChange={(e) => {
+                    setFullDocNumber(e.target.value);
+                    setIsEditingFileName(false);
+                  }}
+                  placeholder="Ví dụ: 1234/SGDĐT-GDTrH"
+                  required
+                  className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                />
+              </div>
 
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="space-y-1 min-w-0">
                   <div className="flex items-center justify-between gap-1 flex-wrap">
                     <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
@@ -1204,7 +1114,23 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     type="text"
                     value={issuingAgency}
                     onChange={(e) => setIssuingAgency(e.target.value)}
-                    placeholder="Ví dụ: Sở GD&ĐT, Trường THPT..."
+                    placeholder="Ví dụ: SỞ GIÁO DỤC VÀ ĐÀO TẠO..."
+                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                  />
+                </div>
+
+                <div className="space-y-1 min-w-0">
+                  <div className="flex items-center justify-between gap-1 flex-wrap">
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
+                      Cơ quan chủ quản <span className="text-slate-400 font-normal lowercase">(nếu có)</span>
+                    </label>
+                    {renderLocateButton('parentAgency', 'Cơ quan chủ quản')}
+                  </div>
+                  <input
+                    type="text"
+                    value={parentAgency}
+                    onChange={(e) => setParentAgency(e.target.value)}
+                    placeholder="Ví dụ: UBND TỈNH AN GIANG..."
                     className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                   />
                 </div>
@@ -1224,7 +1150,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     setDocName(e.target.value);
                     setIsEditingFileName(false);
                   }}
-                  placeholder="Tên ngắn gọn của văn bản (dùng để đặt tên tệp lưu trữ)..."
+                  placeholder="Tên văn bản (dùng để đặt tên tệp lưu trữ)..."
                   className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                 />
               </div>
@@ -1245,41 +1171,200 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 />
               </div>
 
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div className="space-y-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1 flex-wrap">
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
-                      Ngày ban hành
-                    </label>
-                    {renderLocateButton('issueDate', 'Ngày ban hành')}
-                  </div>
-                  <input
-                    type="text"
-                    value={issueDate}
-                    onChange={(e) => setIssueDate(e.target.value)}
-                    onBlur={(e) => setIssueDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
-                    placeholder="dd/mm/yyyy (để trống nếu chưa có)"
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
-                  />
-                </div>
+              {/* Ngày văn bản + Đối chiếu 2 vị trí */}
+              {(() => {
+                const compStatus = analysis.extraction.dateComparisonStatus;
+                const topDate = analysis.extraction.topRightDate;
+                const sigDate = analysis.extraction.signatureDate;
+                const dateInvalid =
+                  documentDate.trim().length > 0 && !normalizeDateOnlyDdMmYyyy(documentDate.trim());
 
-                <div className="space-y-1 min-w-0">
-                  <div className="flex items-center justify-between gap-1 flex-wrap">
-                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
-                      Ngày ký
-                    </label>
-                    {renderLocateButton('signDate', 'Ngày ký')}
+                if (compStatus === 'mismatch' && (topDate || sigDate)) {
+                  return (
+                    <div className="p-3.5 bg-amber-50 border border-amber-300 rounded-xl space-y-3 text-xs">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <div className="flex items-center gap-2 text-amber-950 font-bold">
+                          <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0" />
+                          <span>Ngày trên văn bản chưa thống nhất</span>
+                        </div>
+                        <span className="text-[11px] font-bold px-2 py-0.5 rounded bg-amber-200 text-amber-950 border border-amber-300">
+                          Chờ quản trị viên xác nhận ngày
+                        </span>
+                      </div>
+
+                      <div className="grid grid-cols-1 sm:grid-cols-2 gap-2.5">
+                        {topDate && (
+                          <div className="bg-white border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-[11px] font-semibold text-slate-600">
+                                {topDate.positionLabel || 'Đầu trang 1 (góc phải)'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleLocateDateSource(topDate, 'Ngày ở đầu văn bản')}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded"
+                              >
+                                <Crosshair className="w-3 h-3" />
+                                <span>Xem vị trí (Tr.{topDate.page})</span>
+                              </button>
+                            </div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-bold text-sm text-slate-900 tabular-nums">
+                                {topDate.date}
+                              </span>
+                              {canManageActiveBook && (
+                                <button
+                                  type="button"
+                                  onClick={() => setDocumentDate(topDate.date)}
+                                  className={`px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors ${
+                                    documentDate === topDate.date
+                                      ? 'bg-sky-700 text-white border-sky-700'
+                                      : 'bg-slate-50 hover:bg-sky-50 text-slate-800 border-slate-300'
+                                  }`}
+                                >
+                                  {documentDate === topDate.date ? 'Đã chọn' : 'Chọn ngày này'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
+                        {sigDate && (
+                          <div className="bg-white border border-amber-200 rounded-lg p-2.5 space-y-1.5">
+                            <div className="flex items-center justify-between gap-1">
+                              <span className="text-[11px] font-semibold text-slate-600">
+                                {sigDate.positionLabel || 'Khối chữ ký'}
+                              </span>
+                              <button
+                                type="button"
+                                onClick={() => handleLocateDateSource(sigDate, 'Ngày ở khối chữ ký')}
+                                className="inline-flex items-center gap-1 px-2 py-0.5 text-[11px] font-semibold text-sky-700 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded"
+                              >
+                                <Crosshair className="w-3 h-3" />
+                                <span>Xem vị trí (Tr.{sigDate.page})</span>
+                              </button>
+                            </div>
+                            <div className="flex items-center justify-between gap-2">
+                              <span className="font-mono font-bold text-sm text-slate-900 tabular-nums">
+                                {sigDate.date}
+                              </span>
+                              {canManageActiveBook && (
+                                <button
+                                  type="button"
+                                  onClick={() => setDocumentDate(sigDate.date)}
+                                  className={`px-2.5 py-1 rounded text-[11px] font-semibold border transition-colors ${
+                                    documentDate === sigDate.date
+                                      ? 'bg-sky-700 text-white border-sky-700'
+                                      : 'bg-slate-50 hover:bg-sky-50 text-slate-800 border-slate-300'
+                                  }`}
+                                >
+                                  {documentDate === sigDate.date ? 'Đã chọn' : 'Chọn ngày này'}
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
+                      </div>
+
+                      {canManageActiveBook ? (
+                        <div className="space-y-1">
+                          <label className="block text-[11px] font-bold text-amber-950 uppercase tracking-wide">
+                            Ngày văn bản thống nhất (dd/mm/yyyy)
+                          </label>
+                          <div className="flex items-center gap-2">
+                            <input
+                              type="text"
+                              value={documentDate}
+                              onChange={(e) => setDocumentDate(e.target.value)}
+                              onBlur={(e) => {
+                                const norm = normalizeDateOnlyDdMmYyyy(e.target.value);
+                                if (norm) setDocumentDate(norm);
+                              }}
+                              placeholder="Chọn một ngày ở trên hoặc nhập dd/mm/yyyy (để trống nếu muốn xác nhận sau)"
+                              className="flex-1 min-h-[42px] h-10 px-3 bg-white border border-amber-300 rounded-lg font-mono text-sm text-slate-900 tabular-nums focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                            />
+                            {documentDate && (
+                              <button
+                                type="button"
+                                onClick={() => setDocumentDate('')}
+                                className="px-2.5 py-2 text-[11px] font-semibold text-slate-600 bg-white border border-slate-300 rounded-lg hover:bg-slate-50"
+                              >
+                                Xác nhận sau
+                              </button>
+                            )}
+                          </div>
+                          {dateInvalid && (
+                            <p className="text-[11px] text-rose-700 font-semibold">
+                              Ngày không hợp lệ. Vui lòng nhập đúng định dạng dd/mm/yyyy.
+                            </p>
+                          )}
+                        </div>
+                      ) : (
+                        <p className="text-[11px] text-amber-900 bg-white/80 border border-amber-200 rounded-lg px-2.5 py-2">
+                          Hệ thống không tự chọn ngày chính thức khi 2 vị trí khác nhau. Hồ sơ sẽ lưu ở trạng thái{' '}
+                          <strong>Chờ quản trị viên xác nhận ngày</strong> trong Sổ văn bản.
+                        </p>
+                      )}
+                    </div>
+                  );
+                }
+
+                return (
+                  <div className="space-y-1 min-w-0">
+                    <div className="flex items-center justify-between gap-1 flex-wrap">
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
+                          Ngày văn bản
+                        </label>
+                        {compStatus === 'matched' && (
+                          <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-800 border border-emerald-200">
+                            Khớp 2 vị trí
+                          </span>
+                        )}
+                      </div>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {topDate && (
+                          <button
+                            type="button"
+                            onClick={() => handleLocateDateSource(topDate, 'Ngày ở đầu văn bản')}
+                            className="inline-flex items-center gap-1 px-2 py-1 min-h-[28px] text-[11px] font-semibold text-sky-700 hover:text-sky-900 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                            <span>Đầu VB (Tr.{topDate.page})</span>
+                          </button>
+                        )}
+                        {sigDate && (
+                          <button
+                            type="button"
+                            onClick={() => handleLocateDateSource(sigDate, 'Ngày ở khối chữ ký')}
+                            className="inline-flex items-center gap-1 px-2 py-1 min-h-[28px] text-[11px] font-semibold text-sky-700 hover:text-sky-900 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded"
+                          >
+                            <Crosshair className="w-3 h-3" />
+                            <span>Khối chữ ký (Tr.{sigDate.page})</span>
+                          </button>
+                        )}
+                        {!topDate && !sigDate && renderLocateButton('documentDate', 'Ngày văn bản')}
+                      </div>
+                    </div>
+                    <input
+                      type="text"
+                      value={documentDate}
+                      onChange={(e) => setDocumentDate(e.target.value)}
+                      onBlur={(e) => {
+                        const norm = normalizeDateOnlyDdMmYyyy(e.target.value);
+                        if (norm) setDocumentDate(norm);
+                      }}
+                      placeholder="dd/mm/yyyy (để trống nếu chưa phát hiện)"
+                      className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm text-slate-900 tabular-nums focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    />
+                    {dateInvalid && (
+                      <p className="text-[11px] text-rose-700 font-semibold">
+                        Ngày văn bản không hợp lệ. Vui lòng nhập đúng định dạng dd/mm/yyyy.
+                      </p>
+                    )}
                   </div>
-                  <input
-                    type="text"
-                    value={signDate}
-                    onChange={(e) => setSignDate(e.target.value)}
-                    onBlur={(e) => setSignDate(normalizeDateOnlyDdMmYyyy(e.target.value))}
-                    placeholder="dd/mm/yyyy (chỉ điền nếu có ngày ký riêng)"
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
-                  />
-                </div>
-              </div>
+                );
+              })()}
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
                 <div className="space-y-1 min-w-0">
@@ -1407,7 +1492,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 <p className="text-[11px] text-slate-500 break-words">
                   Lưu vào Google Drive tại thư mục:{' '}
                   <strong className="text-slate-700">
-                    {activeBook.name} → {(issueDate || signDate).match(/(\d{4})$/)?.[1] || serverYear || Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric' }).format(new Date()))} → Văn bản đến
+                    {activeBook.name} → {(normalizeDateOnlyDdMmYyyy(documentDate) || analysis.extraction.topRightDate?.date || analysis.extraction.signatureDate?.date || '').match(/(\d{4})$/)?.[1] || serverYear || Number(new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Ho_Chi_Minh', year: 'numeric' }).format(new Date()))} → Văn bản đến
                   </strong>{' '}
                   bằng đúng tên ở ô này (giữ nguyên số gốc{' '}
                   <strong className="font-mono text-slate-700 break-all">{fullDocNumber || '...'}</strong> trong sổ).
@@ -1424,166 +1509,6 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </div>
               )}
 
-              {/* Trích thời hạn và việc cần làm từ PDF */}
-              {editableSuggestions.length > 0 && (
-                <div className="bg-slate-50 border border-slate-200 rounded-xl p-3.5 space-y-3">
-                  <div className="flex flex-wrap items-center justify-between gap-2">
-                    <span className="text-xs font-bold text-slate-900 uppercase tracking-wide flex items-center gap-1.5">
-                      <CalendarClock className="w-4 h-4 text-sky-700 shrink-0" />
-                      <span>Thời hạn &amp; Việc cần làm trích xuất ({editableSuggestions.length})</span>
-                    </span>
-                    <span className="text-[11px] text-slate-500">
-                      Tích chọn để giao việc tự động khi bấm Xác nhận và lưu
-                    </span>
-                  </div>
-
-                  <div className="space-y-3">
-                    {editableSuggestions.map((sug, idx) => (
-                      <div
-                        key={sug.id}
-                        className="bg-white border border-slate-200 rounded-lg p-3 space-y-2.5 text-xs"
-                      >
-                        <div className="flex flex-wrap items-center justify-between gap-2">
-                          <label className="inline-flex items-center gap-2 font-bold text-slate-900 cursor-pointer">
-                            <input
-                              type="checkbox"
-                              checked={sug.selected}
-                              onChange={(e) => {
-                                const checked = e.target.checked;
-                                setEditableSuggestions((prev) =>
-                                  prev.map((item, i) => (i === idx ? { ...item, selected: checked } : item))
-                                );
-                              }}
-                              className="rounded border-slate-300 text-sky-700"
-                            />
-                            <span>Mục #{idx + 1}</span>
-                            {sug.needsConfirmation && !sug.dueDate.trim() && (
-                              <span className="px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300 font-bold text-[10px]">
-                                Cần xác nhận hạn
-                              </span>
-                            )}
-                          </label>
-
-                          <button
-                            type="button"
-                            onClick={() => {
-                              setJumpToPage(sug.page);
-                              setHighlightBox({
-                                page: sug.page,
-                                label: `Đoạn nguồn việc #${idx + 1}`,
-                                estimated: true,
-                                nonce: Date.now(),
-                              });
-                              setActiveMobilePane('pdf');
-                            }}
-                            className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-sky-700 hover:text-sky-900 bg-sky-50 hover:bg-sky-100 border border-sky-200 rounded"
-                          >
-                            <Crosshair className="w-3 h-3" />
-                            <span>Xem trang {sug.page}</span>
-                          </button>
-                        </div>
-
-                        <div className="space-y-1">
-                          <label className="text-[11px] font-semibold text-slate-600">
-                            Việc cần thực hiện
-                          </label>
-                          <input
-                            type="text"
-                            value={sug.taskTitle}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setEditableSuggestions((prev) =>
-                                prev.map((item, i) => (i === idx ? { ...item, taskTitle: val } : item))
-                              );
-                            }}
-                            className="w-full min-h-[38px] px-2.5 py-1.5 bg-white border border-slate-300 rounded-md text-xs font-medium text-slate-900"
-                          />
-                        </div>
-
-                        <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
-                          <div className="space-y-1">
-                            <label className="text-[11px] font-semibold text-slate-600">
-                              Hạn nộp (dd/mm/yyyy)
-                            </label>
-                            <input
-                              type="text"
-                              value={sug.dueDate}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setEditableSuggestions((prev) =>
-                                  prev.map((item, i) =>
-                                    i === idx
-                                      ? { ...item, dueDate: val, needsConfirmation: !val.trim() && Boolean(item.rawDeadlineText) }
-                                      : item
-                                  )
-                                );
-                              }}
-                              placeholder={sug.rawDeadlineText || 'dd/mm/yyyy'}
-                              className="w-full min-h-[38px] px-2.5 py-1.5 bg-white border border-slate-300 rounded-md font-mono text-xs text-slate-900"
-                            />
-                            {sug.rawDeadlineText && !sug.dueDate.trim() && (
-                              <p className="text-[10px] text-amber-800">
-                                Nguồn: &ldquo;{sug.rawDeadlineText}&rdquo;
-                              </p>
-                            )}
-                          </div>
-
-                          <div className="space-y-1">
-                            <label className="text-[11px] font-semibold text-slate-600">
-                              Nơi nhận / Đơn vị
-                            </label>
-                            <input
-                              type="text"
-                              value={sug.recipient || ''}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setEditableSuggestions((prev) =>
-                                  prev.map((item, i) => (i === idx ? { ...item, recipient: val } : item))
-                                );
-                              }}
-                              placeholder="Ví dụ: Đoàn trường, GVCN..."
-                              className="w-full min-h-[38px] px-2.5 py-1.5 bg-white border border-slate-300 rounded-md text-xs text-slate-900"
-                            />
-                          </div>
-
-                          <div className="space-y-1">
-                            <label className="text-[11px] font-semibold text-slate-600">
-                              Người phụ trách
-                            </label>
-                            <select
-                              value={sug.assigneeUserId}
-                              onChange={(e) => {
-                                const val = e.target.value;
-                                setEditableSuggestions((prev) =>
-                                  prev.map((item, i) => (i === idx ? { ...item, assigneeUserId: val } : item))
-                                );
-                              }}
-                              className="w-full min-h-[38px] px-2 py-1.5 bg-white border border-slate-300 rounded-md text-xs text-slate-900"
-                            >
-                              {assignees.length > 0 ? (
-                                assignees.map((a) => (
-                                  <option key={a.id} value={a.id}>
-                                    {a.displayName} (@{a.username})
-                                  </option>
-                                ))
-                              ) : (
-                                <option value={currentUser.id}>
-                                  {getUserDisplayName(currentUser)} (@{currentUser.username})
-                                </option>
-                              )}
-                            </select>
-                          </div>
-                        </div>
-
-                        <p className="text-[11px] text-slate-600 bg-slate-50 border border-slate-200 rounded px-2.5 py-1.5 break-words">
-                          <strong className="text-slate-700">Đoạn nguồn (Trang {sug.page}):</strong>{' '}
-                          {sug.sourceExcerpt}
-                        </p>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
 
               {/* Filename conflict resolution banner (tách biệt với cảnh báo trùng văn bản) */}
               {filenameConflict && (

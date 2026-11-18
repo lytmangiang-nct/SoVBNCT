@@ -14,6 +14,8 @@ export const ALL_BOOK_PERMISSIONS: BookPermission[] = [
   'cancel',
   'delete',
   'export',
+  'import_archive',
+  'close_book',
   'manage_book',
 ];
 
@@ -66,6 +68,16 @@ export const BOOK_PERMISSION_META: Record<
     shortLabel: 'Xuất sổ',
     description: 'Xuất dữ liệu văn bản trong sổ ra tệp Excel (.xlsx).',
   },
+  import_archive: {
+    label: 'Nhập kho văn bản cũ',
+    shortLabel: 'Nhập kho',
+    description: 'Nhập danh sách văn bản cũ từ Excel và ghép nối tệp đã có trên Google Drive vào sổ.',
+  },
+  close_book: {
+    label: 'Chốt sổ & Bàn giao cuối năm',
+    shortLabel: 'Chốt sổ',
+    description: 'Xem tổng hợp cuối năm, tạo bản chốt bất biến, tải Excel bàn giao và ghi đính chính.',
+  },
   manage_book: {
     label: 'Quản trị sổ',
     shortLabel: 'Quản trị sổ',
@@ -90,8 +102,8 @@ export function normalizeBookPermissionList(perms: BookPermission[]): BookPermis
   const set = new Set<BookPermission>(
     perms.filter((p): p is BookPermission => typeof p === 'string' && validSet.has(p))
   );
-  // Khi gán quyền Lấy số (issue_number) ở một sổ, đồng thời tự động có quyền Xem & tra cứu trong sổ đó
-  if (set.has('issue_number')) {
+  // Khi gán quyền Lấy số / Nhập kho / Chốt sổ ở một sổ, đồng thời tự động có quyền Xem & tra cứu trong sổ đó
+  if (set.has('issue_number') || set.has('import_archive') || set.has('close_book')) {
     set.add('view');
   }
   return ALL_BOOK_PERMISSIONS.filter((p) => set.has(p));

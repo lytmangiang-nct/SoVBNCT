@@ -325,27 +325,73 @@ function doPost(e) {
   }
 }`;
 
-export const GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE = `function getOrCreateSubFolder(parent, name) {
+export const GOOGLE_DRIVE_APPS_SCRIPT_TEMPLATE = `function verifyCachedFolder(parent, cachedId, expectedName) {
+  var id = (cachedId || "").toString().trim();
+  var trimmed = (expectedName || "").toString().trim();
+  if (!id || !trimmed) return null;
+  try {
+    var folder = DriveApp.getFolderById(id);
+    if (!folder || folder.isTrashed()) return null;
+    if (folder.getName().toString().trim().toLowerCase() !== trimmed.toLowerCase()) return null;
+    var parents = folder.getParents();
+    var parentId = parent.getId();
+    while (parents.hasNext()) {
+      if (parents.next().getId() === parentId) {
+        return folder;
+      }
+    }
+  } catch (err) {}
+  return null;
+}
+
+function getOrCreateSubFolder(parent, name, cachedId) {
   var trimmed = (name || "").toString().trim();
   if (!trimmed) return parent;
+  var cached = verifyCachedFolder(parent, cachedId, trimmed);
+  if (cached) return cached;
+
   var folders = parent.getFoldersByName(trimmed);
-  if (folders.hasNext()) return folders.next();
+  while (folders.hasNext()) {
+    var candidate = folders.next();
+    if (!candidate.isTrashed()) {
+      return candidate;
+    }
+  }
   return parent.createFolder(trimmed);
 }
 
 function resolveHierarchyFolder(rootFolder, data) {
-  var target = rootFolder;
-  var bookName = (data.bookName || "").toString().trim();
-  if (bookName && rootFolder.getName().toLowerCase() !== bookName.toLowerCase()) {
-    target = getOrCreateSubFolder(target, bookName);
+  var lock = LockService.getScriptLock();
+  lock.waitLock(15000);
+  try {
+    var rootName = (rootFolder.getName() || "").toString().trim();
+    var bookName = (data.bookName || "").toString().trim();
+    var bookFolder = rootFolder;
+    var bookFolderId = "";
+
+    if (bookName && rootName.toLowerCase() !== bookName.toLowerCase()) {
+      bookFolder = getOrCreateSubFolder(rootFolder, bookName, data.cachedBookFolderId);
+      bookFolderId = bookFolder.getId();
+    }
+
+    var yearLabel = (data.year !== undefined && data.year !== null ? String(data.year) : "").trim() || "Chưa xác định năm";
+    var yearFolder = getOrCreateSubFolder(bookFolder, yearLabel, data.cachedYearFolderId);
+    var catLabel = (data.categoryFolder || "").toString().trim();
+    var target = catLabel ? getOrCreateSubFolder(yearFolder, catLabel, data.cachedCategoryFolderId) : yearFolder;
+
+    var displayBook = bookName || rootName || "Sổ văn bản";
+    var folderPath = displayBook + "/" + yearLabel + (catLabel ? "/" + catLabel : "");
+
+    return {
+      folder: target,
+      bookFolderId: bookFolderId,
+      yearFolderId: yearFolder.getId(),
+      categoryFolderId: target.getId(),
+      folderPath: folderPath
+    };
+  } finally {
+    try { lock.releaseLock(); } catch (eLock) {}
   }
-  if (data.year) {
-    target = getOrCreateSubFolder(target, String(data.year));
-  }
-  if (data.categoryFolder) {
-    target = getOrCreateSubFolder(target, String(data.categoryFolder));
-  }
-  return target;
 }
 
 function doPost(e) {
@@ -400,7 +446,73 @@ function doPost(e) {
       }
     }
 
-    var targetFolder = resolveHierarchyFolder(rootFolder, data);
+    // 1c. Lấy thông tin 1 tệp theo fileId (dùng cho Nhập kho văn bản cũ)
+    if (data.action === "get_file") {
+      var gId = (data.fileId || "").trim();
+      if (!gId) {
+        return jsonOut({ result: "success", status: "not_found", error: "Thiếu fileId." });
+      }
+      try {
+        var gf = DriveApp.getFileById(gId);
+        if (gf.isTrashed()) {
+          return jsonOut({ result: "success", status: "not_found", error: "Tệp đã nằm trong thùng rác." });
+        }
+        return jsonOut({
+          result: "success",
+          status: "ok",
+          file: {
+            fileId: gf.getId(),
+            fileName: gf.getName(),
+            webViewLink: gf.getUrl(),
+            mimeType: gf.getMimeType()
+          }
+        });
+      } catch (eGet) {
+        var msgGet = eGet.toString().toLowerCase();
+        if (msgGet.indexOf("access") !== -1 || msgGet.indexOf("permission") !== -1) {
+          return jsonOut({ result: "success", status: "access_denied", error: eGet.toString() });
+        }
+        return jsonOut({ result: "success", status: "not_found", error: eGet.toString() });
+      }
+    }
+
+    // 1d. Liệt kê tệp trong thư mục và thư mục con (dùng cho Nhập kho văn bản cũ)
+    if (data.action === "list_files") {
+      var maxDepth = Math.min(Math.max(Number(data.maxDepth || 4), 1), 6);
+      var collected = [];
+      function walkFolder(dir, relPath, depth) {
+        var filesIt = dir.getFiles();
+        while (filesIt.hasNext() && collected.length < 3000) {
+          var item = filesIt.next();
+          if (item.isTrashed()) continue;
+          collected.push({
+            fileId: item.getId(),
+            fileName: item.getName(),
+            webViewLink: item.getUrl(),
+            mimeType: item.getMimeType(),
+            folderPath: relPath || folderName
+          });
+        }
+        if (depth < maxDepth) {
+          var subIt = dir.getFolders();
+          while (subIt.hasNext() && collected.length < 3000) {
+            var subDir = subIt.next();
+            var nextPath = relPath ? relPath + "/" + subDir.getName() : subDir.getName();
+            walkFolder(subDir, nextPath, depth + 1);
+          }
+        }
+      }
+      walkFolder(rootFolder, folderName, 1);
+      return jsonOut({
+        result: "success",
+        folderId: folderId,
+        folderName: folderName,
+        files: collected
+      });
+    }
+
+    var resolved = resolveHierarchyFolder(rootFolder, data);
+    var targetFolder = resolved.folder;
     var docId = (data.docId || "").trim();
     var marker = docId ? "[NCT_DOC_ID:" + docId + "]" : "";
 
@@ -433,13 +545,25 @@ function doPost(e) {
           fileId: existing.getId(),
           fileName: existing.getName(),
           webViewLink: existing.getUrl(),
-          targetFolderId: targetFolder.getId()
+          folderId: resolved.categoryFolderId,
+          targetFolderId: resolved.categoryFolderId,
+          bookFolderId: resolved.bookFolderId,
+          yearFolderId: resolved.yearFolderId,
+          folderPath: resolved.folderPath
         });
       }
-      return jsonOut({ result: "success", found: false });
+      return jsonOut({
+        result: "success",
+        found: false,
+        folderId: resolved.categoryFolderId,
+        targetFolderId: resolved.categoryFolderId,
+        bookFolderId: resolved.bookFolderId,
+        yearFolderId: resolved.yearFolderId,
+        folderPath: resolved.folderPath
+      });
     }
 
-    // 3. Tải tệp vào đúng cây thư mục Tên sổ -> Năm -> Văn bản đi / Văn bản đến
+    // 3. Tải tệp vào đúng cây thư mục Tên sổ / Năm / Văn bản đi | Văn bản đến
     if (data.action === "upload") {
       var dup = data.keepPreviousFile ? null : findExisting();
       if (dup && !data.replaceMode) {
@@ -452,7 +576,11 @@ function doPost(e) {
           fileId: dup.getId(),
           fileName: dup.getName(),
           webViewLink: dup.getUrl(),
-          targetFolderId: targetFolder.getId()
+          folderId: resolved.categoryFolderId,
+          targetFolderId: resolved.categoryFolderId,
+          bookFolderId: resolved.bookFolderId,
+          yearFolderId: resolved.yearFolderId,
+          folderPath: resolved.folderPath
         });
       }
 
@@ -480,7 +608,11 @@ function doPost(e) {
         fileId: created.getId(),
         fileName: created.getName(),
         webViewLink: created.getUrl(),
-        targetFolderId: targetFolder.getId()
+        folderId: resolved.categoryFolderId,
+        targetFolderId: resolved.categoryFolderId,
+        bookFolderId: resolved.bookFolderId,
+        yearFolderId: resolved.yearFolderId,
+        folderPath: resolved.folderPath
       });
     }
 

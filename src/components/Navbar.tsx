@@ -15,6 +15,8 @@ import {
   UserCircle2,
   ListChecks,
   ClipboardCheck,
+  Archive,
+  Lock,
 } from 'lucide-react';
 import type { BookPermission, RegistryBook, User } from '../types';
 import {
@@ -31,6 +33,8 @@ export type AppTab =
   | 'registry'
   | 'tasks'
   | 'reconciliation'
+  | 'archive_import'
+  | 'year_end_closing'
   | 'statistics'
   | 'settings';
 export type RegistrySection = 'active' | 'deleted' | 'history';
@@ -108,6 +112,8 @@ export const Navbar: React.FC<NavbarProps> = ({
   const canViewDeleted = canViewRegistry || hasPermForActiveBook('delete');
   const canManageSettings = hasPermForActiveBook('manage_book');
   const canAccessReconciliation = isAdmin || hasAnyBookPermission(currentUser, 'manage_book', books);
+  const canImportArchive = isAdmin || hasAnyBookPermission(currentUser, 'import_archive', books);
+  const canCloseBook = isAdmin || hasAnyBookPermission(currentUser, 'close_book', books);
 
   const displayName = getUserDisplayName(currentUser);
   const systemRoleLabel = getUserSystemRoleLabel(currentUser);
@@ -227,6 +233,28 @@ export const Navbar: React.FC<NavbarProps> = ({
       icon: <ClipboardCheck className="w-4 h-4 text-sky-700 shrink-0" />,
       onClick: () => {
         setActiveTab('reconciliation');
+        setMoreMenuOpen(false);
+      },
+    },
+    {
+      key: 'archive_import',
+      label: 'Nhập kho văn bản cũ',
+      visible: canImportArchive,
+      active: activeTab === 'archive_import',
+      icon: <Archive className="w-4 h-4 text-emerald-700 shrink-0" />,
+      onClick: () => {
+        setActiveTab('archive_import');
+        setMoreMenuOpen(false);
+      },
+    },
+    {
+      key: 'year_end_closing',
+      label: 'Chốt sổ cuối năm',
+      visible: canCloseBook,
+      active: activeTab === 'year_end_closing',
+      icon: <Lock className="w-4 h-4 text-sky-700 shrink-0" />,
+      onClick: () => {
+        setActiveTab('year_end_closing');
         setMoreMenuOpen(false);
       },
     },
