@@ -35,6 +35,7 @@ import {
   DEFAULT_MAX_WORD_MB,
   formatFileSize,
   normalizeDateOnlyDdMmYyyy,
+  sanitizeCustomDriveFileName,
 } from '../utils/fileNaming';
 import { DEFAULT_BOOK_ID, getUserDisplayName, hasBookPermission, isSystemAdmin } from '../utils/permissions';
 import { SEMANTIC_STATUS_STYLES } from '../utils/documentColors';
@@ -70,6 +71,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   const [selectedPdfFile, setSelectedPdfFile] = useState<File | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const retryPdfFileInputRef = useRef<HTMLInputElement>(null);
+  const restagePdfFileInputRef = useRef<HTMLInputElement>(null);
 
   const [analyzing, setAnalyzing] = useState(false);
   const [analyzeError, setAnalyzeError] = useState<string | null>(null);
@@ -95,6 +97,7 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
 
   // Editable extracted fields
   const [fullDocNumber, setFullDocNumber] = useState('');
+  const [docNumberConfirmed, setDocNumberConfirmed] = useState(true);
   const [docName, setDocName] = useState('');
   const [title, setTitle] = useState('');
   const [documentDate, setDocumentDate] = useState('');
@@ -121,6 +124,13 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   const [ignoreSuspectedDuplicate, setIgnoreSuspectedDuplicate] = useState(false);
   const [liveSuspectedDuplicate, setLiveSuspectedDuplicate] = useState<DocumentRecord | null>(null);
 
+  // Expired staged PDF recovery state (preserves all edits & idempotencyKey)
+  const [tempPdfExpiredError, setTempPdfExpiredError] = useState<string | null>(null);
+  const [restagingPdf, setRestagingPdf] = useState(false);
+  const [restagePickFile, setRestagePickFile] = useState<File | null>(null);
+  const [restageShaStatus, setRestageShaStatus] = useState<'idle' | 'matched' | 'mismatch'>('idle');
+  const [allowDifferentRestageFile, setAllowDifferentRestageFile] = useState(false);
+
   // Result state
   const [savedDoc, setSavedDoc] = useState<DocumentRecord | null>(null);
   const [savedStageToken, setSavedStageToken] = useState<string | null>(null);
@@ -145,14 +155,42 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
   const maxFileSizeMB = settings.googleDriveConfig?.maxFileSizeMB || DEFAULT_MAX_WORD_MB;
   const maxFileSizeBytes = settings.googleDriveConfig?.maxFileSizeBytes || maxFileSizeMB * 1024 * 1024;
 
-  // Unified live file name ("Tên tệp sẽ lưu")
+  const isIncompleteDocNumber = (val: string): boolean => {
+    const trimmed = val.trim();
+    if (!trimmed) return true;
+    if (/^[/\\-]/.test(trimmed)) return true;
+    if (trimmed.includes('/')) {
+      const beforeSlash = trimmed.split('/')[0].trim();
+      if (!/\d/.test(beforeSlash)) return true;
+    }
+    return false;
+  };
+
+  const docNumberIncomplete = isIncompleteDocNumber(fullDocNumber);
+  const requiresDocNumberReview = Boolean(
+    analysis?.extraction.docNumberNeedsConfirmation || docNumberIncomplete
+  );
+
+  // Unified live file name ("Tên tệp sẽ lưu" — toàn bộ phần tên trước phần mở rộng viết IN HOA giữ dấu tiếng Việt)
   const computedDriveFileName = useMemo(() => {
     if (isEditingFileName && customFileName.trim()) {
-      const cleaned = customFileName.trim();
-      return cleaned.toLowerCase().endsWith('.pdf') ? cleaned : `${cleaned}.pdf`;
+      return sanitizeCustomDriveFileName(customFileName, '.pdf');
     }
     return buildStandardDriveFileName(fullDocNumber, docName || title, '.pdf');
   }, [fullDocNumber, docName, title, isEditingFileName, customFileName]);
+
+  const computePdfSha256Hex = async (file: File): Promise<string | null> => {
+    try {
+      if (!window.crypto?.subtle) return null;
+      const buf = await file.arrayBuffer();
+      const digest = await window.crypto.subtle.digest('SHA-256', buf);
+      return Array.from(new Uint8Array(digest))
+        .map((b) => b.toString(16).padStart(2, '0'))
+        .join('');
+    } catch {
+      return null;
+    }
+  };
 
   // Live check suspected duplicate when user edits fullDocNumber / issuingAgency / documentDate
   useEffect(() => {
@@ -190,7 +228,11 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
 
   const applyAnalysisResult = (res: PdfAnalyzeResponse) => {
     setAnalysis(res);
-    setFullDocNumber(res.extraction.docNumber || '');
+    const extractedNum = res.extraction.docNumber || '';
+    setFullDocNumber(extractedNum);
+    setDocNumberConfirmed(
+      !res.extraction.docNumberNeedsConfirmation && !isIncompleteDocNumber(extractedNum)
+    );
     setDocName(res.extraction.docName || '');
     setTitle(res.extraction.title || '');
     const compStatus = res.extraction.dateComparisonStatus;
@@ -213,6 +255,10 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     setCustomFileName('');
     setFilenameConflict(null);
     setSubmitError(null);
+    setTempPdfExpiredError(null);
+    setRestagePickFile(null);
+    setRestageShaStatus('idle');
+    setAllowDifferentRestageFile(false);
     setIgnoreDuplicatePdf(false);
     setIgnoreSuspectedDuplicate(false);
     setLiveSuspectedDuplicate(res.suspectedDuplicateDocument || null);
@@ -347,13 +393,24 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     overrideCustomName?: string;
     forceIgnoreDuplicate?: boolean;
     forceIgnoreSuspected?: boolean;
+    overrideStageToken?: string;
+    overrideExpectedSha256?: string;
+    allowDifferentFile?: boolean;
   }) => {
     if (!analysis || submitting) return;
     setSubmitError(null);
     setFilenameConflict(null);
 
-    if (!fullDocNumber.trim()) {
-      setSubmitError('Vui lòng nhập hoặc xác nhận Số/ký hiệu văn bản gốc.');
+    if (!fullDocNumber.trim() || isIncompleteDocNumber(fullDocNumber)) {
+      setSubmitError(
+        'Số/ký hiệu văn bản chưa đầy đủ (thiếu phần số ở đầu). Vui lòng đối chiếu bản PDF gốc và nhập đầy đủ trước khi lưu.'
+      );
+      return;
+    }
+    if (requiresDocNumberReview && !docNumberConfirmed) {
+      setSubmitError(
+        'Vui lòng kiểm tra số văn bản với bản PDF gốc và đánh dấu xác nhận ở khung "Cần kiểm tra số văn bản" trước khi lưu.'
+      );
       return;
     }
     if (!docName.trim() && !title.trim()) {
@@ -383,11 +440,16 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
         }
       : undefined;
 
+    const stageTokenToUse = options?.overrideStageToken || analysis.stageToken;
+    const expectedShaToUse = options?.overrideExpectedSha256 || analysis.sha256;
+
     setSubmitting(true);
     try {
       const res = await api.importPdfDocument({
         bookId: activeBook.id,
-        stageToken: analysis.stageToken,
+        stageToken: stageTokenToUse,
+        expectedSha256: expectedShaToUse,
+        allowDifferentFile: Boolean(options?.allowDifferentFile || allowDifferentRestageFile),
         fullDocNumber: fullDocNumber.trim(),
         docName: docName.trim(),
         title: title.trim(),
@@ -414,14 +476,25 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
         idempotencyKey,
       });
 
+      setTempPdfExpiredError(null);
+      setRestagePickFile(null);
+      setRestageShaStatus('idle');
+      setAllowDifferentRestageFile(false);
       setSavedDoc(res.document);
-      setSavedStageToken(res.stageToken || analysis.stageToken);
+      setSavedStageToken(res.stageToken || stageTokenToUse);
       onDocumentImported(res.document);
       if (!res.driveSaved && res.uploadError) {
         setRetryDriveError(res.uploadError);
       }
     } catch (err: any) {
-      if (err.code === 'FILENAME_CONFLICT' && err.existingDocument) {
+      if (err.code === 'TEMP_PDF_EXPIRED' || err.status === 410) {
+        // Giữ nguyên toàn bộ thông tin đã sửa và idempotencyKey để nạp lại tệp không tạo trùng hồ sơ
+        setTempPdfExpiredError(
+          err.message ||
+            'Bản PDF tạm trên máy chủ đã hết hạn lưu trữ. Toàn bộ thông tin bạn đã chỉnh sửa vẫn được giữ nguyên.'
+        );
+        setSubmitError(null);
+      } else if (err.code === 'FILENAME_CONFLICT' && err.existingDocument) {
         setFilenameConflict({
           conflictingFileName: err.conflictingFileName || computedDriveFileName,
           suggestedSuffixName: err.suggestedSuffixName || computedDriveFileName,
@@ -438,6 +511,95 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     } finally {
       setSubmitting(false);
     }
+  };
+
+  const handleRestageAndRetryImport = async (fileOverride?: File, forceAllowDifferent = false) => {
+    if (!analysis || restagingPdf || submitting) return;
+    const fileToUse = fileOverride || restagePickFile || selectedPdfFile;
+    if (!fileToUse) {
+      restagePdfFileInputRef.current?.click();
+      return;
+    }
+
+    if (!fileToUse.name.toLowerCase().endsWith('.pdf')) {
+      setSubmitError('Chỉ hỗ trợ tệp định dạng .pdf.');
+      return;
+    }
+    if (fileToUse.size <= 0) {
+      setSubmitError('Tệp PDF được chọn đang bị rỗng (0 bytes).');
+      return;
+    }
+    if (fileToUse.size > maxFileSizeBytes) {
+      setSubmitError(
+        `Dung lượng tệp (${formatFileSize(fileToUse.size)}) vượt quá giới hạn tối đa ${maxFileSizeMB} MB.`
+      );
+      return;
+    }
+
+    const allowDiff = Boolean(forceAllowDifferent || allowDifferentRestageFile);
+    setRestagingPdf(true);
+    setSubmitError(null);
+    try {
+      const restaged = await api.restagePdfFile(fileToUse, {
+        bookId: activeBook.id,
+        expectedSha256: analysis.sha256,
+        allowDifferentFile: allowDiff,
+      });
+
+      setSelectedPdfFile(fileToUse);
+      setAnalysis((prev) =>
+        prev
+          ? {
+              ...prev,
+              stageToken: restaged.stageToken,
+              sha256: restaged.sha256,
+              fileSize: restaged.fileSize,
+              originalFileName: restaged.originalFileName,
+            }
+          : prev
+      );
+      setRestageShaStatus(restaged.matchedOriginal ? 'matched' : 'mismatch');
+      setRestagingPdf(false);
+
+      await submitImport({
+        overrideStageToken: restaged.stageToken,
+        overrideExpectedSha256: restaged.sha256,
+        allowDifferentFile: allowDiff,
+      });
+    } catch (err: any) {
+      setRestagingPdf(false);
+      if (err?.code === 'PDF_FILE_MISMATCH' || err?.status === 409) {
+        setRestagePickFile(fileToUse);
+        setRestageShaStatus('mismatch');
+        setAllowDifferentRestageFile(false);
+        setTempPdfExpiredError(
+          err?.message ||
+            'Tệp PDF vừa chọn khác với tệp đã phân tích ban đầu. Vui lòng chọn đúng tệp gốc hoặc xác nhận lưu bằng tệp mới này.'
+        );
+      } else {
+        setSubmitError(err?.message || 'Không thể nạp lại tệp PDF để lưu. Vui lòng thử lại.');
+      }
+    }
+  };
+
+  const handleRestageFilePicked = async (file: File) => {
+    if (!analysis) return;
+    if (!file.name.toLowerCase().endsWith('.pdf')) {
+      setSubmitError('Chỉ hỗ trợ tệp định dạng .pdf.');
+      return;
+    }
+    setSubmitError(null);
+    setRestagePickFile(file);
+    setAllowDifferentRestageFile(false);
+
+    const sha = await computePdfSha256Hex(file);
+    if (sha && analysis.sha256 && sha.toLowerCase() !== analysis.sha256.toLowerCase()) {
+      setRestageShaStatus('mismatch');
+      return;
+    }
+
+    setRestageShaStatus('matched');
+    await handleRestageAndRetryImport(file, false);
   };
 
   const handleRetryDriveSave = async (overrideFile?: File) => {
@@ -482,6 +644,11 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
     setSavedStageToken(null);
     setFilenameConflict(null);
     setSubmitError(null);
+    setTempPdfExpiredError(null);
+    setRestagePickFile(null);
+    setRestageShaStatus('idle');
+    setAllowDifferentRestageFile(false);
+    setDocNumberConfirmed(true);
     setRetryDriveError(null);
     setHighlightBox(null);
     setLiveSuspectedDuplicate(null);
@@ -1082,24 +1249,78 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </span>
               </div>
 
-              <div className="space-y-1 min-w-0">
+              <div className="space-y-1.5 min-w-0">
                 <div className="flex items-center justify-between gap-1 flex-wrap">
-                  <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
-                    Số / Ký hiệu gốc <span className="text-rose-600">*</span>
-                  </label>
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
+                      Số / Ký hiệu gốc <span className="text-rose-600">*</span>
+                    </label>
+                    {requiresDocNumberReview && (
+                      <span className="text-[10px] font-bold px-1.5 py-0.5 rounded bg-amber-100 text-amber-900 border border-amber-300">
+                        Cần kiểm tra số văn bản
+                      </span>
+                    )}
+                  </div>
                   {renderLocateButton('docNumber', 'Số/ký hiệu')}
                 </div>
                 <input
                   type="text"
                   value={fullDocNumber}
                   onChange={(e) => {
-                    setFullDocNumber(e.target.value);
+                    const nextVal = e.target.value;
+                    setFullDocNumber(nextVal);
                     setIsEditingFileName(false);
+                    if (isIncompleteDocNumber(nextVal)) {
+                      setDocNumberConfirmed(false);
+                    }
                   }}
                   placeholder="Ví dụ: 1234/SGDĐT-GDTrH"
                   required
-                  className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg font-mono font-bold text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                  className={`w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border rounded-lg font-mono font-bold text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600 ${
+                    requiresDocNumberReview && !docNumberConfirmed
+                      ? 'border-amber-400 bg-amber-50/40'
+                      : 'border-slate-300'
+                  }`}
                 />
+                {requiresDocNumberReview && (
+                  <div
+                    data-testid="doc-number-review-alert"
+                    className="p-3 bg-amber-50 border border-amber-300 rounded-lg space-y-2 text-xs text-amber-950"
+                  >
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                      <div className="space-y-1 min-w-0">
+                        <strong className="font-bold block">Cần kiểm tra số văn bản</strong>
+                        <p className="text-amber-900">
+                          {docNumberIncomplete
+                            ? 'Số/ký hiệu đang thiếu phần số ở đầu (ví dụ dạng /QĐ-SGDĐT). Vui lòng xem góc trên bên trái trang 1 bản PDF gốc và điền đầy đủ.'
+                            : analysis.extraction.docNumberReviewReason ||
+                              'Vui lòng đối chiếu số/ký hiệu vừa trích xuất với góc trên bên trái trang 1 bản PDF gốc trước khi lưu.'}
+                        </p>
+                        {analysis.extraction.filenameDocNumberHint && (
+                          <p className="text-[11px] text-amber-900 bg-white/80 border border-amber-200 rounded px-2 py-1">
+                            Gợi ý đối chiếu từ tên tệp gốc (chỉ tham khảo, không tự điền):{' '}
+                            <strong className="font-mono">{analysis.extraction.filenameDocNumberHint}</strong>
+                          </p>
+                        )}
+                      </div>
+                    </div>
+                    <label
+                      className={`inline-flex items-center gap-2 px-2.5 py-1.5 bg-white border border-amber-300 rounded-md font-semibold text-amber-950 ${
+                        docNumberIncomplete ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+                      }`}
+                    >
+                      <input
+                        type="checkbox"
+                        checked={docNumberConfirmed && !docNumberIncomplete}
+                        disabled={docNumberIncomplete}
+                        onChange={(e) => setDocNumberConfirmed(e.target.checked)}
+                        className="rounded border-amber-400 text-amber-700"
+                      />
+                      <span>Tôi đã đối chiếu số/ký hiệu với bản PDF gốc</span>
+                    </label>
+                  </div>
+                )}
               </div>
 
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
@@ -1459,15 +1680,31 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </div>
 
                 {isEditingFileName ? (
-                  <input
-                    type="text"
-                    value={customFileName}
-                    onChange={(e) => setCustomFileName(e.target.value)}
-                    className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-sky-400 rounded-lg font-mono text-base sm:text-sm font-bold text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
-                  />
+                  <div className="space-y-1.5">
+                    <input
+                      type="text"
+                      value={customFileName}
+                      onChange={(e) => setCustomFileName(e.target.value)}
+                      className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-sky-400 rounded-lg font-mono text-base sm:text-sm font-bold text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
+                    />
+                    <div className="flex items-center justify-between gap-2 bg-white border border-slate-200 rounded-md px-2.5 py-1.5 text-[11px]">
+                      <span className="text-slate-500 shrink-0">Tên chuẩn sẽ lưu:</span>
+                      <span className="font-mono font-bold text-sky-900 truncate flex-1">{computedDriveFileName}</span>
+                      <button
+                        type="button"
+                        onClick={handleCopyFileName}
+                        className="text-sky-700 hover:underline font-semibold shrink-0"
+                      >
+                        {copiedFileName ? 'Đã chép' : 'Chép'}
+                      </button>
+                    </div>
+                  </div>
                 ) : (
                   <div className="flex flex-col sm:flex-row sm:items-center gap-2 min-w-0">
-                    <div className="flex-1 min-w-0 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs sm:text-sm font-bold text-sky-950 overflow-x-auto whitespace-nowrap">
+                    <div
+                      data-testid="pdf-computed-filename"
+                      className="flex-1 min-w-0 px-3 py-2 bg-white border border-slate-300 rounded-lg font-mono text-xs sm:text-sm font-bold text-sky-950 overflow-x-auto whitespace-nowrap"
+                    >
                       {computedDriveFileName}
                     </div>
                     <button
@@ -1558,6 +1795,95 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                 </div>
               )}
 
+              {/* Inline Recovery Banner when temporary staged PDF expired (preserves all edits & idempotencyKey) */}
+              {tempPdfExpiredError && (
+                <div
+                  data-testid="temp-pdf-expired-recovery"
+                  className="p-3.5 bg-amber-50 border border-amber-300 rounded-xl space-y-2.5 text-xs text-amber-950"
+                >
+                  <div className="flex items-start gap-2">
+                    <AlertTriangle className="w-4 h-4 text-amber-600 shrink-0 mt-0.5" />
+                    <div className="space-y-1 min-w-0">
+                      <strong className="font-bold block">
+                        Bản PDF tạm đã hết hạn lưu trữ · Mọi nội dung bạn vừa chỉnh sửa vẫn được giữ nguyên
+                      </strong>
+                      <p className="text-amber-900">{tempPdfExpiredError}</p>
+                    </div>
+                  </div>
+
+                  <input
+                    ref={restagePdfFileInputRef}
+                    type="file"
+                    accept=".pdf,application/pdf"
+                    className="hidden"
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      e.target.value = '';
+                      if (f) void handleRestageFilePicked(f);
+                    }}
+                  />
+
+                  {restageShaStatus === 'mismatch' && restagePickFile && (
+                    <div className="p-2.5 bg-white border border-rose-300 rounded-lg space-y-2 text-rose-900">
+                      <p className="font-semibold">
+                        Tệp vừa chọn (<span className="font-mono">{restagePickFile.name}</span>) khác mã kiểm tra SHA-256 với tệp PDF ban đầu.
+                      </p>
+                      <label className="inline-flex items-center gap-2 cursor-pointer font-medium">
+                        <input
+                          type="checkbox"
+                          checked={allowDifferentRestageFile}
+                          onChange={(e) => setAllowDifferentRestageFile(e.target.checked)}
+                          className="rounded border-rose-400 text-rose-700"
+                        />
+                        <span>Xác nhận lưu hồ sơ này bằng tệp PDF mới vừa chọn</span>
+                      </label>
+                    </div>
+                  )}
+
+                  {restageShaStatus === 'matched' && restagePickFile && (
+                    <p className="text-[11px] font-semibold text-emerald-800 bg-emerald-50 border border-emerald-200 rounded-md px-2.5 py-1.5">
+                      Đã đối chiếu khớp đúng tệp PDF gốc ({restagePickFile.name}).
+                    </p>
+                  )}
+
+                  <div className="flex flex-wrap items-center gap-2">
+                    {selectedPdfFile && restageShaStatus !== 'mismatch' && (
+                      <button
+                        type="button"
+                        disabled={restagingPdf || submitting}
+                        onClick={() => handleRestageAndRetryImport(selectedPdfFile, false)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-2xs"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${restagingPdf ? 'animate-spin' : ''}`} />
+                        <span>{restagingPdf ? 'Đang nạp lại & lưu...' : 'Thử lưu lại'}</span>
+                      </button>
+                    )}
+
+                    {restageShaStatus === 'mismatch' && restagePickFile && (
+                      <button
+                        type="button"
+                        disabled={!allowDifferentRestageFile || restagingPdf || submitting}
+                        onClick={() => handleRestageAndRetryImport(restagePickFile, true)}
+                        className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-lg shadow-2xs"
+                      >
+                        <RefreshCw className={`w-3.5 h-3.5 ${restagingPdf ? 'animate-spin' : ''}`} />
+                        <span>{restagingPdf ? 'Đang nạp lại & lưu...' : 'Lưu bằng tệp mới này'}</span>
+                      </button>
+                    )}
+
+                    <button
+                      type="button"
+                      disabled={restagingPdf || submitting}
+                      onClick={() => restagePdfFileInputRef.current?.click()}
+                      className="inline-flex items-center gap-1.5 px-3.5 py-2 bg-white hover:bg-amber-100/70 disabled:opacity-50 border border-amber-400 text-amber-950 font-semibold rounded-lg"
+                    >
+                      <FileUp className="w-3.5 h-3.5" />
+                      <span>Chọn lại tệp PDF</span>
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {submitError && (
                 <div className="p-3 bg-rose-50 border border-rose-200 rounded-lg text-xs text-rose-800 flex items-start gap-2">
                   <AlertCircle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
@@ -1576,10 +1902,15 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                   </span>
                   <button
                     type="submit"
-                    disabled={submitting}
+                    disabled={
+                      submitting ||
+                      restagingPdf ||
+                      docNumberIncomplete ||
+                      (requiresDocNumberReview && !docNumberConfirmed)
+                    }
                     className="min-h-[48px] h-12 sm:h-11 px-6 bg-sky-700 hover:bg-sky-800 disabled:opacity-50 text-white text-sm font-semibold rounded-lg shadow-sm inline-flex items-center justify-center gap-2 w-full sm:w-auto"
                   >
-                    {submitting ? (
+                    {submitting || restagingPdf ? (
                       <>
                         <Loader2 className="w-4 h-4 animate-spin" />
                         <span>Đang lưu hồ sơ &amp; tải PDF...</span>

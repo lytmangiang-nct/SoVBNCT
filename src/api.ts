@@ -239,6 +239,8 @@ async function request<T>(endpoint: string, options: ApiRequestOptions = {}): Pr
     if (errorData.documentType) err.documentType = errorData.documentType;
     if (errorData.bookId) err.bookId = errorData.bookId;
     if (errorData.bookName) err.bookName = errorData.bookName;
+    if (errorData.expectedSha256) err.expectedSha256 = errorData.expectedSha256;
+    if (errorData.actualSha256) err.actualSha256 = errorData.actualSha256;
     throw err;
   }
 
@@ -738,8 +740,18 @@ export const api = {
     confirmUpdatedSequence?: boolean;
     templateId?: string;
     templateCustomValues?: Record<string, string>;
-  }): Promise<{ document: DocumentRecord; nextPreview?: PreviewNumberResponse; duplicatePrevented?: boolean }> => {
-    return request<{ document: DocumentRecord; nextPreview?: PreviewNumberResponse; duplicatePrevented?: boolean }>(
+  }): Promise<{
+    document: DocumentRecord;
+    nextPreview?: PreviewNumberResponse;
+    duplicatePrevented?: boolean;
+    timings?: { issueMs: number };
+  }> => {
+    return request<{
+      document: DocumentRecord;
+      nextPreview?: PreviewNumberResponse;
+      duplicatePrevented?: boolean;
+      timings?: { issueMs: number };
+    }>(
       '/api/documents/issue',
       {
         method: 'POST',
@@ -766,8 +778,14 @@ export const api = {
     docId: string,
     file: File,
     fileName?: string,
-    mode?: 'retry' | 'replace'
-  ): Promise<{ document: DocumentRecord; deduplicated?: boolean; success?: boolean; message?: string }> => {
+    mode?: 'initial' | 'retry' | 'replace'
+  ): Promise<{
+    document: DocumentRecord;
+    deduplicated?: boolean;
+    success?: boolean;
+    message?: string;
+    timings?: { driveUploadMs: number };
+  }> => {
     const formData = new FormData();
     formData.append('file', file);
     if (fileName) {
@@ -776,13 +794,16 @@ export const api = {
     if (mode) {
       formData.append('mode', mode);
     }
-    return request<{ document: DocumentRecord; deduplicated?: boolean; success?: boolean; message?: string }>(
-      `/api/documents/${encodeURIComponent(docId)}/upload-word`,
-      {
-        method: 'POST',
-        body: formData,
-      }
-    );
+    return request<{
+      document: DocumentRecord;
+      deduplicated?: boolean;
+      success?: boolean;
+      message?: string;
+      timings?: { driveUploadMs: number };
+    }>(`/api/documents/${encodeURIComponent(docId)}/upload-word`, {
+      method: 'POST',
+      body: formData,
+    });
   },
 
   // Incoming PDF Analysis & Import
@@ -806,6 +827,32 @@ export const api = {
     });
   },
 
+  restagePdfFile: async (
+    file: File,
+    options: { bookId: string; expectedSha256?: string; allowDifferentFile?: boolean }
+  ): Promise<{
+    stageToken: string;
+    bookId: string;
+    sha256: string;
+    matchedOriginal: boolean;
+    originalFileName: string;
+    fileSize: number;
+  }> => {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('bookId', options.bookId);
+    if (options.expectedSha256) {
+      formData.append('expectedSha256', options.expectedSha256);
+    }
+    if (options.allowDifferentFile) {
+      formData.append('allowDifferentFile', 'true');
+    }
+    return request('/api/pdf/restage', {
+      method: 'POST',
+      body: formData,
+    });
+  },
+
   getStagedPdfUrl: (stageToken: string): string => {
     const token = getStoredToken();
     const q = token ? `?token=${encodeURIComponent(token)}` : '';
@@ -815,6 +862,8 @@ export const api = {
   importPdfDocument: async (payload: {
     bookId?: string;
     stageToken: string;
+    expectedSha256?: string;
+    allowDifferentFile?: boolean;
     fullDocNumber: string;
     docName: string;
     title?: string;
@@ -847,6 +896,7 @@ export const api = {
     uploadError?: string;
     stageToken?: string;
     duplicatePrevented?: boolean;
+    timings?: { recordSaveMs: number; driveUploadMs: number; totalMs: number };
   }> => {
     return request('/api/documents/import-pdf', {
       method: 'POST',

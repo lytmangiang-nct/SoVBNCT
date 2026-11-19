@@ -16,6 +16,7 @@ import type {
   BookPermission,
   DocumentRecord,
   DocumentTypeConfig,
+  IssuedUploadTask,
   NumberRequest,
   PersistenceStatus,
   RegistryBook,
@@ -93,6 +94,11 @@ export default function App() {
   const [requestedSettingsTab, setRequestedSettingsTab] = useState<SettingsSubTab | null>(null);
   const syncInFlightRef = React.useRef<boolean>(false);
 
+  // Compact Post-Issue Upload Tasks (persisted in sessionStorage across reloads/tab switches)
+  const [recentIssueTasks, setRecentIssueTasks] = useState<IssuedUploadTask[]>([]);
+  const inFlightUploadFilesRef = React.useRef<Map<string, File>>(new Map());
+  const activeClientUploadsRef = React.useRef<Set<string>>(new Set());
+
   // Live Toast Notification
   const [liveToast, setLiveToast] = useState<{ message: string; type?: 'info' | 'success' } | null>(null);
 
@@ -136,9 +142,112 @@ export default function App() {
       setDocuments([]);
       setDeletedDocuments([]);
       setNumberRequests([]);
+      setRecentIssueTasks([]);
+      inFlightUploadFilesRef.current.clear();
+      activeClientUploadsRef.current.clear();
     };
     window.addEventListener('auth_expired', handleExpired);
     return () => window.removeEventListener('auth_expired', handleExpired);
+  }, []);
+
+  // Load & persist recentIssueTasks per user in sessionStorage
+  useEffect(() => {
+    if (!currentUser?.id) {
+      setRecentIssueTasks([]);
+      return;
+    }
+    try {
+      const raw = window.sessionStorage.getItem(`nct_recent_issue_tasks_${currentUser.id}`);
+      if (!raw) {
+        setRecentIssueTasks([]);
+        return;
+      }
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        const now = Date.now();
+        // Keep tasks from the last 6 hours, max 5
+        const valid = parsed
+          .filter(
+            (t: any) =>
+              t &&
+              typeof t.docId === 'string' &&
+              typeof t.fullDocNumber === 'string' &&
+              typeof t.issuedAtMs === 'number' &&
+              now - t.issuedAtMs < 6 * 60 * 60 * 1000
+          )
+          .slice(0, 5);
+        setRecentIssueTasks(valid);
+      }
+    } catch {
+      setRecentIssueTasks([]);
+    }
+  }, [currentUser?.id]);
+
+  useEffect(() => {
+    if (!currentUser?.id) return;
+    try {
+      const key = `nct_recent_issue_tasks_${currentUser.id}`;
+      if (recentIssueTasks.length === 0) {
+        window.sessionStorage.removeItem(key);
+      } else {
+        window.sessionStorage.setItem(key, JSON.stringify(recentIssueTasks.slice(0, 5)));
+      }
+    } catch {
+      // ignore sessionStorage quota errors
+    }
+  }, [recentIssueTasks, currentUser?.id]);
+
+  const syncIssueTasksWithDocs = useCallback((updatedDocs: DocumentRecord[]) => {
+    if (!updatedDocs || updatedDocs.length === 0) return;
+    const byId = new Map<string, DocumentRecord>();
+    for (const d of updatedDocs) {
+      if (d?.id) byId.set(d.id, d);
+    }
+    setRecentIssueTasks((prev) => {
+      if (prev.length === 0) return prev;
+      let changed = false;
+      const next = prev.map((task) => {
+        const doc = byId.get(task.docId);
+        if (!doc) return task;
+        const verifiedSaved = Boolean(doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl);
+        const nextStatus: IssuedUploadTask['driveStatus'] = verifiedSaved
+          ? 'saved'
+          : doc.driveStatus === 'failed'
+          ? 'failed'
+          : doc.driveStatus === 'uploading'
+          ? 'uploading'
+          : task.hasFileOrTemplate
+          ? task.driveStatus
+          : 'none';
+        const nextFileName = doc.driveFileName || task.driveFileName;
+        const nextFileId = doc.driveFileId || task.driveFileId;
+        const nextFileUrl = doc.driveFileUrl || task.driveFileUrl;
+        const nextError = nextStatus === 'saved' ? undefined : doc.driveError || task.driveError;
+        if (
+          nextStatus !== task.driveStatus ||
+          nextFileName !== task.driveFileName ||
+          nextFileId !== task.driveFileId ||
+          nextFileUrl !== task.driveFileUrl ||
+          nextError !== task.driveError
+        ) {
+          changed = true;
+          if (verifiedSaved) {
+            inFlightUploadFilesRef.current.delete(task.docId);
+          }
+          return {
+            ...task,
+            driveStatus: nextStatus,
+            driveFileName: nextFileName,
+            driveFileId: nextFileId,
+            driveFileUrl: nextFileUrl,
+            driveError: nextError,
+            driveCompletedAtMs: verifiedSaved ? task.driveCompletedAtMs || Date.now() : task.driveCompletedAtMs,
+          };
+        }
+        return task;
+      });
+      return changed ? next : prev;
+    });
   }, []);
 
   const refreshBooks = useCallback(async () => {
@@ -203,6 +312,7 @@ export default function App() {
       setDocumentTypes(settingsRes.documentTypes);
       setSigners(settingsRes.signers);
       setDocuments(docsRes.documents);
+      syncIssueTasksWithDocs(docsRes.documents);
       setDeletedDocuments(deletedDocsRes.documents);
       setBooks(booksRes.books);
       setNumberRequests(reqsRes.requests);
@@ -288,6 +398,7 @@ export default function App() {
             setDocuments((prev) =>
               prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
             );
+            syncIssueTasksWithDocs([updatedDoc]);
           }
         } catch (err) {
           console.error(err);
@@ -540,36 +651,333 @@ export default function App() {
     setDocuments([]);
     setDeletedDocuments([]);
     setNumberRequests([]);
+    setRecentIssueTasks([]);
+    inFlightUploadFilesRef.current.clear();
+    activeClientUploadsRef.current.clear();
     setActiveBookId(DEFAULT_BOOK_ID);
   };
 
-  const handleDocumentIssued = (newDoc: DocumentRecord) => {
+  const handleDocumentIssued = useCallback((newDoc: DocumentRecord) => {
     setDocuments((prev) => {
       if (prev.some((d) => d.id === newDoc.id)) return prev;
       return [newDoc, ...prev];
     });
     setLastSyncAt(new Date());
-  };
+  }, []);
 
-  const handleDocumentUpdated = (updatedDoc: DocumentRecord) => {
-    if (updatedDoc.status === 'deleted') {
-      setDocuments((prev) => prev.filter((d) => d.id !== updatedDoc.id));
-      setDeletedDocuments((prev) => {
-        if (updatedDoc.deletedListArchived) {
-          return prev.filter((d) => d.id !== updatedDoc.id);
+  const handleDocumentUpdated = useCallback(
+    (updatedDoc: DocumentRecord) => {
+      if (updatedDoc.status === 'deleted') {
+        setDocuments((prev) => prev.filter((d) => d.id !== updatedDoc.id));
+        setDeletedDocuments((prev) => {
+          if (updatedDoc.deletedListArchived) {
+            return prev.filter((d) => d.id !== updatedDoc.id);
+          }
+          const exists = prev.some((d) => d.id === updatedDoc.id);
+          return exists
+            ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+            : [updatedDoc, ...prev];
+        });
+      } else {
+        setDocuments((prev) => {
+          if (!prev.some((d) => d.id === updatedDoc.id)) return [updatedDoc, ...prev];
+          return prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d));
+        });
+        syncIssueTasksWithDocs([updatedDoc]);
+      }
+      setLastSyncAt(new Date());
+    },
+    [syncIssueTasksWithDocs]
+  );
+
+  // Poll server for uploading tasks not currently driven by an active client request (e.g., after reload or tab switch)
+  const uploadingTaskIdsKey = useMemo(
+    () =>
+      recentIssueTasks
+        .filter((t) => t.driveStatus === 'uploading')
+        .map((t) => t.docId)
+        .join(','),
+    [recentIssueTasks]
+  );
+
+  useEffect(() => {
+    if (!currentUser?.id || !uploadingTaskIdsKey) return;
+    let cancelled = false;
+
+    const pollOnce = async () => {
+      const ids = uploadingTaskIdsKey.split(',').filter(Boolean);
+      for (const docId of ids) {
+        if (cancelled) return;
+        if (activeClientUploadsRef.current.has(docId)) continue;
+        try {
+          const res = await api.getDocument(docId);
+          if (cancelled || !res?.document) continue;
+          const doc = res.document;
+          const verifiedSaved = Boolean(doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl);
+          if (verifiedSaved || doc.driveStatus === 'failed') {
+            handleDocumentUpdated(doc);
+          } else if (doc.driveStatus === 'uploading') {
+            setRecentIssueTasks((prev) =>
+              prev.map((t) => {
+                if (t.docId !== docId || t.driveStatus !== 'uploading') return t;
+                if (Date.now() - t.issuedAtMs > 90000) {
+                  return {
+                    ...t,
+                    driveStatus: 'failed',
+                    driveError: 'Phiên lưu tệp bị gián đoạn. Bấm Thử lưu lại để lưu tệp cho hồ sơ này.',
+                  };
+                }
+                return t;
+              })
+            );
+          }
+        } catch {
+          // ignore transient poll errors
         }
-        const exists = prev.some((d) => d.id === updatedDoc.id);
-        return exists
-          ? prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
-          : [updatedDoc, ...prev];
-      });
-    } else {
-      setDocuments((prev) =>
-        prev.map((d) => (d.id === updatedDoc.id ? updatedDoc : d))
+      }
+    };
+
+    void pollOnce();
+    const timer = window.setInterval(pollOnce, 2000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [currentUser?.id, uploadingTaskIdsKey, handleDocumentUpdated]);
+
+  const startIssueUploadTask = useCallback(
+    (issuedDoc: DocumentRecord, file: File | null, issueMs?: number) => {
+      const hasFileOrTemplate = Boolean(file || issuedDoc.templateId);
+      const verifiedSaved = Boolean(
+        issuedDoc.driveStatus === 'saved' && issuedDoc.driveFileId && issuedDoc.driveFileUrl
       );
-    }
-    setLastSyncAt(new Date());
-  };
+      const initialStatus: IssuedUploadTask['driveStatus'] = file
+        ? 'uploading'
+        : verifiedSaved
+        ? 'saved'
+        : issuedDoc.driveStatus === 'failed'
+        ? 'failed'
+        : issuedDoc.templateId
+        ? 'uploading'
+        : 'none';
+
+      const newTask: IssuedUploadTask = {
+        docId: issuedDoc.id,
+        bookId: getDocBookId(issuedDoc),
+        bookName: issuedDoc.bookName || '',
+        typeCode: issuedDoc.typeCode,
+        fullDocNumber: issuedDoc.fullDocNumber,
+        docName: issuedDoc.docName || issuedDoc.title,
+        driveFileName: issuedDoc.driveFileName,
+        driveOriginalFileName: file?.name || issuedDoc.driveOriginalFileName,
+        hasFileOrTemplate,
+        templateId: issuedDoc.templateId,
+        driveStatus: initialStatus,
+        driveFileId: verifiedSaved ? issuedDoc.driveFileId : undefined,
+        driveFileUrl: verifiedSaved ? issuedDoc.driveFileUrl : undefined,
+        driveError: initialStatus === 'failed' ? issuedDoc.driveError : undefined,
+        issuedAtMs: Date.now(),
+        issueMs,
+        driveCompletedAtMs: verifiedSaved ? Date.now() : undefined,
+      };
+
+      setRecentIssueTasks((prev) => {
+        const filtered = prev.filter((t) => t.docId !== issuedDoc.id);
+        return [newTask, ...filtered].slice(0, 5);
+      });
+
+      if (file) {
+        inFlightUploadFilesRef.current.set(issuedDoc.id, file);
+        activeClientUploadsRef.current.add(issuedDoc.id);
+        void api
+          .uploadWordToDocument(issuedDoc.id, file, issuedDoc.driveFileName, 'initial')
+          .then((res) => {
+            const doc = res.document;
+            const isVerifiedSaved = Boolean(doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl);
+            if (isVerifiedSaved) {
+              inFlightUploadFilesRef.current.delete(issuedDoc.id);
+            }
+            handleDocumentUpdated(doc);
+            if (!isVerifiedSaved) {
+              setRecentIssueTasks((prev) =>
+                prev.map((t) =>
+                  t.docId === issuedDoc.id
+                    ? {
+                        ...t,
+                        driveStatus: 'failed',
+                        driveError: doc.driveError || 'Chưa xác nhận được tệp trên Google Drive.',
+                      }
+                    : t
+                )
+              );
+            }
+          })
+          .catch((uploadErr: any) => {
+            const failedDoc: DocumentRecord = uploadErr?.document || {
+              ...issuedDoc,
+              driveStatus: 'failed',
+              driveOriginalFileName: file.name,
+              driveFileSize: file.size,
+              driveError: uploadErr?.message || 'Lỗi kết nối Google Drive',
+            };
+            handleDocumentUpdated(failedDoc);
+            setRecentIssueTasks((prev) =>
+              prev.map((t) =>
+                t.docId === issuedDoc.id
+                  ? {
+                      ...t,
+                      driveStatus: 'failed',
+                      driveError: uploadErr?.message || failedDoc.driveError || 'Lưu tệp thất bại',
+                    }
+                  : t
+              )
+            );
+          })
+          .finally(() => {
+            activeClientUploadsRef.current.delete(issuedDoc.id);
+          });
+      } else if (issuedDoc.templateId && initialStatus === 'uploading') {
+        activeClientUploadsRef.current.add(issuedDoc.id);
+        void api
+          .retryWordDrive(issuedDoc.id, issuedDoc.templateId)
+          .then((res) => {
+            const doc = res.document;
+            handleDocumentUpdated(doc);
+            const isVerifiedSaved = Boolean(doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl);
+            if (!isVerifiedSaved) {
+              setRecentIssueTasks((prev) =>
+                prev.map((t) =>
+                  t.docId === issuedDoc.id
+                    ? {
+                        ...t,
+                        driveStatus: 'failed',
+                        driveError: res.error || doc.driveError || 'Chưa lưu được tệp Word từ mẫu lên Google Drive.',
+                      }
+                    : t
+                )
+              );
+            }
+          })
+          .catch((err: any) => {
+            if (err?.document) {
+              handleDocumentUpdated(err.document);
+            }
+            setRecentIssueTasks((prev) =>
+              prev.map((t) =>
+                t.docId === issuedDoc.id
+                  ? {
+                      ...t,
+                      driveStatus: 'failed',
+                      driveError: err?.message || 'Lưu tệp từ mẫu thất bại',
+                    }
+                  : t
+              )
+            );
+          })
+          .finally(() => {
+            activeClientUploadsRef.current.delete(issuedDoc.id);
+          });
+      }
+    },
+    [handleDocumentUpdated]
+  );
+
+  const retryIssueUploadTask = useCallback(
+    async (docId: string, overrideFile?: File) => {
+      if (activeClientUploadsRef.current.has(docId)) return;
+      const task = recentIssueTasks.find((t) => t.docId === docId);
+      if (overrideFile) {
+        inFlightUploadFilesRef.current.set(docId, overrideFile);
+      }
+      const cachedFile = overrideFile || inFlightUploadFilesRef.current.get(docId);
+
+      if (task?.templateId && !cachedFile) {
+        activeClientUploadsRef.current.add(docId);
+        setRecentIssueTasks((prev) =>
+          prev.map((t) => (t.docId === docId ? { ...t, driveStatus: 'uploading', driveError: undefined } : t))
+        );
+        try {
+          const res = await api.retryWordDrive(docId, task.templateId);
+          handleDocumentUpdated(res.document);
+          const isVerifiedSaved = Boolean(
+            res.document.driveStatus === 'saved' && res.document.driveFileId && res.document.driveFileUrl
+          );
+          if (!isVerifiedSaved) {
+            setRecentIssueTasks((prev) =>
+              prev.map((t) =>
+                t.docId === docId
+                  ? { ...t, driveStatus: 'failed', driveError: res.error || res.document.driveError || 'Lưu tệp thất bại' }
+                  : t
+              )
+            );
+          }
+        } catch (err: any) {
+          if (err?.document) handleDocumentUpdated(err.document);
+          setRecentIssueTasks((prev) =>
+            prev.map((t) =>
+              t.docId === docId
+                ? { ...t, driveStatus: 'failed', driveError: err?.message || 'Lưu tệp thất bại' }
+                : t
+            )
+          );
+        } finally {
+          activeClientUploadsRef.current.delete(docId);
+        }
+        return;
+      }
+
+      if (!cachedFile) {
+        setRecentIssueTasks((prev) =>
+          prev.map((t) =>
+            t.docId === docId
+              ? { ...t, driveStatus: 'failed', driveError: 'Vui lòng chọn lại tệp Word để thử lưu lại cho hồ sơ này.' }
+              : t
+          )
+        );
+        return;
+      }
+
+      activeClientUploadsRef.current.add(docId);
+      setRecentIssueTasks((prev) =>
+        prev.map((t) => (t.docId === docId ? { ...t, driveStatus: 'uploading', driveError: undefined } : t))
+      );
+      try {
+        const res = await api.uploadWordToDocument(docId, cachedFile, task?.driveFileName, 'retry');
+        const doc = res.document;
+        const isVerifiedSaved = Boolean(doc.driveStatus === 'saved' && doc.driveFileId && doc.driveFileUrl);
+        if (isVerifiedSaved) {
+          inFlightUploadFilesRef.current.delete(docId);
+        }
+        handleDocumentUpdated(doc);
+        if (!isVerifiedSaved) {
+          setRecentIssueTasks((prev) =>
+            prev.map((t) =>
+              t.docId === docId
+                ? { ...t, driveStatus: 'failed', driveError: doc.driveError || 'Lưu tệp thất bại' }
+                : t
+            )
+          );
+        }
+      } catch (err: any) {
+        if (err?.document) handleDocumentUpdated(err.document);
+        setRecentIssueTasks((prev) =>
+          prev.map((t) =>
+            t.docId === docId
+              ? { ...t, driveStatus: 'failed', driveError: err?.message || 'Lưu tệp thất bại' }
+              : t
+          )
+        );
+      } finally {
+        activeClientUploadsRef.current.delete(docId);
+      }
+    },
+    [recentIssueTasks, handleDocumentUpdated]
+  );
+
+  const dismissIssueTask = useCallback((docId: string) => {
+    inFlightUploadFilesRef.current.delete(docId);
+    setRecentIssueTasks((prev) => prev.filter((t) => t.docId !== docId));
+  }, []);
 
   const handleOpenExistingDocument = (docId: string) => {
     setPendingOpenDocId(docId);
@@ -808,6 +1216,11 @@ export default function App() {
                 onRefreshRequests={refreshRequests}
                 onDocumentIssued={handleDocumentIssued}
                 onDocumentUpdated={handleDocumentUpdated}
+                recentIssueTasks={recentIssueTasks}
+                onStartIssueUploadTask={startIssueUploadTask}
+                onRetryIssueUploadTask={retryIssueUploadTask}
+                onDismissIssueTask={dismissIssueTask}
+                hasCachedUploadFile={(docId) => inFlightUploadFilesRef.current.has(docId)}
                 onNavigateToRegistry={() => {
                   setRegistrySection('active');
                   setActiveTab('registry');

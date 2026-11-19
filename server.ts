@@ -104,6 +104,7 @@ import {
 import {
   PdfUrlFetchError,
   analyzePdfBuffer,
+  extractFilenameDocNumberHint,
   extractPdfPageContentsForIndex,
   fetchPdfFromUrl,
   getServerPdfWorkerDiagnostics,
@@ -2417,7 +2418,7 @@ function refreshUserSessions(updatedUser: User) {
   }
 }
 
-// --- Staged PDF Store for Preview & Retry (30-min TTL) ---
+// --- Durable Staged PDF Store for Preview & Retry (2-hour TTL = 7200s) ---
 interface StagedPdfEntry {
   token: string;
   bookId: string;
@@ -2430,15 +2431,255 @@ interface StagedPdfEntry {
   createdAt: number;
   pageTexts?: PdfPageContent[];
 }
-const stagedPdfs = new Map<string, StagedPdfEntry>();
+
+interface SerializedStagedPdfEntry {
+  token: string;
+  bookId: string;
+  bufferBase64: string;
+  sha256: string;
+  originalFileName: string;
+  sourceType: 'pdf_url' | 'pdf_upload';
+  sourceUrl?: string;
+  userId: string;
+  createdAt: number;
+  pageTexts?: PdfPageContent[];
+}
+
+const STAGED_PDF_TTL_SEC = 2 * 60 * 60; // 7200s (2 giờ)
+const STAGED_PDF_TTL_MS = STAGED_PDF_TTL_SEC * 1000;
+const STAGED_PDF_MEM_MAX = 24;
+const stagedPdfsMem = new Map<string, StagedPdfEntry>();
+const STAGED_PDF_DIR = path.join(DATA_DIR, 'staged-pdfs');
+
+function touchStagedMem(token: string, entry: StagedPdfEntry) {
+  stagedPdfsMem.delete(token);
+  stagedPdfsMem.set(token, entry);
+  while (stagedPdfsMem.size > STAGED_PDF_MEM_MAX) {
+    const oldestKey = stagedPdfsMem.keys().next().value;
+    if (oldestKey) stagedPdfsMem.delete(oldestKey);
+    else break;
+  }
+}
+
+function getStagedPdfDiskPath(token: string): string {
+  const safe = token.replace(/[^a-zA-Z0-9_-]/g, '');
+  return path.join(STAGED_PDF_DIR, `${safe}.json`);
+}
+
+function serializeStagedPdfEntry(entry: StagedPdfEntry): string {
+  const payload: SerializedStagedPdfEntry = {
+    token: entry.token,
+    bookId: entry.bookId,
+    bufferBase64: entry.buffer.toString('base64'),
+    sha256: entry.sha256,
+    originalFileName: entry.originalFileName,
+    sourceType: entry.sourceType,
+    sourceUrl: entry.sourceUrl,
+    userId: entry.userId,
+    createdAt: entry.createdAt,
+    pageTexts: entry.pageTexts,
+  };
+  return JSON.stringify(payload);
+}
+
+function deserializeStagedPdfEntry(raw: string): StagedPdfEntry | null {
+  try {
+    const parsed = JSON.parse(raw) as SerializedStagedPdfEntry;
+    if (!parsed || !parsed.token || !parsed.bufferBase64 || !parsed.sha256) return null;
+    if (Date.now() - (Number(parsed.createdAt) || 0) > STAGED_PDF_TTL_MS) return null;
+    return {
+      token: parsed.token,
+      bookId: parsed.bookId,
+      buffer: Buffer.from(parsed.bufferBase64, 'base64'),
+      sha256: parsed.sha256,
+      originalFileName: parsed.originalFileName,
+      sourceType: parsed.sourceType,
+      sourceUrl: parsed.sourceUrl,
+      userId: parsed.userId,
+      createdAt: parsed.createdAt,
+      pageTexts: parsed.pageTexts,
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function saveStagedPdfEntry(entry: StagedPdfEntry): Promise<void> {
+  touchStagedMem(entry.token, entry);
+  const serialized = serializeStagedPdfEntry(entry);
+  const cfg = getStorageAdapterConfig();
+
+  // 1. Upstash Redis / Vercel KV (bền vững qua nhiều instance & serverless cold-start)
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    try {
+      await executeUpstashCommand(
+        cfg,
+        ['SET', `nct_staged_pdf:${entry.token}`, serialized, 'EX', String(STAGED_PDF_TTL_SEC)],
+        12000
+      );
+      return;
+    } catch (err) {
+      console.warn('[Staged PDF] Không lưu được vào Upstash Redis, fallback ổ đĩa cục bộ:', sanitizeErrorForLog(err));
+    }
+  }
+
+  // 2. Vercel Blob (nếu dùng Blob store)
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    try {
+      const blobPath = `nct-staged-pdfs/${entry.token.replace(/[^a-zA-Z0-9_-]/g, '')}.json`;
+      await fetchRemoteWithTimeout(
+        `https://blob.vercel-storage.com/${encodeURIComponent(blobPath)}`,
+        {
+          method: 'PUT',
+          headers: {
+            Authorization: `Bearer ${cfg.blobToken}`,
+            'x-api-version': '7',
+            'x-add-random-suffix': '0',
+            'content-type': 'application/json',
+          },
+          body: serialized,
+        },
+        15000
+      );
+      return;
+    } catch (err) {
+      console.warn('[Staged PDF] Không lưu được vào Vercel Blob, fallback ổ đĩa cục bộ:', sanitizeErrorForLog(err));
+    }
+  }
+
+  // 3. Ổ đĩa cục bộ (DATA_DIR hoặc /tmp)
+  try {
+    if (!fs.existsSync(STAGED_PDF_DIR)) {
+      fs.mkdirSync(STAGED_PDF_DIR, { recursive: true });
+    }
+    fs.writeFileSync(getStagedPdfDiskPath(entry.token), serialized, 'utf-8');
+  } catch (err) {
+    console.warn('[Staged PDF] Không ghi được cache ổ đĩa cục bộ:', sanitizeErrorForLog(err));
+  }
+}
+
+async function getStagedPdfEntry(token: string): Promise<StagedPdfEntry | null> {
+  const cleanToken = (token || '').trim();
+  if (!cleanToken) return null;
+
+  const mem = stagedPdfsMem.get(cleanToken);
+  if (mem) {
+    if (Date.now() - mem.createdAt <= STAGED_PDF_TTL_MS) {
+      touchStagedMem(cleanToken, mem);
+      return mem;
+    }
+    stagedPdfsMem.delete(cleanToken);
+  }
+
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    try {
+      const result = await executeUpstashCommand<any>(cfg, ['GET', `nct_staged_pdf:${cleanToken}`], 10000);
+      if (result) {
+        const rawStr = typeof result === 'string' ? result : JSON.stringify(result);
+        const hydrated = deserializeStagedPdfEntry(rawStr);
+        if (hydrated) {
+          touchStagedMem(cleanToken, hydrated);
+          return hydrated;
+        }
+      }
+    } catch (err) {
+      console.warn('[Staged PDF] Lỗi đọc từ Upstash Redis:', sanitizeErrorForLog(err));
+    }
+  }
+
+  if (cfg.mode === 'vercel_blob' && cfg.blobToken) {
+    try {
+      const blobPrefix = `nct-staged-pdfs/${cleanToken.replace(/[^a-zA-Z0-9_-]/g, '')}.json`;
+      const listRes = await fetchRemoteWithTimeout(
+        `https://blob.vercel-storage.com?prefix=${encodeURIComponent(blobPrefix)}&limit=2`,
+        {
+          method: 'GET',
+          headers: { Authorization: `Bearer ${cfg.blobToken}`, 'x-api-version': '7' },
+        },
+        10000
+      );
+      if (listRes.ok) {
+        const listData = (await listRes.json()) as { blobs?: Array<{ pathname: string; url: string; downloadUrl?: string }> };
+        const match = listData.blobs?.find((b) => b.pathname === blobPrefix);
+        if (match) {
+          const fRes = await fetchRemoteWithTimeout(
+            match.downloadUrl || match.url,
+            { method: 'GET', headers: { Authorization: `Bearer ${cfg.blobToken}` } },
+            12000
+          );
+          if (fRes.ok) {
+            const hydrated = deserializeStagedPdfEntry(await fRes.text());
+            if (hydrated) {
+              touchStagedMem(cleanToken, hydrated);
+              return hydrated;
+            }
+          }
+        }
+      }
+    } catch {
+      // ignore blob fallback errors
+    }
+  }
+
+  try {
+    const diskPath = getStagedPdfDiskPath(cleanToken);
+    if (fs.existsSync(diskPath)) {
+      const raw = fs.readFileSync(diskPath, 'utf-8');
+      const hydrated = deserializeStagedPdfEntry(raw);
+      if (hydrated) {
+        touchStagedMem(cleanToken, hydrated);
+        return hydrated;
+      }
+      fs.unlinkSync(diskPath);
+    }
+  } catch {
+    // ignore disk read errors
+  }
+
+  return null;
+}
+
+async function deleteStagedPdfEntry(token: string): Promise<void> {
+  const cleanToken = (token || '').trim();
+  if (!cleanToken) return;
+  stagedPdfsMem.delete(cleanToken);
+
+  const cfg = getStorageAdapterConfig();
+  if (cfg.mode === 'upstash_kv' && cfg.kvUrl && cfg.kvToken) {
+    void executeUpstashCommand(cfg, ['DEL', `nct_staged_pdf:${cleanToken}`], 6000).catch(() => {});
+  }
+  try {
+    const diskPath = getStagedPdfDiskPath(cleanToken);
+    if (fs.existsSync(diskPath)) {
+      fs.unlinkSync(diskPath);
+    }
+  } catch {
+    // ignore
+  }
+}
 
 if (!IS_SERVERLESS) {
   setInterval(() => {
-    const cutoff = Date.now() - 30 * 60 * 1000;
-    for (const [k, v] of stagedPdfs.entries()) {
-      if (v.createdAt < cutoff) stagedPdfs.delete(k);
+    const cutoff = Date.now() - STAGED_PDF_TTL_MS;
+    for (const [k, v] of stagedPdfsMem.entries()) {
+      if (v.createdAt < cutoff) stagedPdfsMem.delete(k);
     }
-  }, 5 * 60 * 1000).unref();
+    try {
+      if (fs.existsSync(STAGED_PDF_DIR)) {
+        for (const f of fs.readdirSync(STAGED_PDF_DIR)) {
+          if (!f.endsWith('.json')) continue;
+          const p = path.join(STAGED_PDF_DIR, f);
+          const stat = fs.statSync(p);
+          if (stat.mtimeMs < cutoff) {
+            fs.unlinkSync(p);
+          }
+        }
+      }
+    } catch {
+      // ignore cleanup errors
+    }
+  }, 10 * 60 * 1000).unref();
 }
 
 function findConflictingDocumentByDriveFileName(
@@ -2634,6 +2875,7 @@ async function uploadDocumentWithFolderCache(params: {
   buffer: Buffer;
   overrideFileName?: string;
   replaceMode?: boolean;
+  isRetry?: boolean;
   previousFileId?: string;
   keepPreviousFile?: boolean;
 }): Promise<DriveUploadResult> {
@@ -2669,8 +2911,9 @@ async function generateAndUploadWordFromTemplate(params: {
   template: WordTemplate;
   actor: User;
   customValues?: Record<string, string>;
+  isRetry?: boolean;
 }): Promise<{ ok: boolean; error?: string }> {
-  const { doc, book, template, actor, customValues } = params;
+  const { doc, book, template, actor, customValues, isRetry = false } = params;
   const docxBuffer = Buffer.from(template.base64Docx, 'base64');
   const filled = fillDocxTemplate(
     docxBuffer,
@@ -2765,6 +3008,7 @@ async function generateAndUploadWordFromTemplate(params: {
       buffer: filled.outputBuffer,
       overrideFileName: generatedFileName,
       keepPreviousFile: wordAttIdx !== -1,
+      isRetry,
     });
 
     const nextVersionNum =
@@ -5488,6 +5732,7 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
   }
 
   // Khóa giao dịch nguyên tử tại máy chủ - ngăn chặn 100% việc trùng số khi nhiều người cùng bấm
+  const issueStartMs = Date.now();
   let issuedDocForPostActions: DocumentRecord | null = null;
   let issuedBookForPostActions: RegistryBook | null = null;
   let issuedActorForPostActions: User | null = null;
@@ -5767,45 +6012,68 @@ app.post('/api/documents/issue', requireAuth, async (req, res) => {
   }
 
   if (issuedDocForPostActions && issuedBookForPostActions && issuedActorForPostActions) {
-    // Nếu có chọn mẫu Word và không tự tải tệp Word thủ công, tự động sinh .docx từ mẫu và lưu lên Drive
-    if (selectedTemplateForPost && !hasAttachment) {
-      try {
-        await generateAndUploadWordFromTemplate({
-          doc: issuedDocForPostActions,
-          book: issuedBookForPostActions,
-          template: selectedTemplateForPost,
-          actor: issuedActorForPostActions,
-          customValues: templateCustomValues,
-        });
-        await saveDatabasePersistent(db);
-      } catch (tplErr: any) {
-        issuedDocForPostActions.wordGenerationStatus = 'failed';
-        issuedDocForPostActions.wordGenerationError =
-          tplErr?.message || 'Không thể tạo văn bản từ mẫu Word đã chọn.';
-        issuedDocForPostActions.driveStatus = 'failed';
-        issuedDocForPostActions.driveError = issuedDocForPostActions.wordGenerationError;
-        await saveDatabasePersistent(db);
-      }
-    }
+    const issueMs = Date.now() - issueStartMs;
+    const issuedDoc = issuedDocForPostActions;
+    const issuedBook = issuedBookForPostActions;
+    const issuedActor = issuedActorForPostActions;
 
     broadcastSSE('document_issued', {
-      document: issuedDocForPostActions,
+      document: issuedDoc,
       nextPreview: issuedNextPreview,
     });
 
+    // Tách hoàn toàn bước tạo tệp Word từ mẫu + lưu Google Drive ra khỏi phản hồi cấp số để người dùng nhận số tức thì
+    if (selectedTemplateForPost && !hasAttachment) {
+      const tplForBg = selectedTemplateForPost;
+      const runTemplateBg = async (): Promise<DocumentRecord> => {
+        try {
+          await generateAndUploadWordFromTemplate({
+            doc: issuedDoc,
+            book: issuedBook,
+            template: tplForBg,
+            actor: issuedActor,
+            customValues: templateCustomValues,
+            isRetry: false,
+          });
+          await saveDatabasePersistent(db);
+          broadcastSSE('document_updated', { document: issuedDoc });
+          void syncToGoogleSheets(issuedDoc, 'update').catch(() => {});
+          return issuedDoc;
+        } catch (tplErr: any) {
+          issuedDoc.wordGenerationStatus = 'failed';
+          issuedDoc.wordGenerationError =
+            tplErr?.message || 'Không thể tạo văn bản từ mẫu Word đã chọn.';
+          issuedDoc.driveStatus = 'failed';
+          issuedDoc.driveError = issuedDoc.wordGenerationError;
+          await saveDatabasePersistent(db);
+          broadcastSSE('document_updated', { document: issuedDoc });
+          return issuedDoc;
+        }
+      };
+
+      if (!IS_SERVERLESS) {
+        const bgPromise = runTemplateBg().finally(() => {
+          if (inFlightDocUploads.get(issuedDoc.id) === bgPromise) {
+            inFlightDocUploads.delete(issuedDoc.id);
+          }
+        });
+        inFlightDocUploads.set(issuedDoc.id, bgPromise);
+      }
+    }
+
     if (!res.headersSent) {
       res.json({
-        document: issuedDocForPostActions,
+        document: issuedDoc,
         nextPreview: issuedNextPreview,
         success: true,
+        timings: { issueMs },
       });
     }
 
-    const syncDoc = issuedDocForPostActions;
-    void syncToGoogleSheets(syncDoc, 'create')
+    void syncToGoogleSheets(issuedDoc, 'create')
       .then((syncRes) => {
         if (syncRes.attempted) {
-          broadcastSSE('document_updated', { document: syncDoc });
+          broadcastSSE('document_updated', { document: issuedDoc });
         }
       })
       .catch((err) => {
@@ -5834,38 +6102,75 @@ app.post('/api/documents/:id/retry-word-drive', requireAuth, async (req, res) =>
     return res.status(403).json({ error: `Bạn không có quyền thử tạo/lưu lại tệp Word trong ${book.name}.` });
   }
 
+  // Nếu tiến trình tạo Word từ mẫu đang chạy nền cho chính hồ sơ này, chờ hoàn tất để không tạo trùng tệp
+  const pending = inFlightDocUploads.get(doc.id);
+  if (pending) {
+    try {
+      const finished = await pending;
+      if (finished.driveStatus === 'saved' && finished.driveFileId) {
+        return res.json({ success: true, document: finished, deduplicated: true });
+      }
+    } catch {
+      // fall through to explicit retry below
+    }
+  }
+
+  if (doc.driveStatus === 'saved' && doc.driveFileId) {
+    return res.json({ success: true, document: doc, deduplicated: true });
+  }
+
   const tplId = (req.body?.templateId as string) || doc.templateId;
   const template = (db.wordTemplates || []).find((t) => t.id === tplId && t.bookId === book.id);
   if (!template) {
     return res.status(404).json({ error: 'Không tìm thấy mẫu Word gắn với văn bản này.' });
   }
 
-  const resGen = await generateAndUploadWordFromTemplate({
-    doc,
-    book,
-    template,
-    actor: currentUser,
-  });
-  await saveDatabasePersistent(db);
-  broadcastSSE('document_updated', { document: doc });
-  if (resGen.ok) {
-    await syncToGoogleSheets(doc, 'update');
-    return res.json({ success: true, document: doc });
+  let genError: string | undefined;
+  const task = (async (): Promise<DocumentRecord> => {
+    const resGen = await generateAndUploadWordFromTemplate({
+      doc,
+      book,
+      template,
+      actor: currentUser,
+      isRetry: true,
+    });
+    genError = resGen.error;
+    await saveDatabasePersistent(db);
+    broadcastSSE('document_updated', { document: doc });
+    if (resGen.ok) {
+      void syncToGoogleSheets(doc, 'update').catch(() => {});
+    }
+    return doc;
+  })();
+
+  inFlightDocUploads.set(doc.id, task);
+  try {
+    const updated = await task;
+    if (updated.driveStatus === 'saved' && updated.driveFileId) {
+      return res.json({ success: true, document: updated });
+    }
+    return res.status(502).json({
+      success: false,
+      document: updated,
+      error: genError || updated.driveError || 'Chưa lưu được tệp Word lên Google Drive.',
+    });
+  } finally {
+    if (inFlightDocUploads.get(doc.id) === task) {
+      inFlightDocUploads.delete(doc.id);
+    }
   }
-  return res.status(502).json({
-    success: false,
-    document: doc,
-    error: resGen.error || 'Chưa lưu được tệp Word lên Google Drive.',
-  });
 });
 
 // 7b. TẢI LÊN / THỬ LƯU LẠI / THAY TỆP WORD ĐÍNH KÈM VÀO GOOGLE DRIVE CHO VĂN BẢN ĐÃ CẤP SỐ
 app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const uploadStartMs = Date.now();
   const { id } = req.params;
   const currentUser = (req as any).user as User;
   const file = req.file;
   const requestedFileName = typeof req.body?.fileName === 'string' ? req.body.fileName.trim() : '';
-  const mode = req.body?.mode === 'replace' ? 'replace' : 'retry';
+  const rawMode = req.body?.mode;
+  const mode: 'initial' | 'retry' | 'replace' =
+    rawMode === 'replace' ? 'replace' : rawMode === 'initial' ? 'initial' : 'retry';
 
   const doc = db.documents.find((d) => d.id === id);
   if (!doc) {
@@ -5883,24 +6188,39 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
     });
   }
 
-  const isReplacing = doc.driveStatus === 'saved' && Boolean(doc.driveFileId);
-  if (mode === 'replace' || doc.driveStatus === 'saved') {
-    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'replace_file')) {
-      return res.status(403).json({
-        error: `Bạn cần quyền "Thay tệp" trong ${targetBook.name} để thay thế tệp trên Google Drive.`,
-      });
-    }
-  } else {
-    const canAttach =
-      isSystemAdmin(currentUser) ||
-      hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
-      hasBookPermission(currentUser, targetBook.id, 'issue_number') ||
-      (hasBookPermission(currentUser, targetBook.id, 'edit') && doc.issuedByUserId === currentUser.id);
+  const canAttach =
+    isSystemAdmin(currentUser) ||
+    hasBookPermission(currentUser, targetBook.id, 'replace_file') ||
+    hasBookPermission(currentUser, targetBook.id, 'issue_number') ||
+    (hasBookPermission(currentUser, targetBook.id, 'edit') && doc.issuedByUserId === currentUser.id);
+
+  const alreadySavedOnDrive = doc.driveStatus === 'saved' && Boolean(doc.driveFileId && doc.driveFileUrl);
+  if (mode !== 'replace' && alreadySavedOnDrive) {
     if (!canAttach) {
       return res.status(403).json({
         error: `Bạn không có quyền tải tệp Word cho văn bản trong ${targetBook.name}.`,
       });
     }
+    return res.json({
+      document: doc,
+      deduplicated: true,
+      success: true,
+      message: 'Tệp đã được lưu trên Google Drive trước đó.',
+      timings: { driveUploadMs: 0 },
+    });
+  }
+
+  const isReplacing = mode === 'replace' && alreadySavedOnDrive;
+  if (mode === 'replace' || alreadySavedOnDrive) {
+    if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'replace_file')) {
+      return res.status(403).json({
+        error: `Bạn cần quyền "Thay tệp" trong ${targetBook.name} để thay thế tệp trên Google Drive.`,
+      });
+    }
+  } else if (!canAttach) {
+    return res.status(403).json({
+      error: `Bạn không có quyền tải tệp Word cho văn bản trong ${targetBook.name}.`,
+    });
   }
 
   if (!file) {
@@ -5924,6 +6244,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
         deduplicated: true,
         success: true,
         message: 'Yêu cầu tải tệp trước đó đã hoàn tất.',
+        timings: { driveUploadMs: Date.now() - uploadStartMs },
       });
     } catch (err: any) {
       return res.status(502).json({
@@ -5940,11 +6261,13 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
       deduplicated: true,
       success: true,
       message: 'Tệp Word của văn bản này đã được lưu trên Google Drive trước đó.',
+      timings: { driveUploadMs: Date.now() - uploadStartMs },
     });
   }
 
   const prevFileName = doc.driveFileName || null;
   const prevFileId = doc.driveFileId || null;
+  const isRetryUpload = !isReplacing && (mode === 'retry' || doc.driveStatus === 'failed');
   const targetOverrideName =
     requestedFileName
       ? sanitizeCustomDriveFileName(requestedFileName, validation.extension!)
@@ -5966,7 +6289,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
       throw new Error(driveCfg.missingReason || 'Thư mục Google Drive chưa được cấu hình hợp lệ.');
     }
 
-    if (!isReplacing) {
+    if (!isReplacing && doc.driveStatus !== 'uploading') {
       doc.driveStatus = 'uploading';
       doc.driveFileName = targetOverrideName;
       doc.driveOriginalFileName = file.originalname;
@@ -5985,6 +6308,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
         buffer: file.buffer,
         overrideFileName: targetOverrideName,
         replaceMode: isReplacing,
+        isRetry: isRetryUpload,
         previousFileId: isReplacing ? prevFileId || undefined : undefined,
       });
 
@@ -6073,7 +6397,9 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
 
       await saveDatabasePersistent(db);
       broadcastSSE('document_updated', { document: doc });
-      await syncToGoogleSheets(doc, 'update');
+      void syncToGoogleSheets(doc, 'update').catch((err) => {
+        console.error('Lỗi đồng bộ Google Sheets nền sau khi lưu Word lên Drive:', err);
+      });
       return doc;
     } catch (err: any) {
       if (!isReplacing) {
@@ -6141,6 +6467,7 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
     return res.json({
       document: updatedDoc,
       success: true,
+      timings: { driveUploadMs: Date.now() - uploadStartMs },
     });
   } catch (err: any) {
     return res.status(502).json({
@@ -6148,7 +6475,9 @@ app.post('/api/documents/:id/upload-word', requireAuth, handleWordUploadMulter, 
       document: doc,
     });
   } finally {
-    inFlightDocUploads.delete(doc.id);
+    if (inFlightDocUploads.get(doc.id) === uploadTask) {
+      inFlightDocUploads.delete(doc.id);
+    }
   }
 });
 
@@ -6203,6 +6532,28 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
     }
 
     const { sha256, extraction, pageTexts } = await analyzePdfBuffer(buffer);
+
+    // Trích gợi ý số văn bản từ tên tệp chỉ để đối chiếu (không tự lấy làm số văn bản chính thức)
+    const filenameHint = extractFilenameDocNumberHint(originalFileName);
+    if (filenameHint) {
+      extraction.filenameDocNumberHint = filenameHint;
+      const hintLeadingDigits = filenameHint.match(/^(\d+)/)?.[1] || '';
+      const docLeadingDigits = (extraction.docNumber || '').match(/^(\d+)/)?.[1] || '';
+      if (
+        hintLeadingDigits &&
+        docLeadingDigits &&
+        parseInt(hintLeadingDigits, 10) !== parseInt(docLeadingDigits, 10)
+      ) {
+        extraction.docNumberNeedsConfirmation = true;
+        const mismatchReason = `Số văn bản trích từ nội dung ("${extraction.docNumber}") khác với gợi ý trong tên tệp ("${filenameHint}"). Vui lòng đối chiếu bản PDF gốc trước khi lưu.`;
+        extraction.docNumberReviewReason = extraction.docNumberReviewReason || mismatchReason;
+        if (!extraction.reviewReasons.includes(mismatchReason)) {
+          extraction.reviewReasons.push(mismatchReason);
+        }
+        extraction.needsReview = true;
+      }
+    }
+
     const duplicateDocument =
       db.documents.find(
         (d) =>
@@ -6231,7 +6582,7 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
     );
 
     const stageToken = `pdf-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
-    stagedPdfs.set(stageToken, {
+    await saveStagedPdfEntry({
       token: stageToken,
       bookId: targetBook.id,
       buffer,
@@ -6295,12 +6646,81 @@ app.post('/api/pdf/analyze', requireAuth, handleWordUploadMulter, async (req, re
   }
 });
 
-app.get('/api/pdf/staged/:stageToken', requireAuth, (req, res) => {
+// Nạp lại tệp PDF tạm khi phiên tạm hết hạn mà không xóa các trường người dùng đã chỉnh sửa
+app.post('/api/pdf/restage', requireAuth, handleWordUploadMulter, async (req, res) => {
+  const currentUser = (req as any).user as User;
+  const file = req.file;
+  const targetBook = getBookById(typeof req.body?.bookId === 'string' ? req.body.bookId : undefined);
+  const expectedSha256 = typeof req.body?.expectedSha256 === 'string' ? req.body.expectedSha256.trim().toLowerCase() : '';
+  const allowDifferentFile = req.body?.allowDifferentFile === 'true' || req.body?.allowDifferentFile === true;
+
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_incoming')) {
+    return res.status(403).json({
+      error: `Bạn chưa được phân quyền "Nhập văn bản đến" trong ${targetBook.name}.`,
+    });
+  }
+
+  if (!file) {
+    return res.status(400).json({ error: 'Vui lòng chọn tệp PDF để khôi phục phiên lưu.' });
+  }
+
+  const validation = validatePdfFileBuffer(file.originalname, file.mimetype, file.buffer);
+  if (!validation.valid) {
+    return res.status(400).json({ error: validation.error });
+  }
+
+  const actualSha256 = crypto.createHash('sha256').update(file.buffer).digest('hex');
+  const matchedOriginal = !expectedSha256 || expectedSha256 === actualSha256;
+
+  if (!matchedOriginal && !allowDifferentFile) {
+    return res.status(409).json({
+      code: 'PDF_FILE_MISMATCH',
+      expectedSha256,
+      actualSha256,
+      error: 'Tệp PDF vừa chọn khác nội dung so với tệp đã phân tích ban đầu. Vui lòng kiểm tra đúng tệp hoặc xác nhận dùng tệp mới.',
+    });
+  }
+
+  let pageTexts: PdfPageContent[] | undefined;
+  try {
+    const indexed = await extractPdfPageContentsForIndex(file.buffer);
+    pageTexts = indexed.pageTexts;
+  } catch {
+    pageTexts = undefined;
+  }
+
+  const stageToken = `pdf-${Date.now()}-${crypto.randomBytes(8).toString('hex')}`;
+  await saveStagedPdfEntry({
+    token: stageToken,
+    bookId: targetBook.id,
+    buffer: file.buffer,
+    sha256: actualSha256,
+    originalFileName: file.originalname || 'van-ban.pdf',
+    sourceType: 'pdf_upload',
+    userId: currentUser.id,
+    createdAt: Date.now(),
+    pageTexts,
+  });
+
+  return res.json({
+    stageToken,
+    bookId: targetBook.id,
+    sha256: actualSha256,
+    matchedOriginal,
+    originalFileName: file.originalname || 'van-ban.pdf',
+    fileSize: file.buffer.length,
+  });
+});
+
+app.get('/api/pdf/staged/:stageToken', requireAuth, async (req, res) => {
   const { stageToken } = req.params;
   const currentUser = (req as any).user as User;
-  const entry = stagedPdfs.get(stageToken);
+  const entry = await getStagedPdfEntry(stageToken);
   if (!entry) {
-    return res.status(404).json({ error: 'Phiên xem trước PDF đã hết hạn, vui lòng chọn hoặc tải lại tệp.' });
+    return res.status(410).json({
+      code: 'TEMP_PDF_EXPIRED',
+      error: 'Tệp PDF tạm đã hết hạn, vui lòng chọn lại tệp hoặc bấm Thử lưu lại.',
+    });
   }
   const hasImportPerm = isSystemAdmin(currentUser) || hasBookPermission(currentUser, entry.bookId, 'import_incoming');
   if (!hasImportPerm || (currentUser.role !== 'admin' && entry.userId !== currentUser.id)) {
@@ -6314,10 +6734,13 @@ app.get('/api/pdf/staged/:stageToken', requireAuth, (req, res) => {
 });
 
 app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
+  const totalStartMs = Date.now();
   const currentUser = (req as any).user as User;
   const {
     bookId,
     stageToken,
+    expectedSha256,
+    allowDifferentFile,
     fullDocNumber,
     docName,
     title,
@@ -6343,7 +6766,8 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
     idempotencyKey,
   } = req.body || {};
 
-  const entry = stageToken ? stagedPdfs.get(stageToken) : undefined;
+  await ensureLatestDb({ maxAgeMs: 0 });
+  const entry = stageToken ? await getStagedPdfEntry(String(stageToken)) : null;
   const targetBook = getBookById(bookId || entry?.bookId);
 
   if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, targetBook.id, 'import_incoming')) {
@@ -6379,27 +6803,75 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
   const cleanSigner = (signer || '').trim();
   const cleanSignerRole = (signerRole || '').trim();
 
-  if (!stageToken || !cleanDocNumber) {
-    return res.status(400).json({
-      error: 'Thiếu thông tin tệp PDF hoặc Số/ký hiệu văn bản gốc.',
-    });
-  }
-
-  if (!cleanDocName && !cleanTitle) {
-    return res.status(400).json({
-      error: 'Vui lòng nhập Tên văn bản hoặc Trích yếu nội dung văn bản.',
-    });
-  }
-
   if (!idempotencyKey) {
     return res.status(400).json({ error: 'Thiếu mã chống lặp (idempotency key).' });
   }
 
-  if (!entry || (currentUser.role !== 'admin' && entry.userId !== currentUser.id)) {
-    return res.status(400).json({
-      error: 'Phiên dữ liệu PDF tạm đã hết hạn hoặc không hợp lệ. Vui lòng phân tích lại tệp PDF.',
-    });
+  // 1. Kiểm tra idempotency TRƯỚC khi từ chối stageToken hết hạn để đảm bảo không tạo hồ sơ trùng lặp khi thử lại
+  let resumedExistingDoc: DocumentRecord | null = null;
+  let isRetryDriveResume = false;
+  if (db.idempotencyKeys[idempotencyKey]) {
+    const existingDocId = db.idempotencyKeys[idempotencyKey];
+    const existingDoc = db.documents.find((d) => d.id === existingDocId);
+    if (existingDoc) {
+      if (existingDoc.driveStatus === 'saved' && existingDoc.driveFileId) {
+        return res.json({
+          document: existingDoc,
+          duplicatePrevented: true,
+          driveSaved: true,
+          message: 'Văn bản PDF này đã được lưu trước đó.',
+          timings: { recordSaveMs: 0, driveUploadMs: 0, totalMs: Date.now() - totalStartMs },
+        });
+      }
+      // Hồ sơ đã ghi vào sổ nhưng chưa lưu được tệp lên Drive -> nối tiếp tải tệp lên chính hồ sơ đó
+      if (!entry || (currentUser.role !== 'admin' && entry.userId !== currentUser.id) || entry.bookId !== getDocBookId(existingDoc)) {
+        return res.status(410).json({
+          code: 'TEMP_PDF_EXPIRED',
+          existingDocument: existingDoc,
+          error: 'Tệp PDF tạm đã hết hạn. Các thông tin bạn đã chỉnh sửa vẫn được giữ nguyên; vui lòng chọn lại tệp PDF để hoàn tất lưu lên Google Drive.',
+        });
+      }
+      resumedExistingDoc = existingDoc;
+      isRetryDriveResume = true;
+    }
   }
+
+  if (!resumedExistingDoc) {
+    if (!stageToken || !cleanDocNumber) {
+      return res.status(400).json({
+        error: 'Thiếu thông tin tệp PDF hoặc Số/ký hiệu văn bản gốc.',
+      });
+    }
+
+    if (!cleanDocName && !cleanTitle) {
+      return res.status(400).json({
+        error: 'Vui lòng nhập Tên văn bản hoặc Trích yếu nội dung văn bản.',
+      });
+    }
+
+    if (!entry || (currentUser.role !== 'admin' && entry.userId !== currentUser.id) || entry.bookId !== targetBook.id) {
+      return res.status(410).json({
+        code: 'TEMP_PDF_EXPIRED',
+        error: 'Tệp PDF tạm đã hết hạn hoặc không khớp sổ hiện tại. Các trường bạn đã sửa vẫn được giữ lại; vui lòng chọn lại tệp hoặc bấm Thử lưu lại.',
+      });
+    }
+
+    if (
+      typeof expectedSha256 === 'string' &&
+      expectedSha256.trim() &&
+      !allowDifferentFile &&
+      entry.sha256 !== expectedSha256.trim().toLowerCase()
+    ) {
+      return res.status(409).json({
+        code: 'PDF_FILE_MISMATCH',
+        expectedSha256: expectedSha256.trim().toLowerCase(),
+        actualSha256: entry.sha256,
+        error: 'Tệp PDF hiện tại khác nội dung với tệp đã phân tích ban đầu. Vui lòng xác nhận trước khi lưu.',
+      });
+    }
+  }
+
+  const activeEntry = entry!;
 
   const normalizedCompStatus: DateComparisonStatus | undefined =
     dateComparisonStatus === 'single' ||
@@ -6437,226 +6909,247 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
     });
   }
 
-  const releaseLock = await atomicLock.acquire();
-  let createdDoc: DocumentRecord | null = null;
-  let targetFileName = '';
+  let createdDoc: DocumentRecord | null = resumedExistingDoc;
+  let targetFileName = resumedExistingDoc?.driveFileName || '';
+  let recordSaveMs = 0;
 
-  try {
-    if (db.idempotencyKeys[idempotencyKey]) {
-      const existingDocId = db.idempotencyKeys[idempotencyKey];
-      const existingDoc = db.documents.find((d) => d.id === existingDocId);
-      if (existingDoc) {
-        return res.json({
-          document: existingDoc,
-          duplicatePrevented: true,
-          driveSaved: existingDoc.driveStatus === 'saved',
-          message: 'Văn bản PDF này đã được lưu trước đó.',
+  if (!createdDoc) {
+    const recordStartMs = Date.now();
+    const releaseLock = await atomicLock.acquire();
+    try {
+      if (db.idempotencyKeys[idempotencyKey]) {
+        const existingDocId = db.idempotencyKeys[idempotencyKey];
+        const existingDoc = db.documents.find((d) => d.id === existingDocId);
+        if (existingDoc) {
+          if (existingDoc.driveStatus === 'saved' && existingDoc.driveFileId) {
+            return res.json({
+              document: existingDoc,
+              duplicatePrevented: true,
+              driveSaved: true,
+              message: 'Văn bản PDF này đã được lưu trước đó.',
+              timings: { recordSaveMs: 0, driveUploadMs: 0, totalMs: Date.now() - totalStartMs },
+            });
+          }
+          createdDoc = existingDoc;
+          targetFileName = existingDoc.driveFileName || targetFileName;
+          isRetryDriveResume = true;
+        }
+      }
+
+      if (!createdDoc) {
+        const nowIso = new Date().toISOString();
+        const receivedTimeVn = getRequestVietnamTimeInfo(req);
+
+        let finalIssueDate = cleanIssueDate;
+        let finalSignDate = cleanSignDate || cleanIssueDate || undefined;
+        let pendingDateConfirmation = false;
+        let dateConfirmedBy: string | undefined;
+        let dateConfirmedByUserId: string | undefined;
+        let dateConfirmedAt: string | undefined;
+
+        if (normalizedCompStatus === 'mismatch') {
+          if (confirmUnifiedDate && cleanIssueDate && canManageBook) {
+            finalIssueDate = cleanIssueDate;
+            finalSignDate = cleanIssueDate;
+            pendingDateConfirmation = false;
+            dateConfirmedBy = currentUser.displayName?.trim() || currentUser.fullName;
+            dateConfirmedByUserId = currentUser.id;
+            dateConfirmedAt = nowIso;
+          } else {
+            finalIssueDate = '';
+            finalSignDate = undefined;
+            pendingDateConfirmation = true;
+          }
+        }
+
+        const refDateForYear = finalIssueDate || finalSignDate || '';
+        const dateParts = refDateForYear.split('/');
+        const parsedYear =
+          dateParts.length === 3 && /^\d{4}$/.test(dateParts[2])
+            ? parseInt(dateParts[2], 10)
+            : receivedTimeVn.year;
+
+        if (!ignoreDuplicatePdf) {
+          const duplicateDoc = db.documents.find(
+            (d) =>
+              getDocBookId(d) === targetBook.id &&
+              d.fileSha256 === activeEntry.sha256 &&
+              d.status !== 'cancelled' &&
+              d.status !== 'deleted'
+          );
+          if (duplicateDoc) {
+            return res.status(409).json({
+              code: 'PDF_DUPLICATE',
+              error: `Tệp PDF này trùng nội dung với văn bản đã lưu (${duplicateDoc.fullDocNumber}) trong ${targetBook.name}.`,
+              existingDocument: duplicateDoc,
+            });
+          }
+        }
+
+        if (!ignoreDuplicatePdf && !ignoreSuspectedDuplicate) {
+          const suspectedDoc = findSuspectedDuplicateDocument(
+            targetBook.id,
+            cleanDocNumber,
+            cleanAgency,
+            parsedYear
+          );
+          if (suspectedDoc) {
+            return res.status(409).json({
+              code: 'PDF_SUSPECTED_DUPLICATE',
+              error: `Nghi trùng văn bản "${suspectedDoc.fullDocNumber}" (${suspectedDoc.issuingAgency || 'cùng cơ quan'}) trong ${targetBook.name}. Vui lòng kiểm tra lại hồ sơ đã có hoặc xác nhận lưu mới.`,
+              existingDocument: suspectedDoc,
+            });
+          }
+        }
+
+        const nameInputForFile = cleanDocName || cleanTitle;
+        const standardName = buildStandardDriveFileName(cleanDocNumber, nameInputForFile, '.pdf');
+        if (typeof customFileName === 'string' && customFileName.trim()) {
+          targetFileName = sanitizeCustomDriveFileName(customFileName, '.pdf');
+        } else if (typeof expectedFileName === 'string' && expectedFileName.trim()) {
+          targetFileName = sanitizeCustomDriveFileName(expectedFileName, '.pdf');
+        } else {
+          targetFileName = standardName;
+        }
+
+        const conflictDoc = findConflictingDocumentByDriveFileName(targetFileName, undefined, targetBook.id);
+        if (conflictDoc) {
+          if (conflictAction === 'suffix') {
+            targetFileName = resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id);
+          } else if (conflictAction !== 'overwrite') {
+            return res.status(409).json({
+              code: 'FILENAME_CONFLICT',
+              error: `Tên tệp "${targetFileName}" đã trùng với hồ sơ ${conflictDoc.fullDocNumber} (${conflictDoc.docName || conflictDoc.title}). Vui lòng chọn cách xử lý.`,
+              conflictingFileName: targetFileName,
+              suggestedSuffixName: resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id),
+              existingDocument: conflictDoc,
+            });
+          }
+        }
+
+        const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
+        const globalStt = db.documents.length + 1;
+
+        const indexedPagesCount = Array.isArray(activeEntry.pageTexts)
+          ? activeEntry.pageTexts.filter((p) => (p.text || '').trim().length >= 10).length
+          : 0;
+
+        let finalReviewReasons = Array.isArray(reviewReasons) ? [...reviewReasons] : [];
+        if (!pendingDateConfirmation) {
+          finalReviewReasons = finalReviewReasons.filter(
+            (r) => !/ngày trên văn bản chưa thống nhất|chờ quản trị viên xác nhận ngày/i.test(r)
+          );
+        }
+        const finalNeedsReview = pendingDateConfirmation
+          ? true
+          : finalReviewReasons.length > 0
+          ? Boolean(needsReview)
+          : false;
+
+        const newDocument: DocumentRecord = {
+          id: docId,
+          bookId: targetBook.id,
+          bookCode: targetBook.code,
+          bookName: targetBook.name,
+          stt: globalStt,
+          year: parsedYear,
+          issueDate: finalIssueDate,
+          signDate: finalSignDate,
+          receivedAt: nowIso,
+          receivedDate: receivedTimeVn.formattedDate,
+          createdAt: nowIso,
+          docCategory: 'incoming',
+          parentAgency: cleanParentAgency || undefined,
+          issuingAgency: cleanAgency || undefined,
+          typeCode: 'VBD',
+          typeName: 'Văn bản đến',
+          sequenceNumber: 0,
+          fullDocNumber: cleanDocNumber,
+          docName: cleanDocName || cleanTitle,
+          title: cleanTitle || cleanDocName,
+          signer: cleanSigner || 'Chưa xác định',
+          signerRole: cleanSignerRole || (cleanAgency || 'Cơ quan ban hành'),
+          issuedBy: currentUser.displayName?.trim() || currentUser.fullName,
+          issuedByUsername: currentUser.username,
+          issuedByUserId: currentUser.id,
+          status: 'active',
+          notes: typeof notes === 'string' ? notes.trim() : '',
+          auditLogs: [],
+          syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
+          idempotencyKey,
+          driveStatus: 'uploading',
+          driveFileName: targetFileName,
+          driveOriginalFileName: activeEntry.originalFileName,
+          driveMimeType: 'application/pdf',
+          driveFileSize: activeEntry.buffer.length,
+          sourceType: activeEntry.sourceType,
+          sourceUrl: activeEntry.sourceUrl,
+          fileSha256: activeEntry.sha256,
+          needsReview: finalNeedsReview,
+          reviewReasons: finalReviewReasons.length > 0 ? finalReviewReasons : undefined,
+          relevantPages: Array.isArray(relevantPages) ? relevantPages : undefined,
+          pendingDateConfirmation: pendingDateConfirmation || undefined,
+          dateComparisonStatus: normalizedCompStatus,
+          dateMismatchSources:
+            normalizedCompStatus === 'mismatch' ? sanitizedMismatchSources : undefined,
+          dateConfirmedBy,
+          dateConfirmedByUserId,
+          dateConfirmedAt,
+          pdfPageContents: activeEntry.pageTexts,
+          pdfContentVersion: activeEntry.pageTexts ? 1 : undefined,
+          pdfTextStatus: indexedPagesCount > 0 ? 'indexed' : 'no_text',
+          pdfIndexedPagesCount: indexedPagesCount,
+        };
+
+        recordDocumentHistoryEntry({
+          doc: newDocument,
+          book: targetBook,
+          actor: currentUser,
+          action: 'import_pdf',
+          changes: {
+            bookCode: { old: null, new: targetBook.code },
+            bookName: { old: null, new: targetBook.name },
+            fullDocNumber: { old: null, new: cleanDocNumber },
+            docName: { old: null, new: cleanDocName || cleanTitle },
+            issuingAgency: { old: null, new: cleanAgency || '(chưa xác định)' },
+            ...(finalIssueDate
+              ? { issueDate: { old: null, new: finalIssueDate } }
+              : pendingDateConfirmation
+              ? { issueDate: { old: null, new: 'Chờ xác nhận ngày thống nhất' } }
+              : {}),
+            driveFileName: { old: null, new: targetFileName },
+          },
+          reason: activeEntry.sourceType === 'pdf_url' ? 'Nhập văn bản đến từ đường dẫn PDF' : 'Nhập văn bản đến từ tệp PDF tải lên',
         });
-      }
-    }
 
-    const nowIso = new Date().toISOString();
-    const receivedTimeVn = getRequestVietnamTimeInfo(req);
+        db.documents.unshift(newDocument);
+        db.idempotencyKeys[idempotencyKey] = docId;
+        await saveDatabasePersistent(db);
 
-    let finalIssueDate = cleanIssueDate;
-    let finalSignDate = cleanSignDate || cleanIssueDate || undefined;
-    let pendingDateConfirmation = false;
-    let dateConfirmedBy: string | undefined;
-    let dateConfirmedByUserId: string | undefined;
-    let dateConfirmedAt: string | undefined;
-
-    if (normalizedCompStatus === 'mismatch') {
-      if (confirmUnifiedDate && cleanIssueDate && canManageBook) {
-        finalIssueDate = cleanIssueDate;
-        finalSignDate = cleanIssueDate;
-        pendingDateConfirmation = false;
-        dateConfirmedBy = currentUser.displayName?.trim() || currentUser.fullName;
-        dateConfirmedByUserId = currentUser.id;
-        dateConfirmedAt = nowIso;
-      } else {
-        // Khi 2 vị trí ngày chưa thống nhất và chưa được Quản trị viên xác nhận -> lưu ở trạng thái chờ xác nhận, không tự chọn một ngày
-        finalIssueDate = '';
-        finalSignDate = undefined;
-        pendingDateConfirmation = true;
-      }
-    }
-
-    // Xác định năm từ ngày văn bản đã thống nhất (dd/mm/yyyy); nếu chưa xác nhận thì dùng năm hiện tại (chú ý getDocumentFilterYear vẫn trả 'unknown' khi issueDate='')
-    const refDateForYear = finalIssueDate || finalSignDate || '';
-    const dateParts = refDateForYear.split('/');
-    const parsedYear =
-      dateParts.length === 3 && /^\d{4}$/.test(dateParts[2])
-        ? parseInt(dateParts[2], 10)
-        : receivedTimeVn.year;
-
-    if (!ignoreDuplicatePdf) {
-      const duplicateDoc = db.documents.find(
-        (d) =>
-          getDocBookId(d) === targetBook.id &&
-          d.fileSha256 === entry.sha256 &&
-          d.status !== 'cancelled'
-      );
-      if (duplicateDoc) {
-        return res.status(409).json({
-          code: 'PDF_DUPLICATE',
-          error: `Tệp PDF này trùng nội dung với văn bản đã lưu (${duplicateDoc.fullDocNumber}) trong ${targetBook.name}.`,
-          existingDocument: duplicateDoc,
+        broadcastSSE('document_issued', { document: newDocument });
+        void syncToGoogleSheets(newDocument, 'create').catch((err) => {
+          console.error('Lỗi đồng bộ Google Sheets nền khi nhập PDF:', err);
         });
+        createdDoc = newDocument;
       }
+    } finally {
+      releaseLock();
+      recordSaveMs = Date.now() - recordStartMs;
     }
-
-    if (!ignoreDuplicatePdf && !ignoreSuspectedDuplicate) {
-      const suspectedDoc = findSuspectedDuplicateDocument(
-        targetBook.id,
-        cleanDocNumber,
-        cleanAgency,
-        parsedYear
-      );
-      if (suspectedDoc) {
-        return res.status(409).json({
-          code: 'PDF_SUSPECTED_DUPLICATE',
-          error: `Nghi trùng văn bản "${suspectedDoc.fullDocNumber}" (${suspectedDoc.issuingAgency || 'cùng cơ quan'}) trong ${targetBook.name}. Vui lòng kiểm tra lại hồ sơ đã có hoặc xác nhận lưu mới.`,
-          existingDocument: suspectedDoc,
-        });
-      }
-    }
-
-    const nameInputForFile = cleanDocName || cleanTitle;
-    const standardName = buildStandardDriveFileName(cleanDocNumber, nameInputForFile, '.pdf');
-    if (typeof customFileName === 'string' && customFileName.trim()) {
-      targetFileName = sanitizeCustomDriveFileName(customFileName, '.pdf');
-    } else if (typeof expectedFileName === 'string' && expectedFileName.trim()) {
-      targetFileName = sanitizeCustomDriveFileName(expectedFileName, '.pdf');
-    } else {
-      targetFileName = standardName;
-    }
-
-    const conflictDoc = findConflictingDocumentByDriveFileName(targetFileName, undefined, targetBook.id);
-    if (conflictDoc) {
-      if (conflictAction === 'suffix') {
-        targetFileName = resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id);
-      } else if (conflictAction !== 'overwrite') {
-        return res.status(409).json({
-          code: 'FILENAME_CONFLICT',
-          error: `Tên tệp "${targetFileName}" đã trùng với hồ sơ ${conflictDoc.fullDocNumber} (${conflictDoc.docName || conflictDoc.title}). Vui lòng chọn cách xử lý.`,
-          conflictingFileName: targetFileName,
-          suggestedSuffixName: resolveUniqueDriveFileName(targetFileName, undefined, targetBook.id),
-          existingDocument: conflictDoc,
-        });
-      }
-    }
-
-    const docId = `doc-${Date.now()}-${crypto.randomBytes(4).toString('hex')}`;
-    const globalStt = db.documents.length + 1;
-
-    const indexedPagesCount = Array.isArray(entry.pageTexts)
-      ? entry.pageTexts.filter((p) => (p.text || '').trim().length >= 10).length
-      : 0;
-
-    let finalReviewReasons = Array.isArray(reviewReasons) ? [...reviewReasons] : [];
-    if (!pendingDateConfirmation) {
-      finalReviewReasons = finalReviewReasons.filter(
-        (r) => !/ngày trên văn bản chưa thống nhất|chờ quản trị viên xác nhận ngày/i.test(r)
-      );
-    }
-    const finalNeedsReview = pendingDateConfirmation
-      ? true
-      : finalReviewReasons.length > 0
-      ? Boolean(needsReview)
-      : false;
-
-    const newDocument: DocumentRecord = {
-      id: docId,
-      bookId: targetBook.id,
-      bookCode: targetBook.code,
-      bookName: targetBook.name,
-      stt: globalStt,
-      year: parsedYear,
-      issueDate: finalIssueDate,
-      signDate: finalSignDate,
-      receivedAt: nowIso,
-      receivedDate: receivedTimeVn.formattedDate,
-      createdAt: nowIso,
-      docCategory: 'incoming',
-      parentAgency: cleanParentAgency || undefined,
-      issuingAgency: cleanAgency || undefined,
-      typeCode: 'VBD',
-      typeName: 'Văn bản đến',
-      sequenceNumber: 0,
-      fullDocNumber: cleanDocNumber,
-      docName: cleanDocName || cleanTitle,
-      title: cleanTitle || cleanDocName,
-      signer: cleanSigner || 'Chưa xác định',
-      signerRole: cleanSignerRole || (cleanAgency || 'Cơ quan ban hành'),
-      issuedBy: currentUser.displayName?.trim() || currentUser.fullName,
-      issuedByUsername: currentUser.username,
-      issuedByUserId: currentUser.id,
-      status: 'active',
-      notes: typeof notes === 'string' ? notes.trim() : '',
-      auditLogs: [],
-      syncStatus: getGoogleSheetsTargets(targetBook).length > 0 ? 'pending' : 'not_configured',
-      idempotencyKey,
-      driveStatus: 'uploading',
-      driveFileName: targetFileName,
-      driveOriginalFileName: entry.originalFileName,
-      driveMimeType: 'application/pdf',
-      driveFileSize: entry.buffer.length,
-      sourceType: entry.sourceType,
-      sourceUrl: entry.sourceUrl,
-      fileSha256: entry.sha256,
-      needsReview: finalNeedsReview,
-      reviewReasons: finalReviewReasons.length > 0 ? finalReviewReasons : undefined,
-      relevantPages: Array.isArray(relevantPages) ? relevantPages : undefined,
-      pendingDateConfirmation: pendingDateConfirmation || undefined,
-      dateComparisonStatus: normalizedCompStatus,
-      dateMismatchSources:
-        normalizedCompStatus === 'mismatch' ? sanitizedMismatchSources : undefined,
-      dateConfirmedBy,
-      dateConfirmedByUserId,
-      dateConfirmedAt,
-      pdfPageContents: entry.pageTexts,
-      pdfContentVersion: entry.pageTexts ? 1 : undefined,
-      pdfTextStatus: indexedPagesCount > 0 ? 'indexed' : 'no_text',
-      pdfIndexedPagesCount: indexedPagesCount,
-    };
-
-    recordDocumentHistoryEntry({
-      doc: newDocument,
-      book: targetBook,
-      actor: currentUser,
-      action: 'import_pdf',
-      changes: {
-        bookCode: { old: null, new: targetBook.code },
-        bookName: { old: null, new: targetBook.name },
-        fullDocNumber: { old: null, new: cleanDocNumber },
-        docName: { old: null, new: cleanDocName || cleanTitle },
-        issuingAgency: { old: null, new: cleanAgency || '(chưa xác định)' },
-        ...(finalIssueDate
-          ? { issueDate: { old: null, new: finalIssueDate } }
-          : pendingDateConfirmation
-          ? { issueDate: { old: null, new: 'Chờ xác nhận ngày thống nhất' } }
-          : {}),
-        driveFileName: { old: null, new: targetFileName },
-      },
-      reason: entry.sourceType === 'pdf_url' ? 'Nhập văn bản đến từ đường dẫn PDF' : 'Nhập văn bản đến từ tệp PDF tải lên',
-    });
-
-    db.documents.unshift(newDocument);
-    db.idempotencyKeys[idempotencyKey] = docId;
-    await saveDatabasePersistent(db);
-
-    broadcastSSE('document_issued', { document: newDocument });
-    await syncToGoogleSheets(newDocument, 'create');
-    createdDoc = newDocument;
-  } finally {
-    releaseLock();
   }
 
   if (!createdDoc) {
     return res.status(500).json({ error: 'Không thể khởi tạo bản ghi văn bản đến.' });
   }
 
+  if (!targetFileName) {
+    targetFileName =
+      createdDoc.driveFileName ||
+      buildStandardDriveFileName(createdDoc.fullDocNumber, createdDoc.docName || createdDoc.title, '.pdf');
+  }
+
   // Tải tệp PDF gốc lên thư mục Google Drive của sổ đã cấu hình với đúng tên hiển thị
+  const driveUploadStartMs = Date.now();
   const driveCfg = resolveDriveForBook(targetBook);
   if (!driveCfg.isConfigured) {
     const nowAttIso = new Date().toISOString();
@@ -6671,10 +7164,10 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
         isOfficial: true,
         currentVersion: 1,
         fileName: createdDoc.driveFileName || targetFileName,
-        originalFileName: entry.originalFileName,
+        originalFileName: activeEntry.originalFileName,
         mimeType: 'application/pdf',
-        fileSize: entry.buffer.length,
-        sha256: entry.sha256,
+        fileSize: activeEntry.buffer.length,
+        sha256: activeEntry.sha256,
         driveStatus: 'failed',
         driveError: errMsg,
         uploadedBy: currentUser.fullName,
@@ -6684,10 +7177,10 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
           {
             version: 1,
             fileName: createdDoc.driveFileName || targetFileName,
-            originalFileName: entry.originalFileName,
+            originalFileName: activeEntry.originalFileName,
             mimeType: 'application/pdf',
-            fileSize: entry.buffer.length,
-            sha256: entry.sha256,
+            fileSize: activeEntry.buffer.length,
+            sha256: activeEntry.sha256,
             driveStatus: 'failed',
             driveError: errMsg,
             uploadedBy: currentUser.fullName,
@@ -6704,6 +7197,11 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
       driveSaved: false,
       uploadError: createdDoc.driveError,
       stageToken,
+      timings: {
+        recordSaveMs,
+        driveUploadMs: Date.now() - driveUploadStartMs,
+        totalMs: Date.now() - totalStartMs,
+      },
     });
   }
 
@@ -6713,10 +7211,11 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
       book: targetBook,
       doc: createdDoc,
       docCategoryOverride: 'incoming',
-      originalFileName: entry.originalFileName || `${targetFileName}`,
+      originalFileName: activeEntry.originalFileName || `${targetFileName}`,
       mimeType: 'application/pdf',
-      buffer: entry.buffer,
+      buffer: activeEntry.buffer,
       overrideFileName: targetFileName,
+      isRetry: isRetryDriveResume,
     });
 
     const nowUploadIso = new Date().toISOString();
@@ -6736,10 +7235,10 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
         isOfficial: true,
         currentVersion: 1,
         fileName: uploadResult.fileName,
-        originalFileName: entry.originalFileName,
+        originalFileName: activeEntry.originalFileName,
         mimeType: 'application/pdf',
-        fileSize: entry.buffer.length,
-        sha256: entry.sha256,
+        fileSize: activeEntry.buffer.length,
+        sha256: activeEntry.sha256,
         driveFileId: uploadResult.fileId,
         driveFileUrl: uploadResult.webViewLink,
         driveFolderId: uploadResult.folderId || driveCfg.folderId,
@@ -6752,10 +7251,10 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
           {
             version: 1,
             fileName: uploadResult.fileName,
-            originalFileName: entry.originalFileName,
+            originalFileName: activeEntry.originalFileName,
             mimeType: 'application/pdf',
-            fileSize: entry.buffer.length,
-            sha256: entry.sha256,
+            fileSize: activeEntry.buffer.length,
+            sha256: activeEntry.sha256,
             driveFileId: uploadResult.fileId,
             driveFileUrl: uploadResult.webViewLink,
             driveFolderId: uploadResult.folderId || driveCfg.folderId,
@@ -6784,12 +7283,23 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
 
     await saveDatabasePersistent(db);
     broadcastSSE('document_updated', { document: createdDoc });
-    await syncToGoogleSheets(createdDoc, 'update');
-    stagedPdfs.delete(stageToken);
+    void syncToGoogleSheets(createdDoc, 'update').catch((err) => {
+      console.error('Lỗi đồng bộ Google Sheets nền sau khi lưu PDF lên Drive:', err);
+    });
+    if (stageToken) {
+      await deleteStagedPdfEntry(String(stageToken));
+    }
 
+    const driveUploadMs = Date.now() - driveUploadStartMs;
     return res.json({
       document: createdDoc,
-      driveSaved: true,
+      driveSaved: Boolean(createdDoc.driveFileId && createdDoc.driveFileUrl),
+      duplicatePrevented: isRetryDriveResume,
+      timings: {
+        recordSaveMs,
+        driveUploadMs,
+        totalMs: Date.now() - totalStartMs,
+      },
     });
   } catch (err: any) {
     const errMsg = err.message || 'Lỗi kết nối khi lưu tệp PDF lên Google Drive.';
@@ -6804,10 +7314,10 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
         isOfficial: true,
         currentVersion: 1,
         fileName: createdDoc.driveFileName || targetFileName,
-        originalFileName: entry.originalFileName,
+        originalFileName: activeEntry.originalFileName,
         mimeType: 'application/pdf',
-        fileSize: entry.buffer.length,
-        sha256: entry.sha256,
+        fileSize: activeEntry.buffer.length,
+        sha256: activeEntry.sha256,
         driveStatus: 'failed',
         driveError: errMsg,
         uploadedBy: currentUser.fullName,
@@ -6817,10 +7327,10 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
           {
             version: 1,
             fileName: createdDoc.driveFileName || targetFileName,
-            originalFileName: entry.originalFileName,
+            originalFileName: activeEntry.originalFileName,
             mimeType: 'application/pdf',
-            fileSize: entry.buffer.length,
-            sha256: entry.sha256,
+            fileSize: activeEntry.buffer.length,
+            sha256: activeEntry.sha256,
             driveStatus: 'failed',
             driveError: errMsg,
             uploadedBy: currentUser.fullName,
@@ -6837,6 +7347,11 @@ app.post('/api/documents/import-pdf', requireAuth, async (req, res) => {
       driveSaved: false,
       uploadError: createdDoc.driveError,
       stageToken,
+      timings: {
+        recordSaveMs,
+        driveUploadMs: Date.now() - driveUploadStartMs,
+        totalMs: Date.now() - totalStartMs,
+      },
     });
   }
 });
@@ -6898,10 +7413,11 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
     pdfBuffer = file.buffer;
     originalName = file.originalname;
   } else if (stageToken) {
-    const staged = stagedPdfs.get(stageToken);
+    const staged = await getStagedPdfEntry(stageToken);
     if (!staged || (currentUser.role !== 'admin' && staged.userId !== currentUser.id)) {
-      return res.status(400).json({
-        error: 'Phiên PDF tạm đã hết hạn. Vui lòng chọn lại tệp PDF từ máy để thử lưu lại.',
+      return res.status(410).json({
+        code: 'TEMP_PDF_EXPIRED',
+        error: 'Tệp PDF tạm đã hết hạn. Vui lòng chọn lại tệp PDF từ máy để thử lưu lại.',
       });
     }
     pdfBuffer = staged.buffer;
@@ -6975,6 +7491,7 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
         buffer: pdfBuffer,
         overrideFileName: targetOverrideName,
         replaceMode: isReplacing,
+        isRetry: !isReplacing && (mode === 'retry' || doc.driveStatus === 'failed'),
         previousFileId: isReplacing ? prevFileId || undefined : undefined,
       });
 
@@ -7079,8 +7596,8 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
 
       await saveDatabasePersistent(db);
       broadcastSSE('document_updated', { document: doc });
-      await syncToGoogleSheets(doc, 'update');
-      if (stageToken) stagedPdfs.delete(stageToken);
+      void syncToGoogleSheets(doc, 'update').catch(() => {});
+      if (stageToken) await deleteStagedPdfEntry(stageToken);
       return doc;
     } catch (err: any) {
       if (!isReplacing) {
@@ -7150,7 +7667,9 @@ app.post('/api/documents/:id/upload-pdf', requireAuth, handleWordUploadMulter, a
       document: doc,
     });
   } finally {
-    inFlightDocUploads.delete(doc.id);
+    if (inFlightDocUploads.get(doc.id) === uploadTask) {
+      inFlightDocUploads.delete(doc.id);
+    }
   }
 });
 
@@ -7448,14 +7967,18 @@ app.get('/api/documents/search-pdf', requireAuth, async (req, res) => {
   });
 });
 
-// Chi tiết 1 văn bản (kiểm tra quyền Xem trên sổ)
+// Chi tiết 1 văn bản (kiểm tra quyền Xem trên sổ hoặc chính người cấp số đang theo dõi trạng thái lưu tệp)
 app.get('/api/documents/:id', requireAuth, (req, res) => {
   const { id } = req.params;
   const currentUser = (req as any).user as User;
   const doc = db.documents.find((d) => d.id === id);
   if (!doc) return res.status(404).json({ error: 'Không tìm thấy văn bản' });
   const docBookId = getDocBookId(doc);
-  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, docBookId, 'view')) {
+  const canReadOwnIssued =
+    doc.issuedByUserId === currentUser.id &&
+    (hasBookPermission(currentUser, docBookId, 'issue_number') ||
+      hasBookPermission(currentUser, docBookId, 'import_incoming'));
+  if (!isSystemAdmin(currentUser) && !hasBookPermission(currentUser, docBookId, 'view') && !canReadOwnIssued) {
     return res.status(403).json({ error: 'Bạn không có quyền xem hồ sơ thuộc sổ này.' });
   }
   res.json({ document: doc });

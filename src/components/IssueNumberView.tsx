@@ -7,10 +7,8 @@ import {
   AlertTriangle,
   Clock,
   Sparkles,
-  ArrowRight,
   Shield,
   Send,
-  RotateCcw,
   X,
   Plus,
   FileText,
@@ -18,7 +16,6 @@ import {
   FileUp,
   ExternalLink,
   RefreshCw,
-  FolderCheck,
   BookOpen,
   Inbox,
   CheckSquare,
@@ -31,6 +28,7 @@ import { api } from '../api';
 import type {
   DocumentRecord,
   DocumentTypeConfig,
+  IssuedUploadTask,
   NumberRequest,
   PreIssueCheckResult,
   RegistryBook,
@@ -74,6 +72,11 @@ interface IssueNumberViewProps {
   onRefreshRequests: () => void;
   onDocumentIssued: (doc: DocumentRecord) => void;
   onDocumentUpdated?: (doc: DocumentRecord) => void;
+  recentIssueTasks?: IssuedUploadTask[];
+  onStartIssueUploadTask?: (doc: DocumentRecord, file: File | null, issueMs?: number) => void;
+  onRetryIssueUploadTask?: (docId: string, overrideFile?: File) => Promise<void> | void;
+  onDismissIssueTask?: (docId: string) => void;
+  hasCachedUploadFile?: (docId: string) => boolean;
   onNavigateToRegistry: () => void;
   onOpenExistingDocument?: (docId: string) => void;
   onDocumentTypeAdded?: (newType: DocumentTypeConfig, updatedBook?: RegistryBook) => void;
@@ -97,8 +100,13 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   onServerTimeUpdate,
   onRefreshRequests,
   onDocumentIssued,
-  onDocumentUpdated,
-  onNavigateToRegistry,
+  onDocumentUpdated: _onDocumentUpdated,
+  recentIssueTasks = [],
+  onStartIssueUploadTask,
+  onRetryIssueUploadTask,
+  onDismissIssueTask,
+  hasCachedUploadFile,
+  onNavigateToRegistry: _onNavigateToRegistry,
   onOpenExistingDocument,
   onDocumentTypeAdded,
 }) => {
@@ -191,11 +199,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   // Submission State
   const [isSubmitting, setIsSubmitting] = useState<boolean>(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
-  const [issuedSuccessDoc, setIssuedSuccessDoc] = useState<DocumentRecord | null>(null);
   const [requestSuccess, setRequestSuccess] = useState<NumberRequest | null>(null);
-  const [copied, setCopied] = useState<boolean>(false);
   const [copiedFileName, setCopiedFileName] = useState<boolean>(false);
-  const [copiedSuccessFileName, setCopiedSuccessFileName] = useState<boolean>(false);
+  const [copiedTaskKey, setCopiedTaskKey] = useState<string | null>(null);
 
   // Queue Approval State (for issue_number users)
   const [processingReqId, setProcessingReqId] = useState<string | null>(null);
@@ -207,10 +213,6 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
   const [selectedFileSha256, setSelectedFileSha256] = useState<string | undefined>(undefined);
   const [fileError, setFileError] = useState<string | null>(null);
-  const [uploadStep, setUploadStep] = useState<'idle' | 'issuing' | 'uploading' | 'saved' | 'failed'>('idle');
-  const [pendingRetryFile, setPendingRetryFile] = useState<File | null>(null);
-  const [isRetryingUpload, setIsRetryingUpload] = useState<boolean>(false);
-  const [retryError, setRetryError] = useState<string | null>(null);
   const [filenameConflict, setFilenameConflict] = useState<{
     conflictingFileName: string;
     suggestedSuffixName: string;
@@ -218,7 +220,8 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     officialDocNumberPreview?: string;
   } | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const retryFileInputRef = useRef<HTMLInputElement>(null);
+  const retryTaskFileInputRef = useRef<HTMLInputElement>(null);
+  const retryPickTargetDocIdRef = useRef<string | null>(null);
 
   // Word Templates State (auto-generate .docx from template)
   const [wordTemplates, setWordTemplates] = useState<WordTemplate[]>([]);
@@ -229,7 +232,6 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
   } | null>(null);
   const [downloadingDraft, setDownloadingDraft] = useState<boolean>(false);
   const [draftError, setDraftError] = useState<string | null>(null);
-  const [isRetryingTemplateWord, setIsRetryingTemplateWord] = useState<boolean>(false);
 
   // Pre-Issue Confirmation Modal State
   const [checkingPreIssue, setCheckingPreIssue] = useState<boolean>(false);
@@ -868,8 +870,6 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
 
     setIsSubmitting(true);
-    setUploadStep(selectedFile ? 'issuing' : 'idle');
-    setRetryError(null);
     setSequenceConflict(null);
 
     let issuedDoc: DocumentRecord | null = null;
@@ -911,20 +911,23 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       }
       previewReqSeqRef.current += 1;
 
+      // Tự trở về biểu mẫu Cấp số: giữ nguyên Sổ và Loại văn bản, xóa dữ liệu hồ sơ vừa hoàn tất
       setYearRolloverNotice(null);
       setSequenceConflict(null);
+      setFilenameConflict(null);
+      setSubmitError(null);
+      setFileError(null);
       setFormYear(issuedDoc.year);
-      setIssuedSuccessDoc(issuedDoc);
+      setDocName('');
+      setTitle('');
+      setNotes('');
+      setSelectedFile(null);
+      setSelectedFileSha256(undefined);
+      setSelectedTemplateId('');
+      setTemplateDraftCheck(null);
+      setDraftError(null);
+      if (fileInputRef.current) fileInputRef.current.value = '';
       setIdempotencyKey(generateKey());
-      if (issuedDoc.templateId && !fileToUpload) {
-        setUploadStep(
-          issuedDoc.wordGenerationStatus === 'generated' && issuedDoc.driveStatus === 'saved'
-            ? 'saved'
-            : issuedDoc.wordGenerationStatus === 'failed' || issuedDoc.driveStatus === 'failed'
-            ? 'failed'
-            : 'idle'
-        );
-      }
 
       if (res.nextPreview && activeSeriesKeyRef.current === submittingSeriesKey) {
         setNextNumber(res.nextPreview.previewNumber);
@@ -950,41 +953,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
       }
 
       onDocumentIssued(issuedDoc);
-
-      if (fileToUpload) {
-        setUploadStep('uploading');
-        try {
-          const uploadRes = await api.uploadWordToDocument(
-            issuedDoc.id,
-            fileToUpload,
-            issuedDoc.driveFileName,
-            'retry'
-          );
-          setIssuedSuccessDoc(uploadRes.document);
-          onDocumentUpdated?.(uploadRes.document);
-          setUploadStep('saved');
-          setSelectedFile(null);
-          setPendingRetryFile(null);
-          if (fileInputRef.current) fileInputRef.current.value = '';
-        } catch (uploadErr: any) {
-          const failedDoc: DocumentRecord = uploadErr.document || {
-            ...issuedDoc,
-            driveStatus: 'failed',
-            driveOriginalFileName: fileToUpload.name,
-            driveFileSize: fileToUpload.size,
-            driveError: uploadErr.message || 'Lỗi kết nối Google Drive',
-          };
-          setIssuedSuccessDoc(failedDoc);
-          onDocumentUpdated?.(failedDoc);
-          setUploadStep('failed');
-          setPendingRetryFile(fileToUpload);
-          setRetryError(uploadErr.message || `Đã cấp số ${issuedDoc.fullDocNumber} · Chưa lưu tệp lên Drive`);
-          setSelectedFile(null);
-          if (fileInputRef.current) fileInputRef.current.value = '';
-        }
-      }
+      // Kích hoạt thanh kết quả gọn & lưu tệp Drive bất đồng bộ (không chặn nhập văn bản kế tiếp)
+      onStartIssueUploadTask?.(issuedDoc, fileToUpload, res.timings?.issueMs);
     } catch (err: any) {
-      setUploadStep('idle');
       if (err.code === 'SEQUENCE_CHANGED' && typeof err.currentNextSeq === 'number' && err.previewNumber) {
         if (previewAbortRef.current) {
           previewAbortRef.current.abort();
@@ -1115,70 +1086,6 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   };
 
-  const handleRetryTemplateWord = async () => {
-    if (!issuedSuccessDoc || isRetryingTemplateWord) return;
-    setIsRetryingTemplateWord(true);
-    setRetryError(null);
-    try {
-      const res = await api.retryWordDrive(issuedSuccessDoc.id, issuedSuccessDoc.templateId);
-      setIssuedSuccessDoc(res.document);
-      onDocumentUpdated?.(res.document);
-      setUploadStep('saved');
-    } catch (err: any) {
-      if (err.document) {
-        setIssuedSuccessDoc(err.document);
-        onDocumentUpdated?.(err.document);
-      }
-      setUploadStep('failed');
-      setRetryError(err?.message || 'Chưa tạo/lưu lại được tệp Word từ mẫu lên Google Drive.');
-    } finally {
-      setIsRetryingTemplateWord(false);
-    }
-  };
-
-  const handleRetryUpload = async (overrideFile?: File) => {
-    if (!issuedSuccessDoc || isRetryingUpload) return;
-    const fileToUse = overrideFile || pendingRetryFile;
-    if (!fileToUse) {
-      setRetryError('Vui lòng chọn lại tệp Word (.doc hoặc .docx) để thử lưu lại.');
-      return;
-    }
-
-    const validationErr = validateWordFile(fileToUse);
-    if (validationErr) {
-      setRetryError(validationErr);
-      return;
-    }
-
-    setIsRetryingUpload(true);
-    setRetryError(null);
-    setUploadStep('uploading');
-    try {
-      const res = await api.uploadWordToDocument(
-        issuedSuccessDoc.id,
-        fileToUse,
-        issuedSuccessDoc.driveFileName,
-        'retry'
-      );
-      setIssuedSuccessDoc(res.document);
-      onDocumentUpdated?.(res.document);
-      setUploadStep('saved');
-      setPendingRetryFile(null);
-    } catch (err: any) {
-      const failedDoc: DocumentRecord = err.document || {
-        ...issuedSuccessDoc,
-        driveStatus: 'failed',
-        driveError: err.message,
-      };
-      setIssuedSuccessDoc(failedDoc);
-      onDocumentUpdated?.(failedDoc);
-      setUploadStep('failed');
-      setRetryError(err.message || `Đã cấp số ${issuedSuccessDoc.fullDocNumber} · Chưa lưu tệp lên Drive`);
-    } finally {
-      setIsRetryingUpload(false);
-    }
-  };
-
   const handleApproveRequest = async (reqId: string) => {
     if (processingReqId) return;
     setProcessingReqId(reqId);
@@ -1186,8 +1093,7 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     try {
       const res = await api.approveNumberRequest(reqId);
       onDocumentIssued(res.document);
-      setIssuedSuccessDoc(res.document);
-      setUploadStep('idle');
+      onStartIssueUploadTask?.(res.document, null);
       onRefreshRequests();
     } catch (err: any) {
       setQueueError(err.message || 'Không thể duyệt và cấp số cho yêu cầu này.');
@@ -1212,75 +1118,52 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
     }
   };
 
-  const handleIssueNext = () => {
-    setIssuedSuccessDoc(null);
-    setRequestSuccess(null);
-    setDocName('');
-    setTitle('');
-    setNotes('');
-    setSubmitError(null);
-    setSequenceConflict(null);
-    setCopied(false);
-    setSelectedFile(null);
-    setSelectedFileSha256(undefined);
-    setFileError(null);
-    setPendingRetryFile(null);
-    setRetryError(null);
-    setUploadStep('idle');
-    setYearRolloverNotice(null);
-    if (serverYear) setFormYear(serverYear);
-    if (fileInputRef.current) fileInputRef.current.value = '';
-    setIdempotencyKey(generateKey());
-
-    if (typeCode) {
-      fetchNextNumber({ silent: previewStatus === 'ready' && previewSeriesKey === currentSeriesKey });
-    }
-  };
-
-  const handleCopyDocNumber = async (docNumber: string) => {
+  const copyTextToClipboard = async (text: string, feedbackKey?: string) => {
+    if (!text) return;
     try {
-      await navigator.clipboard.writeText(docNumber);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
+      await navigator.clipboard.writeText(text);
     } catch {
       const ta = document.createElement('textarea');
-      ta.value = docNumber;
+      ta.value = text;
       document.body.appendChild(ta);
       ta.select();
       document.execCommand('copy');
       document.body.removeChild(ta);
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2500);
+    }
+    if (feedbackKey) {
+      setCopiedTaskKey(feedbackKey);
+      window.setTimeout(() => {
+        setCopiedTaskKey((prev) => (prev === feedbackKey ? null : prev));
+      }, 2200);
     }
   };
 
-  const handleCopyFileName = async (fileName: string, isSuccessCard = false) => {
+  const handleCopyFileName = async (fileName: string) => {
     if (!fileName) return;
-    try {
-      await navigator.clipboard.writeText(fileName);
-    } catch {
-      const ta = document.createElement('textarea');
-      ta.value = fileName;
-      document.body.appendChild(ta);
-      ta.select();
-      document.execCommand('copy');
-      document.body.removeChild(ta);
-    }
-    if (isSuccessCard) {
-      setCopiedSuccessFileName(true);
-      setTimeout(() => setCopiedSuccessFileName(false), 2500);
-    } else {
-      setCopiedFileName(true);
-      setTimeout(() => setCopiedFileName(false), 2500);
-    }
+    await copyTextToClipboard(fileName);
+    setCopiedFileName(true);
+    window.setTimeout(() => setCopiedFileName(false), 2200);
   };
 
-  const handleOpenSavedWord = async (doc: DocumentRecord) => {
+  const handleOpenTaskFile = async (task: IssuedUploadTask) => {
     try {
-      const res = await api.openDocumentFile(doc.id);
+      const res = await api.openDocumentFile(task.docId);
       if (res.url) window.open(res.url, '_blank', 'noopener,noreferrer');
     } catch {
-      if (doc.driveFileUrl) window.open(doc.driveFileUrl, '_blank', 'noopener,noreferrer');
+      if (task.driveFileUrl) window.open(task.driveFileUrl, '_blank', 'noopener,noreferrer');
+    }
+  };
+
+  const handleTaskRetryClick = (task: IssuedUploadTask) => {
+    const canDirectRetry = Boolean(task.templateId || hasCachedUploadFile?.(task.docId));
+    if (canDirectRetry) {
+      void onRetryIssueUploadTask?.(task.docId);
+      return;
+    }
+    retryPickTargetDocIdRef.current = task.docId;
+    if (retryTaskFileInputRef.current) {
+      retryTaskFileInputRef.current.value = '';
+      retryTaskFileInputRef.current.click();
     }
   };
 
@@ -1550,297 +1433,185 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
         </div>
       )}
 
-      {/* Issued Success Banner */}
-      {issuedSuccessDoc && (() => {
-        const docTypeConfig = documentTypes.find((t) => t.code === issuedSuccessDoc.typeCode);
-        const successStyle = getTypeColorStyle(issuedSuccessDoc.typeCode, docTypeConfig?.color);
-        const driveFailed = issuedSuccessDoc.driveStatus === 'failed';
-        const driveSaved = issuedSuccessDoc.driveStatus === 'saved';
+      {/* Hidden file picker for retrying a failed task after page reload */}
+      <input
+        ref={retryTaskFileInputRef}
+        type="file"
+        accept=".doc,.docx,application/msword,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        className="hidden"
+        onChange={(e) => {
+          const picked = e.target.files?.[0];
+          const targetDocId = retryPickTargetDocIdRef.current;
+          e.target.value = '';
+          if (!picked || !targetDocId) return;
+          const err = validateWordFile(picked);
+          if (err) {
+            setSubmitError(err);
+            return;
+          }
+          setSubmitError(null);
+          void onRetryIssueUploadTask?.(targetDocId, picked);
+        }}
+      />
+
+      {/* Compact Post-Issue Result Bar(s) above the form */}
+      {(() => {
+        const visibleTasks = recentIssueTasks.filter(
+          (t) =>
+            t.bookId === activeBook.id ||
+            t.driveStatus === 'uploading' ||
+            t.driveStatus === 'failed'
+        );
+        if (visibleTasks.length === 0) return null;
 
         return (
-          <div className={`p-4 sm:p-6 ${successStyle.previewBg} border ${successStyle.previewBorder} rounded-xl shadow-xs transition-all animate-fadeIn`}>
-            <div className="flex flex-col sm:flex-row items-start gap-3 sm:gap-4">
-              <div className={`w-10 h-10 sm:w-12 sm:h-12 rounded-full ${successStyle.dotColor} flex items-center justify-center text-white shrink-0 shadow-xs`}>
-                <CheckCircle2 className="w-6 h-6 sm:w-7 sm:h-7" />
-              </div>
+          <div className="space-y-2" aria-live="polite" data-testid="issued-result-bars">
+            {visibleTasks.map((task) => {
+              const isVerifiedSaved = Boolean(
+                task.driveStatus === 'saved' && task.driveFileId && task.driveFileUrl
+              );
+              const isUploading = task.driveStatus === 'uploading';
+              const isFailed = task.driveStatus === 'failed';
+              const numCopyKey = `num:${task.docId}`;
+              const fileCopyKey = `file:${task.docId}`;
 
-              <div className="flex-1 w-full min-w-0">
-                <div className="flex flex-col lg:flex-row lg:items-center justify-between gap-3">
-                  <div className="min-w-0">
-                    <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 mb-1">
-                      {driveFailed ? (
-                        <span className="text-xs font-bold px-2.5 py-0.5 rounded bg-rose-100 text-rose-900 border border-rose-300">
-                          Đã cấp số · Lưu tệp thất bại
+              const barToneClass = isFailed
+                ? 'bg-rose-50/90 border-rose-200'
+                : isVerifiedSaved
+                ? 'bg-emerald-50/90 border-emerald-200'
+                : 'bg-sky-50/80 border-sky-200';
+
+              return (
+                <div
+                  key={task.docId}
+                  data-testid={`issued-result-bar-${task.docId}`}
+                  data-drive-status={isVerifiedSaved ? 'saved' : task.driveStatus}
+                  className={`px-3.5 py-2.5 rounded-xl border shadow-2xs transition-colors ${barToneClass}`}
+                >
+                  {/* Line 1: Official number + copy icon + Drive status + inline retry/dismiss */}
+                  <div className="flex flex-wrap items-center justify-between gap-2 text-xs sm:text-sm">
+                    <div className="flex flex-wrap items-center gap-1.5 sm:gap-2 min-w-0">
+                      <span className="inline-flex items-center gap-1 font-semibold text-slate-900">
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600 shrink-0" />
+                        <span>Đã cấp số</span>
+                      </span>
+                      <code className="font-mono font-extrabold text-slate-950 bg-white/90 px-2 py-0.5 rounded border border-slate-200/90 break-all">
+                        {task.fullDocNumber}
+                      </code>
+                      <button
+                        type="button"
+                        onClick={() => copyTextToClipboard(task.fullDocNumber, numCopyKey)}
+                        aria-label="Sao chép số"
+                        title="Sao chép số"
+                        className="inline-flex items-center justify-center w-7 h-7 rounded-md bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 hover:text-slate-900 transition-colors shrink-0"
+                      >
+                        {copiedTaskKey === numCopyKey ? (
+                          <Check className="w-3.5 h-3.5 text-emerald-600" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+
+                      {task.bookId !== activeBook.id && task.bookName && (
+                        <span className="text-[11px] font-medium text-slate-600 bg-white/80 px-1.5 py-0.5 rounded border border-slate-200">
+                          {task.bookName}
+                        </span>
+                      )}
+
+                      <span className="text-slate-300 hidden sm:inline" aria-hidden="true">·</span>
+
+                      {isVerifiedSaved ? (
+                        <span className="inline-flex items-center gap-1 text-xs font-bold text-emerald-700">
+                          <Check className="w-3.5 h-3.5 shrink-0" />
+                          <span>Đã lưu trên Google Drive</span>
+                        </span>
+                      ) : isUploading ? (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-semibold text-sky-700">
+                          <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />
+                          <span>Đang lưu tệp</span>
+                        </span>
+                      ) : isFailed ? (
+                        <span className="inline-flex items-center gap-1.5 text-xs font-bold text-rose-700">
+                          <AlertTriangle className="w-3.5 h-3.5 shrink-0" />
+                          <span>Đã cấp số · Lưu tệp thất bại</span>
                         </span>
                       ) : (
-                        <>
-                          <span className="text-xs font-bold px-2.5 py-0.5 rounded bg-emerald-100 text-emerald-900 border border-emerald-300">
-                            Đã cấp số
-                          </span>
-                          <span
-                            className={`text-xs font-bold px-2.5 py-0.5 rounded border ${
-                              driveSaved
-                                ? SEMANTIC_STATUS_STYLES.saved.badge
-                                : issuedSuccessDoc.driveStatus === 'uploading'
-                                ? SEMANTIC_STATUS_STYLES.pending.badge
-                                : 'bg-slate-100 text-slate-600 border-slate-200'
-                            }`}
-                          >
-                            {driveSaved
-                              ? 'Đã lưu lên Drive'
-                              : issuedSuccessDoc.driveStatus === 'uploading'
-                              ? 'Đang lưu'
-                              : 'Không đính kèm'}
-                          </span>
-                        </>
+                        <span className="text-xs font-medium text-slate-500">Không đính kèm</span>
                       )}
-                      <span
-                        className={`text-xs font-bold px-2.5 py-0.5 rounded border ${
-                          issuedSuccessDoc.syncStatus === 'synced'
-                            ? 'bg-emerald-50 text-emerald-800 border-emerald-200'
-                            : issuedSuccessDoc.syncStatus === 'error'
-                            ? 'bg-rose-50 text-rose-800 border-rose-200'
-                            : issuedSuccessDoc.syncStatus === 'pending'
-                            ? 'bg-amber-50 text-amber-800 border-amber-200'
-                            : 'bg-slate-100 text-slate-600 border-slate-200'
-                        }`}
-                      >
-                        {issuedSuccessDoc.syncStatus === 'synced'
-                          ? 'Đã đồng bộ Trang tính'
-                          : issuedSuccessDoc.syncStatus === 'error'
-                          ? 'Lỗi Trang tính'
-                          : issuedSuccessDoc.syncStatus === 'pending'
-                          ? 'Đang đồng bộ Trang tính'
-                          : 'Trang tính chưa bật'}
-                      </span>
-                      <span className="text-[11px] font-medium text-slate-600">
-                        {issuedSuccessDoc.bookName || activeBook.name}
-                      </span>
                     </div>
 
-                    <div className={`text-2xl sm:text-3xl font-extrabold ${successStyle.previewText} font-mono tracking-tight mt-1 flex items-center gap-2.5 sm:gap-3 flex-wrap`}>
-                      <span className="break-all">{issuedSuccessDoc.fullDocNumber}</span>
-                      <button
-                        type="button"
-                        onClick={() => handleCopyDocNumber(issuedSuccessDoc.fullDocNumber)}
-                        className={`inline-flex items-center gap-1.5 min-h-[36px] px-3 py-1.5 text-xs font-semibold rounded-md bg-white border ${successStyle.badgeBorder} ${successStyle.badgeText} hover:bg-slate-50 transition-colors shadow-2xs`}
-                        title="Sao chép số văn bản"
-                      >
-                        {copied ? (
-                          <>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      {isFailed && (
+                        <button
+                          type="button"
+                          onClick={() => handleTaskRetryClick(task)}
+                          className="inline-flex items-center gap-1 px-2.5 py-1 text-xs font-semibold bg-rose-700 hover:bg-rose-800 text-white rounded-md shadow-2xs transition-colors"
+                        >
+                          <RefreshCw className="w-3 h-3" />
+                          <span>
+                            {task.templateId || hasCachedUploadFile?.(task.docId)
+                              ? 'Thử lưu lại'
+                              : 'Chọn lại tệp & Lưu'}
+                          </span>
+                        </button>
+                      )}
+                      {onDismissIssueTask && (
+                        <button
+                          type="button"
+                          onClick={() => onDismissIssueTask(task.docId)}
+                          aria-label="Đóng thông báo"
+                          title="Đóng thông báo"
+                          className="inline-flex items-center justify-center w-7 h-7 rounded-md text-slate-400 hover:text-slate-700 hover:bg-white/80 transition-colors"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Line 2 (only when file/template attached): UPPERCASE filename + copy + open link */}
+                  {task.hasFileOrTemplate && task.driveFileName && (
+                    <div className="mt-1.5 pt-1.5 border-t border-slate-200/70 flex items-center justify-between gap-2 text-xs">
+                      <span className="font-mono text-xs font-semibold text-slate-800 truncate min-w-0">
+                        {task.driveFileName}
+                      </span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => copyTextToClipboard(task.driveFileName || '', fileCopyKey)}
+                          aria-label="Sao chép tên tệp"
+                          title="Sao chép tên tệp"
+                          className="inline-flex items-center justify-center w-7 h-7 rounded-md bg-white hover:bg-slate-100 border border-slate-200 text-slate-600 hover:text-slate-900 transition-colors"
+                        >
+                          {copiedTaskKey === fileCopyKey ? (
                             <Check className="w-3.5 h-3.5 text-emerald-600" />
-                            <span className="text-emerald-700">Đã sao chép!</span>
-                          </>
-                        ) : (
-                          <>
+                          ) : (
                             <Copy className="w-3.5 h-3.5" />
-                            <span>Sao chép số</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  </div>
-
-                  <div className="flex flex-wrap items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={handleIssueNext}
-                      className="flex-1 sm:flex-initial justify-center flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-lg shadow-xs transition-colors"
-                    >
-                      <RotateCcw className="w-4 h-4 shrink-0" />
-                      <span>Cấp số tiếp theo</span>
-                    </button>
-
-                    {canView && (
-                      <button
-                        type="button"
-                        onClick={onNavigateToRegistry}
-                        className="flex-1 sm:flex-initial justify-center flex items-center gap-2 min-h-[42px] px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 border border-slate-300 text-slate-800 rounded-lg shadow-2xs transition-colors"
-                      >
-                        <span>Xem sổ theo dõi</span>
-                        <ArrowRight className="w-4 h-4 text-slate-500 shrink-0" />
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                {/* Record Summary */}
-                <div className={`mt-4 pt-4 border-t ${successStyle.previewBorder} grid grid-cols-1 sm:grid-cols-2 md:grid-cols-4 gap-3 text-xs text-slate-700`}>
-                  <div className="min-w-0">
-                    <span className="text-slate-500 block">Tên văn bản:</span>
-                    <p className="font-bold text-slate-900 mt-0.5 break-words">{issuedSuccessDoc.docName || issuedSuccessDoc.title}</p>
-                  </div>
-                  <div className="min-w-0">
-                    <span className="text-slate-500 block">Trích yếu:</span>
-                    <p className="font-medium text-slate-700 mt-0.5 line-clamp-2 break-words">
-                      {issuedSuccessDoc.title || <span className="italic text-slate-400">Không có</span>}
-                    </p>
-                  </div>
-                  <div className="min-w-0">
-                    <span className="text-slate-500 block">Người ký:</span>
-                    <p className="font-medium text-slate-900 mt-0.5 break-words">
-                      {issuedSuccessDoc.signer} ({issuedSuccessDoc.signerRole})
-                    </p>
-                  </div>
-                  <div>
-                    <span className="text-slate-500 block">Ngày ban hành / cấp:</span>
-                    <p className="font-medium text-slate-900 mt-0.5 font-mono">{issuedSuccessDoc.issueDate}</p>
-                  </div>
-                </div>
-
-                {/* Tên tệp chuẩn từ số chính thức thực tế */}
-                {(() => {
-                  const officialFileName =
-                    issuedSuccessDoc.driveFileName ||
-                    generateSuggestedFileName(
-                      issuedSuccessDoc.fullDocNumber,
-                      issuedSuccessDoc.docName || issuedSuccessDoc.title
-                    );
-                  return (
-                    <div className="mt-4 pt-3.5 border-t border-slate-200/80 flex flex-col sm:flex-row sm:items-center justify-between gap-3 bg-white/95 p-3.5 rounded-lg border border-slate-200/90 shadow-2xs">
-                      <div className="space-y-0.5 min-w-0">
-                        <span className="text-[11px] font-bold text-slate-600 uppercase tracking-wide flex items-center gap-1.5">
-                          <FileText className="w-3.5 h-3.5 text-sky-600 shrink-0" />
-                          <span>Tên tệp sẽ lưu ({issuedSuccessDoc.fullDocNumber}):</span>
-                        </span>
-                        <p className="font-mono text-xs sm:text-sm font-bold text-slate-900 break-all sm:break-words">
-                          {officialFileName}
-                        </p>
-                      </div>
-                      <button
-                        type="button"
-                        onClick={() => handleCopyFileName(officialFileName, true)}
-                        className="inline-flex items-center justify-center gap-1.5 min-h-[40px] px-3.5 py-2 text-xs font-semibold bg-sky-700 hover:bg-sky-800 text-white rounded-md shadow-2xs transition-colors shrink-0 w-full sm:w-auto"
-                      >
-                        {copiedSuccessFileName ? (
-                          <>
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Đã sao chép!</span>
-                          </>
-                        ) : (
-                          <>
-                            <Copy className="w-3.5 h-3.5" />
-                            <span>Sao chép tên file</span>
-                          </>
-                        )}
-                      </button>
-                    </div>
-                  );
-                })()}
-
-                {/* Trạng thái lưu tệp Word trên Google Drive */}
-                {(uploadStep !== 'idle' || driveSaved || driveFailed || issuedSuccessDoc.driveStatus === 'uploading') && (
-                  <div className="mt-3 space-y-2.5">
-                    {driveSaved && (
-                      <div className="p-3.5 bg-emerald-50 border border-emerald-200 rounded-lg flex flex-col sm:flex-row sm:items-center justify-between gap-3">
-                        <div className="min-w-0 space-y-0.5">
-                          <div className="text-xs font-bold text-emerald-900 flex items-center gap-1.5">
-                            <FolderCheck className="w-4 h-4 text-emerald-600 shrink-0" />
-                            <span>Đã đổi tên và lưu tệp lên Google Drive</span>
-                          </div>
-                          <p className="font-mono text-xs font-semibold text-emerald-800 break-all">
-                            {issuedSuccessDoc.driveFileName}
-                          </p>
-                          {issuedSuccessDoc.driveFileSize && (
-                            <span className="text-[11px] text-emerald-700 block">
-                              Dung lượng: {formatFileSize(issuedSuccessDoc.driveFileSize)}
-                            </span>
                           )}
-                        </div>
-                        {issuedSuccessDoc.driveFileUrl && (
+                        </button>
+                        {isVerifiedSaved && (
                           <button
                             type="button"
-                            onClick={() => handleOpenSavedWord(issuedSuccessDoc)}
-                            className="inline-flex items-center justify-center gap-1.5 px-3.5 py-2 text-xs font-semibold bg-emerald-700 hover:bg-emerald-800 text-white rounded-lg shadow-2xs transition-colors shrink-0"
+                            onClick={() => handleOpenTaskFile(task)}
+                            aria-label="Mở tệp"
+                            title="Mở tệp"
+                            className="inline-flex items-center justify-center w-7 h-7 rounded-md bg-white hover:bg-emerald-50 border border-emerald-200 text-emerald-700 hover:text-emerald-900 transition-colors"
                           >
                             <ExternalLink className="w-3.5 h-3.5" />
-                            <span>Mở tệp Word</span>
                           </button>
                         )}
                       </div>
-                    )}
+                    </div>
+                  )}
 
-                    {driveFailed && !isRetryingUpload && (
-                      <div className="p-3.5 bg-rose-50 border border-rose-200 rounded-lg space-y-2.5 text-xs">
-                        <div className="flex items-start gap-2 text-rose-900">
-                          <AlertTriangle className="w-4 h-4 text-rose-600 shrink-0 mt-0.5" />
-                          <div className="space-y-0.5">
-                            <strong className="block font-bold">
-                              Đã cấp số · Lưu tệp thất bại ({issuedSuccessDoc.fullDocNumber})
-                            </strong>
-                            <p className="text-rose-700">
-                              {retryError || issuedSuccessDoc.driveError || 'Lỗi kết nối hoặc phân quyền thư mục Google Drive.'}
-                            </p>
-                            {pendingRetryFile && (
-                              <p className="text-[11px] text-rose-800">
-                                Tệp đang chờ: <strong className="font-mono">{pendingRetryFile.name}</strong> ({formatFileSize(pendingRetryFile.size)}) &rarr; Tên mới:{' '}
-                                <strong className="font-mono">
-                                  {buildStandardDriveFileName(
-                                    issuedSuccessDoc.fullDocNumber,
-                                    issuedSuccessDoc.docName || issuedSuccessDoc.title,
-                                    pendingRetryFile.name
-                                  )}
-                                </strong>
-                              </p>
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="flex flex-wrap items-center gap-2 pt-1">
-                          {issuedSuccessDoc.templateId && !pendingRetryFile ? (
-                            <button
-                              type="button"
-                              onClick={handleRetryTemplateWord}
-                              disabled={isRetryingTemplateWord}
-                              className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md shadow-2xs transition-colors"
-                            >
-                              <RefreshCw className={`w-3.5 h-3.5 ${isRetryingTemplateWord ? 'animate-spin' : ''}`} />
-                              <span>{isRetryingTemplateWord ? 'Đang tạo & lưu lại...' : 'Thử tạo & lưu lại Word'}</span>
-                            </button>
-                          ) : (
-                            <>
-                              <input
-                                ref={retryFileInputRef}
-                                type="file"
-                                accept=".doc,.docx"
-                                className="hidden"
-                                onChange={(e) => {
-                                  const f = e.target.files?.[0];
-                                  if (!f) return;
-                                  const err = validateWordFile(f);
-                                  if (err) {
-                                    setRetryError(err);
-                                    return;
-                                  }
-                                  setRetryError(null);
-                                  setPendingRetryFile(f);
-                                }}
-                              />
-                              <button
-                                type="button"
-                                onClick={() => retryFileInputRef.current?.click()}
-                                className="px-3 py-1.5 bg-white hover:bg-slate-50 border border-rose-300 text-rose-800 font-semibold rounded-md transition-colors"
-                              >
-                                Chọn lại tệp khác
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => handleRetryUpload()}
-                                disabled={isRetryingUpload || !pendingRetryFile}
-                                className="inline-flex items-center gap-1.5 px-3.5 py-1.5 bg-rose-700 hover:bg-rose-800 disabled:opacity-50 text-white font-semibold rounded-md shadow-2xs transition-colors"
-                              >
-                                <RefreshCw className="w-3.5 h-3.5" />
-                                <span>Thử lưu lại</span>
-                              </button>
-                            </>
-                          )}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                )}
-              </div>
-            </div>
+                  {isFailed && task.driveError && (
+                    <p className="mt-1 text-[11px] text-rose-700 break-words">
+                      {task.driveError}
+                    </p>
+                  )}
+                </div>
+              );
+            })}
           </div>
         );
       })()}
@@ -2041,7 +1812,9 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                           <span className="text-sky-950 font-bold">{suggestedFileName}</span>
                         ) : (
                           <span className="text-slate-400 font-normal italic font-sans text-xs">
-                            {previewDocNumber ? `${previewDocNumber.replace(/\//g, '.')} - [Tên văn bản]` : 'Nhập tên văn bản để xem tên tệp dự kiến...'}
+                            {previewDocNumber
+                              ? `${previewDocNumber.replace(/\//g, '.').toLocaleUpperCase('vi-VN')} - [TÊN VĂN BẢN]`
+                              : 'Nhập tên văn bản để xem tên tệp dự kiến...'}
                           </span>
                         )}
                       </div>
@@ -2562,8 +2335,6 @@ export const IssueNumberView: React.FC<IssueNumberViewProps> = ({
                       <span>
                         {!canIssue
                           ? 'Đang gửi yêu cầu xin số...'
-                          : uploadStep === 'uploading'
-                          ? 'Đang lưu tệp lên Drive...'
                           : 'Đang cấp số tại máy chủ...'}
                       </span>
                     </>

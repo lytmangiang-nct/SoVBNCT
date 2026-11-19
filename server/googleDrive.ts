@@ -692,6 +692,20 @@ async function runCoalescedByKey<T>(key: string, fn: () => Promise<T>): Promise<
   return promise;
 }
 
+const FOLDER_VERIFY_MEM_TTL_MS = 5 * 60 * 1000;
+const verifiedFolderMemCache = new Map<string, number>();
+const folderNameMemCache = new Map<string, { name: string; expiresAt: number }>();
+
+function clearFolderMemCacheForId(folderId?: string) {
+  if (!folderId) return;
+  folderNameMemCache.delete(folderId);
+  for (const key of Array.from(verifiedFolderMemCache.keys())) {
+    if (key.startsWith(`${folderId}::`)) {
+      verifiedFolderMemCache.delete(key);
+    }
+  }
+}
+
 async function getServiceAccountFolderMeta(
   accessToken: string,
   folderId: string
@@ -710,8 +724,16 @@ async function getServiceAccountFolderMeta(
 }
 
 async function getServiceAccountFolderName(accessToken: string, folderId: string): Promise<string> {
+  const cached = folderNameMemCache.get(folderId);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.name;
+  }
   const meta = await getServiceAccountFolderMeta(accessToken, folderId);
-  return typeof meta?.name === 'string' ? meta.name : '';
+  const name = typeof meta?.name === 'string' ? meta.name : '';
+  if (name) {
+    folderNameMemCache.set(folderId, { name, expiresAt: Date.now() + FOLDER_VERIFY_MEM_TTL_MS });
+  }
+  return name;
 }
 
 async function verifyCachedServiceAccountFolder(
@@ -722,13 +744,22 @@ async function verifyCachedServiceAccountFolder(
 ): Promise<boolean> {
   const cleanId = (folderId || '').trim();
   if (!cleanId) return false;
+  const memKey = `${cleanId}::${expectedName.trim().toLowerCase()}::${expectedParentId || ''}`;
+  const cachedExp = verifiedFolderMemCache.get(memKey);
+  if (cachedExp && cachedExp > Date.now()) {
+    return true;
+  }
   const meta = await getServiceAccountFolderMeta(accessToken, cleanId);
-  if (!meta || meta.trashed) return false;
+  if (!meta || meta.trashed) {
+    clearFolderMemCacheForId(cleanId);
+    return false;
+  }
   if (meta.mimeType !== 'application/vnd.google-apps.folder') return false;
   if ((meta.name || '').trim().toLowerCase() !== expectedName.trim().toLowerCase()) return false;
   if (expectedParentId && Array.isArray(meta.parents) && meta.parents.length > 0) {
     if (!meta.parents.includes(expectedParentId)) return false;
   }
+  verifiedFolderMemCache.set(memKey, Date.now() + FOLDER_VERIFY_MEM_TTL_MS);
   return true;
 }
 
@@ -762,7 +793,12 @@ async function ensureServiceAccountSubfolder(
       }
       const listData: any = await listRes.json().catch(() => ({}));
       if (listData?.files?.[0]?.id) {
-        return listData.files[0].id;
+        const foundId = String(listData.files[0].id);
+        verifiedFolderMemCache.set(
+          `${foundId}::${cleanName.toLowerCase()}::${parentId}`,
+          Date.now() + FOLDER_VERIFY_MEM_TTL_MS
+        );
+        return foundId;
       }
 
       const createRes = await fetch(
@@ -788,7 +824,12 @@ async function ensureServiceAccountSubfolder(
           }`
         );
       }
-      return createData.id;
+      const createdId = String(createData.id);
+      verifiedFolderMemCache.set(
+        `${createdId}::${cleanName.toLowerCase()}::${parentId}`,
+        Date.now() + FOLDER_VERIFY_MEM_TTL_MS
+      );
+      return createdId;
     })
   );
 }
@@ -861,27 +902,54 @@ async function resolveServiceAccountTargetFolder(
 async function findExistingFileServiceAccount(
   accessToken: string,
   folderId: string,
-  docId: string
+  docId: string,
+  expectedFileName?: string
 ): Promise<{ id: string; name: string; webViewLink: string } | null> {
   const apiBase = getGoogleDriveApiBaseUrl();
   const safeDocId = docId.replace(/'/g, "\\'");
-  const q = `'${folderId}' in parents and trashed = false and appProperties has { key='nctDocId' and value='${safeDocId}' }`;
-  const url = `${apiBase}/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name,webViewLink)&q=${encodeURIComponent(
-    q
+  const qByDoc = `'${folderId}' in parents and trashed = false and appProperties has { key='nctDocId' and value='${safeDocId}' }`;
+  const urlByDoc = `${apiBase}/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name,webViewLink)&q=${encodeURIComponent(
+    qByDoc
   )}`;
 
-  const res = await fetch(url, {
+  const res = await fetch(urlByDoc, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
-  if (!res.ok) return null;
-  const data: any = await res.json().catch(() => ({}));
-  const first = data?.files?.[0];
-  if (!first) return null;
-  return {
-    id: first.id,
-    name: first.name,
-    webViewLink: first.webViewLink || `https://drive.google.com/file/d/${first.id}/view`,
-  };
+  if (res.ok) {
+    const data: any = await res.json().catch(() => ({}));
+    const first = data?.files?.[0];
+    if (first) {
+      return {
+        id: first.id,
+        name: first.name,
+        webViewLink: first.webViewLink || `https://drive.google.com/file/d/${first.id}/view`,
+      };
+    }
+  }
+
+  if (expectedFileName && expectedFileName.trim()) {
+    const safeName = expectedFileName.trim().replace(/'/g, "\\'");
+    const qByName = `'${folderId}' in parents and trashed = false and name = '${safeName}'`;
+    const urlByName = `${apiBase}/drive/v3/files?supportsAllDrives=true&includeItemsFromAllDrives=true&fields=files(id,name,webViewLink)&q=${encodeURIComponent(
+      qByName
+    )}`;
+    const nameRes = await fetch(urlByName, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+    if (nameRes.ok) {
+      const nameData: any = await nameRes.json().catch(() => ({}));
+      const firstByName = nameData?.files?.[0];
+      if (firstByName) {
+        return {
+          id: firstByName.id,
+          name: firstByName.name,
+          webViewLink: firstByName.webViewLink || `https://drive.google.com/file/d/${firstByName.id}/view`,
+        };
+      }
+    }
+  }
+
+  return null;
 }
 
 export async function uploadWordToGoogleDrive(params: {
@@ -897,6 +965,7 @@ export async function uploadWordToGoogleDrive(params: {
   buffer: Buffer;
   overrideFileName?: string;
   replaceMode?: boolean;
+  isRetry?: boolean;
   previousFileId?: string;
   keepPreviousFile?: boolean;
   cacheKey?: string;
@@ -916,6 +985,7 @@ export async function uploadWordToGoogleDrive(params: {
     buffer,
     overrideFileName,
     replaceMode,
+    isRetry = false,
     previousFileId,
     keepPreviousFile,
     cacheKey,
@@ -967,8 +1037,8 @@ export async function uploadWordToGoogleDrive(params: {
     const runAppsScriptFlow = async (): Promise<DriveUploadResult> => {
       const currentCached = folderCache ? folderCache[effectiveCacheKey] : undefined;
 
-      // Step 1: Check existing file by docId first (skip when replacing or adding versioned attachments)
-      if (!replaceMode && !keepPreviousFile) {
+      // Chỉ gọi bước kiểm tra trùng trước khi tải lên trong kịch bản thử lại / khôi phục để giảm 1 HTTP roundtrip khi cấp mới
+      if (isRetry && !replaceMode && !keepPreviousFile) {
         const checkRes = await fetch(config.appsScriptUrl, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -983,6 +1053,7 @@ export async function uploadWordToGoogleDrive(params: {
             cachedCategoryFolderId: currentCached?.categoryFolderId || '',
             docId,
             expectedFileName: finalFileName,
+            checkNameFallback: true,
           }),
         });
         const checkData = await parseAppsScriptJsonResponse(checkRes);
@@ -1011,7 +1082,7 @@ export async function uploadWordToGoogleDrive(params: {
 
       const freshCached = folderCache ? folderCache[effectiveCacheKey] : currentCached;
 
-      // Step 2: Upload new file into Tên sổ / Năm / Văn bản đi | Văn bản đến
+      // Upload new file into Tên sổ / Năm / Văn bản đi | Văn bản đến
       const uploadRes = await fetch(config.appsScriptUrl, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -1078,15 +1149,15 @@ export async function uploadWordToGoogleDrive(params: {
   const accessToken = await getServiceAccountAccessToken(parsed);
   const apiBase = getGoogleDriveApiBaseUrl();
 
-  // Resolve/create folder layout: Tên sổ / Năm / Văn bản đi | Văn bản đến (có cache ID + khóa đồng bộ)
+  // Resolve/create folder layout: Tên sổ / Năm / Văn bản đi | Văn bản đến (có cache ID + TTL 5 phút trong RAM + khóa đồng bộ)
   const cachedEntry = folderCache ? folderCache[effectiveCacheKey] : undefined;
-  const resolvedFolders = await resolveServiceAccountTargetFolder(
+  let resolvedFolders = await resolveServiceAccountTargetFolder(
     accessToken,
     config.folderId,
     hierarchy,
     cachedEntry
   );
-  const targetFolderId = resolvedFolders.categoryFolderId;
+  let targetFolderId = resolvedFolders.categoryFolderId;
   saveCacheEntry({
     bookFolderId: resolvedFolders.bookFolderId,
     yearFolderId: resolvedFolders.yearFolderId,
@@ -1094,9 +1165,9 @@ export async function uploadWordToGoogleDrive(params: {
     folderPath: hierarchy.displayPath,
   });
 
-  // Step 1: Deduplication lookup by appProperties.nctDocId (skip when replacing or keeping separate versions)
-  if (!replaceMode && !keepPreviousFile) {
-    const existing = await findExistingFileServiceAccount(accessToken, targetFolderId, docId);
+  // Step 1: Đối soát tệp trùng trên Drive chỉ chạy khi retry / khôi phục để lượt tải đầu tiên giữ tốc độ tối đa
+  if (isRetry && !replaceMode && !keepPreviousFile) {
+    const existing = await findExistingFileServiceAccount(accessToken, targetFolderId, docId, finalFileName);
     if (existing) {
       if (existing.name !== finalFileName) {
         await fetch(
@@ -1136,43 +1207,73 @@ export async function uploadWordToGoogleDrive(params: {
   }
 
   // Step 2: Multipart upload preserving exact binary Word/PDF content and folder-inherited permissions
-  const boundary = `nct_upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
-  const metadata = JSON.stringify({
-    name: finalFileName,
-    parents: [targetFolderId],
-    description: `Sổ: ${hierarchy.bookFolder} | Số văn bản: ${fullDocNumber} | Tên văn bản: ${docName} | Mã hệ thống: ${docId}`,
-    appProperties: {
-      nctDocId: docId,
-      nctDocNumber: fullDocNumber,
-      nctBookName: hierarchy.bookFolder,
-    },
-  });
-
-  const prefix = Buffer.from(
-    `--${boundary}\r\n` +
-      `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
-      `${metadata}\r\n` +
-      `--${boundary}\r\n` +
-      `Content-Type: ${mimeType}\r\n\r\n`,
-    'utf-8'
-  );
-  const suffix = Buffer.from(`\r\n--${boundary}--`, 'utf-8');
-  const multipartPayload = Buffer.concat([prefix, buffer, suffix]);
-
-  const uploadRes = await fetch(
-    `${apiBase}/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,webViewLink`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${accessToken}`,
-        'Content-Type': `multipart/related; boundary=${boundary}`,
-        'Content-Length': String(multipartPayload.length),
+  const performMultipartUpload = async (folderIdToUse: string) => {
+    const boundary = `nct_upload_${Date.now()}_${crypto.randomBytes(4).toString('hex')}`;
+    const metadata = JSON.stringify({
+      name: finalFileName,
+      parents: [folderIdToUse],
+      description: `Sổ: ${hierarchy.bookFolder} | Số văn bản: ${fullDocNumber} | Tên văn bản: ${docName} | Mã hệ thống: ${docId}`,
+      appProperties: {
+        nctDocId: docId,
+        nctDocNumber: fullDocNumber,
+        nctBookName: hierarchy.bookFolder,
       },
-      body: multipartPayload,
-    }
-  );
+    });
 
-  const uploadData: any = await uploadRes.json().catch(() => ({}));
+    const prefix = Buffer.from(
+      `--${boundary}\r\n` +
+        `Content-Type: application/json; charset=UTF-8\r\n\r\n` +
+        `${metadata}\r\n` +
+        `--${boundary}\r\n` +
+        `Content-Type: ${mimeType}\r\n\r\n`,
+      'utf-8'
+    );
+    const suffix = Buffer.from(`\r\n--${boundary}--`, 'utf-8');
+    const multipartPayload = Buffer.concat([prefix, buffer, suffix]);
+
+    const uploadRes = await fetch(
+      `${apiBase}/upload/drive/v3/files?uploadType=multipart&supportsAllDrives=true&fields=id,name,webViewLink`,
+      {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': `multipart/related; boundary=${boundary}`,
+          'Content-Length': String(multipartPayload.length),
+        },
+        body: multipartPayload,
+      }
+    );
+    const uploadData: any = await uploadRes.json().catch(() => ({}));
+    return { uploadRes, uploadData };
+  };
+
+  let { uploadRes, uploadData } = await performMultipartUpload(targetFolderId);
+
+  // Nếu thư mục cache vừa bị xóa/di chuyển (404), vô hiệu hóa cache và phân giải lại 1 lần
+  if (uploadRes.status === 404) {
+    clearFolderMemCacheForId(targetFolderId);
+    if (resolvedFolders.yearFolderId) clearFolderMemCacheForId(resolvedFolders.yearFolderId);
+    if (resolvedFolders.bookFolderId) clearFolderMemCacheForId(resolvedFolders.bookFolderId);
+    if (folderCache) delete folderCache[effectiveCacheKey];
+
+    resolvedFolders = await resolveServiceAccountTargetFolder(
+      accessToken,
+      config.folderId,
+      hierarchy,
+      undefined
+    );
+    targetFolderId = resolvedFolders.categoryFolderId;
+    saveCacheEntry({
+      bookFolderId: resolvedFolders.bookFolderId,
+      yearFolderId: resolvedFolders.yearFolderId,
+      categoryFolderId: targetFolderId,
+      folderPath: hierarchy.displayPath,
+    });
+    const retryRes = await performMultipartUpload(targetFolderId);
+    uploadRes = retryRes.uploadRes;
+    uploadData = retryRes.uploadData;
+  }
+
   if (!uploadRes.ok || !uploadData.id) {
     const errReason = uploadData?.error?.errors?.[0]?.reason || '';
     const errMsg = uploadData?.error?.message || uploadRes.statusText;

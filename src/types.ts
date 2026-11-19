@@ -598,6 +598,9 @@ export interface PdfExtractionResult {
   fieldLocations?: Partial<Record<ExtractableFieldKey, FieldLocation>>;
   taskSuggestions?: PdfTaskSuggestion[];
   indexedPageCount?: number;
+  docNumberNeedsConfirmation?: boolean;
+  docNumberReviewReason?: string;
+  filenameDocNumberHint?: string;
 }
 
 export interface PdfAnalyzeResponse {
@@ -612,6 +615,26 @@ export interface PdfAnalyzeResponse {
   duplicateDocument: DocumentRecord | null;
   suspectedDuplicateDocument?: DocumentRecord | null;
   filenameConflictDocument?: DocumentRecord | null;
+}
+
+export interface IssuedUploadTask {
+  docId: string;
+  bookId: string;
+  bookName: string;
+  typeCode: string;
+  fullDocNumber: string;
+  docName: string;
+  driveFileName?: string;
+  driveOriginalFileName?: string;
+  hasFileOrTemplate: boolean;
+  templateId?: string;
+  driveStatus: DriveUploadStatus;
+  driveFileId?: string;
+  driveFileUrl?: string;
+  driveError?: string;
+  issuedAtMs: number;
+  issueMs?: number;
+  driveCompletedAtMs?: number;
 }
 
 export interface User {

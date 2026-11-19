@@ -1,13 +1,13 @@
 /**
  * Utility for formatting document filenames for computer & Google Drive storage.
- * Converts '/' to '.', keeps Vietnamese diacritics and natural casing in the document title,
- * and formats as "<Số ký hiệu> - <Tên văn bản>".
+ * Converts '/' to '.', keeps Vietnamese diacritics, uppercases the entire stem before extension,
+ * and formats as "<SỐ KÝ HIỆU> - <TÊN VĂN BẢN>".
  *
  * Examples:
- * - 09-KH/ĐTN + Kế hoạch tổ chức hoạt động chào mừng ngày 20-11 (.docx)
- *   => 09-KH.ĐTN - Kế hoạch tổ chức hoạt động chào mừng ngày 20-11.docx
+ * - 03-TB/ĐTN + Thông báo KQ cuộc thi video Tri ân thầy cô (.docx)
+ *   => 03-TB.ĐTN - THÔNG BÁO KQ CUỘC THI VIDEO TRI ÂN THẦY CÔ.docx
  * - 1234/SGDĐT-GDTrH + Hướng dẫn tổ chức hoạt động giáo dục (.pdf)
- *   => 1234.SGDĐT-GDTrH - Hướng dẫn tổ chức hoạt động giáo dục.pdf
+ *   => 1234.SGDĐT-GDTrH - HƯỚNG DẪN TỔ CHỨC HOẠT ĐỘNG GIÁO DỤC.pdf
  */
 
 export function removeVietnameseDiacritics(str: string): string {
@@ -33,7 +33,7 @@ export function sanitizeFileName(name: string): string {
 
 /**
  * Generates suggested document filename without extension:
- * "<Số ký hiệu (đổi / thành .)> - <Tên văn bản (giữ dấu tiếng Việt)>"
+ * "<SỐ KÝ HIỆU (đổi / thành .)> - <TÊN VĂN BẢN (in hoa toàn bộ, giữ dấu tiếng Việt)>"
  */
 export function generateSuggestedFileName(fullDocNumber: string, docName: string): string {
   const safeDocNumber = (fullDocNumber || '')
@@ -43,7 +43,8 @@ export function generateSuggestedFileName(fullDocNumber: string, docName: string
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/[. ]+$/g, '')
-    .trim();
+    .trim()
+    .toLocaleUpperCase('vi-VN');
 
   const safeDocName = (docName || '')
     .replace(/[\x00-\x1f\x7f]/g, '')
@@ -52,7 +53,8 @@ export function generateSuggestedFileName(fullDocNumber: string, docName: string
     .replace(/\s+/g, ' ')
     .trim()
     .replace(/[. ]+$/g, '')
-    .trim();
+    .trim()
+    .toLocaleUpperCase('vi-VN');
 
   if (safeDocNumber && safeDocName) {
     return `${safeDocNumber} - ${safeDocName}`;
@@ -85,8 +87,8 @@ export function getSupportedAttachmentExtension(fileNameOrExt: string): '.doc' |
 
 /**
  * Unified filename builder used for ALL uploads (internal Word attachments, PDF from URL, PDF from file).
- * Reuses the exact "<Số ký hiệu> - <Tên văn bản>.<ext>" template, converts '/' -> '.',
- * preserves Vietnamese diacritics, and keeps the target extension (.doc, .docx, .pdf).
+ * Reuses the exact "<SỐ KÝ HIỆU> - <TÊN VĂN BẢN>.<ext>" template, converts '/' -> '.',
+ * uppercases the full stem while preserving Vietnamese diacritics, and keeps the lowercase extension (.doc, .docx, .pdf).
  */
 export function buildStandardDriveFileName(
   fullDocNumber: string,
@@ -96,7 +98,8 @@ export function buildStandardDriveFileName(
   const ext = getSupportedAttachmentExtension(originalNameOrExt) || '.docx';
   let baseName = generateSuggestedFileName(fullDocNumber, docName)
     .replace(/[. ]+$/g, '')
-    .trim();
+    .trim()
+    .toLocaleUpperCase('vi-VN');
 
   if (!baseName) {
     baseName = 'VAN_BAN';
@@ -209,9 +212,9 @@ export function sanitizeCustomDriveFileName(
       cleaned = cleaned.slice(0, -anyExt.length).trim();
     }
   }
-  cleaned = cleaned.replace(/[. ]+$/g, '').trim();
+  cleaned = cleaned.replace(/[. ]+$/g, '').trim().toLocaleUpperCase('vi-VN');
   if (!cleaned) cleaned = 'VAN_BAN';
-  if (cleaned.length > 180) cleaned = cleaned.slice(0, 180).trim();
+  if (cleaned.length > 180) cleaned = cleaned.slice(0, 180).replace(/[-. ]+$/g, '').trim();
   return `${cleaned}${requiredExt}`;
 }
 

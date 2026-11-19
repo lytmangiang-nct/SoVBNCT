@@ -2,6 +2,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import zlib from 'zlib';
 import { createRequire } from 'module';
 import { execFile } from 'child_process';
 import { pathToFileURL } from 'url';
@@ -727,18 +728,170 @@ function extractBoxesFromTesseractData(
   return boxes;
 }
 
-async function renderPdfPageToPng(pdfPath: string, pageNumber: number, outPngPath: string): Promise<void> {
+async function renderPdfPageToPng(
+  pdfPath: string,
+  pageNumber: number,
+  outPngPath: string,
+  dpi = 200
+): Promise<void> {
   await execFileAsync('gs', [
     '-dNOPAUSE',
     '-dBATCH',
     '-dQUIET',
     '-sDEVICE=png16m',
-    '-r200',
+    `-r${dpi}`,
     `-dFirstPage=${pageNumber}`,
     `-dLastPage=${pageNumber}`,
     `-sOutputFile=${outPngPath}`,
     pdfPath,
   ]);
+}
+
+const PNG_CRC_TABLE = (() => {
+  const table = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) {
+      c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    }
+    table[n] = c >>> 0;
+  }
+  return table;
+})();
+
+function pngCrc32(buf: Buffer): number {
+  let c = 0xffffffff;
+  for (let i = 0; i < buf.length; i++) {
+    c = PNG_CRC_TABLE[(c ^ buf[i]) & 0xff] ^ (c >>> 8);
+  }
+  return (c ^ 0xffffffff) >>> 0;
+}
+
+function makePngChunk(type: string, data: Buffer): Buffer {
+  const typeBuf = Buffer.from(type, 'ascii');
+  const lenBuf = Buffer.alloc(4);
+  lenBuf.writeUInt32BE(data.length, 0);
+  const crcInput = Buffer.concat([typeBuf, data]);
+  const crcBuf = Buffer.alloc(4);
+  crcBuf.writeUInt32BE(pngCrc32(crcInput), 0);
+  return Buffer.concat([lenBuf, typeBuf, data, crcBuf]);
+}
+
+function cropRgbPngRegion(
+  pngPath: string,
+  outCropPath: string,
+  xFrac0: number,
+  yFrac0: number,
+  xFrac1: number,
+  yFrac1: number
+): { width: number; height: number } | null {
+  try {
+    const fileBuf = fs.readFileSync(pngPath);
+    if (fileBuf.length < 32 || fileBuf.toString('ascii', 1, 4) !== 'PNG') return null;
+
+    let offset = 8;
+    let width = 0;
+    let height = 0;
+    let bitDepth = 8;
+    let colorType = 2;
+    const idatChunks: Buffer[] = [];
+
+    while (offset + 8 <= fileBuf.length) {
+      const len = fileBuf.readUInt32BE(offset);
+      const type = fileBuf.toString('ascii', offset + 4, offset + 8);
+      const dataStart = offset + 8;
+      const dataEnd = dataStart + len;
+      if (dataEnd + 4 > fileBuf.length) break;
+      const data = fileBuf.subarray(dataStart, dataEnd);
+      if (type === 'IHDR' && data.length >= 13) {
+        width = data.readUInt32BE(0);
+        height = data.readUInt32BE(4);
+        bitDepth = data[8];
+        colorType = data[9];
+      } else if (type === 'IDAT') {
+        idatChunks.push(data);
+      } else if (type === 'IEND') {
+        break;
+      }
+      offset = dataEnd + 4;
+    }
+
+    if (!width || !height || bitDepth !== 8 || (colorType !== 2 && colorType !== 6) || idatChunks.length === 0) {
+      return null;
+    }
+
+    const bpp = colorType === 6 ? 4 : 3;
+    const stride = width * bpp;
+    const raw = zlib.inflateSync(Buffer.concat(idatChunks));
+    if (raw.length < height * (stride + 1)) return null;
+
+    const recon = Buffer.alloc(height * stride);
+    const paethPredictor = (a: number, b: number, c: number) => {
+      const p = a + b - c;
+      const pa = Math.abs(p - a);
+      const pb = Math.abs(p - b);
+      const pc = Math.abs(p - c);
+      if (pa <= pb && pa <= pc) return a;
+      if (pb <= pc) return b;
+      return c;
+    };
+
+    for (let y = 0; y < height; y++) {
+      const filterType = raw[y * (stride + 1)];
+      const rowInStart = y * (stride + 1) + 1;
+      const rowOutStart = y * stride;
+      const prevOutStart = (y - 1) * stride;
+      for (let x = 0; x < stride; x++) {
+        const val = raw[rowInStart + x];
+        const a = x >= bpp ? recon[rowOutStart + x - bpp] : 0;
+        const b = y > 0 ? recon[prevOutStart + x] : 0;
+        const c = y > 0 && x >= bpp ? recon[prevOutStart + x - bpp] : 0;
+        let resByte = val;
+        if (filterType === 1) resByte = (val + a) & 0xff;
+        else if (filterType === 2) resByte = (val + b) & 0xff;
+        else if (filterType === 3) resByte = (val + ((a + b) >> 1)) & 0xff;
+        else if (filterType === 4) resByte = (val + paethPredictor(a, b, c)) & 0xff;
+        recon[rowOutStart + x] = resByte;
+      }
+    }
+
+    const cx0 = Math.max(0, Math.min(width - 1, Math.floor(xFrac0 * width)));
+    const cy0 = Math.max(0, Math.min(height - 1, Math.floor(yFrac0 * height)));
+    const cx1 = Math.max(cx0 + 1, Math.min(width, Math.ceil(xFrac1 * width)));
+    const cy1 = Math.max(cy0 + 1, Math.min(height, Math.ceil(yFrac1 * height)));
+    const cropW = cx1 - cx0;
+    const cropH = cy1 - cy0;
+    const cropStride = cropW * bpp;
+    const cropRaw = Buffer.alloc(cropH * (cropStride + 1));
+
+    for (let y = 0; y < cropH; y++) {
+      const srcOffset = (cy0 + y) * stride + cx0 * bpp;
+      const dstOffset = y * (cropStride + 1);
+      cropRaw[dstOffset] = 0; // None filter
+      recon.copy(cropRaw, dstOffset + 1, srcOffset, srcOffset + cropStride);
+    }
+
+    const sig = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]);
+    const ihdr = Buffer.alloc(13);
+    ihdr.writeUInt32BE(cropW, 0);
+    ihdr.writeUInt32BE(cropH, 4);
+    ihdr[8] = 8;
+    ihdr[9] = colorType;
+    ihdr[10] = 0;
+    ihdr[11] = 0;
+    ihdr[12] = 0;
+    const compressed = zlib.deflateSync(cropRaw, { level: 4 });
+    const outPng = Buffer.concat([
+      sig,
+      makePngChunk('IHDR', ihdr),
+      makePngChunk('IDAT', compressed),
+      makePngChunk('IEND', Buffer.alloc(0)),
+    ]);
+    fs.writeFileSync(outCropPath, outPng);
+    return { width: cropW, height: cropH };
+  } catch {
+    return null;
+  }
 }
 
 interface OcrPageResult {
@@ -1127,7 +1280,16 @@ function extractDocNumberFromSoValue(rawAfterLabel: string): string {
   const primaryMatch = cleaned.match(
     /^([0-9]{1,5}[\/\-][\p{L}\p{N}_\-\.\/]+)/u
   );
-  let candidate = primaryMatch ? primaryMatch[1] : cleaned.split(/\s+/)[0] || '';
+  let candidate = primaryMatch ? primaryMatch[1] : '';
+  if (!candidate) {
+    // Ghi nhận cả trường hợp thiếu phần số đứng trước dấu "/" (ví dụ "/QĐ-SGDĐT") để cảnh báo cần kiểm tra
+    const suffixOnlyMatch = cleaned.match(/^(\/[\p{L}][\p{L}\p{N}_\-\.\/]*)/u);
+    if (suffixOnlyMatch) {
+      candidate = suffixOnlyMatch[1];
+    } else {
+      candidate = cleaned.split(/\s+/)[0] || '';
+    }
+  }
   candidate = candidate.replace(/[.,;:\)]+$/g, '').trim();
   if (!candidate) return '';
   if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/.test(candidate)) return '';
@@ -1140,8 +1302,8 @@ function isSoLabelLine(lineText: string): boolean {
   if (/^(?:S[ốoôơ6](?:\s*\/\s*K[ýy]\s*hi[ệe]u)?)\s*[:\.]/i.test(cleaned)) {
     return true;
   }
-  // Hỗ trợ cả "Số 2937/QĐ-SGDĐT" lẫn thiếu dấu hai chấm/khoảng trắng "Số2937 /QĐ-SGDĐT"
-  if (/^S[ốoôơ6]\s*\d{1,5}\s*[\/\-]/i.test(cleaned)) {
+  // Hỗ trợ "Số2937 /QĐ-SGDĐT", "Số 2937/QĐ-SGDĐT" lẫn "Số /QĐ-SGDĐT"
+  if (/^S[ốoôơ6](?:\s*\d{1,5})?\s*[\/\-]/i.test(cleaned) || /^S[ốoôơ6]\s+\d{1,5}(?:\s|$)/i.test(cleaned)) {
     return true;
   }
   return false;
@@ -1159,7 +1321,7 @@ function extractValueFromSoLine(lineText: string): string {
 function extractDocNumberCandidates(text: string): string[] {
   if (!text) return [];
   const regex =
-    /(?:S[ốoôơ6]|Số\s*\/\s*Ký\s*hiệu)\s*[:\.]?[ \t]*([0-9]{1,5}[ \t]*[\/\-][ \t]*[\p{L}\p{N}_\-\.\/]+(?:[ \t]*[\-\/][ \t]*[\p{L}\p{N}_\-\.]+)*)/giu;
+    /(?:S[ốoôơ6]|Số\s*\/\s*Ký\s*hiệu)\s*[:\.]?[ \t]*([0-9]{0,5}[ \t]*[\/\-][ \t]*[\p{L}\p{N}_\-\.\/]+(?:[ \t]*[\-\/][ \t]*[\p{L}\p{N}_\-\.]+)*)/giu;
   const results: string[] = [];
   const seen = new Set<string>();
 
@@ -1172,7 +1334,6 @@ function extractDocNumberCandidates(text: string): string[] {
 
     num = num.split(/\s+/)[0] || '';
     if (!num) continue;
-    // Bỏ qua nếu vô tình bắt nhầm ngày dạng 14/11/2026
     if (/^\d{1,2}[\/\-]\d{1,2}[\/\-]\d{2,4}$/.test(num)) continue;
     const key = num.toLowerCase();
     if (!seen.has(key)) {
@@ -1181,6 +1342,53 @@ function extractDocNumberCandidates(text: string): string[] {
     }
   }
   return results;
+}
+
+function isIncompleteOrSuspiciousDocNumber(val: string): { suspicious: boolean; reason: string } {
+  const trimmed = (val || '').trim();
+  if (!trimmed) {
+    return {
+      suspicious: true,
+      reason: 'Chưa nhận diện được Số/ký hiệu văn bản ở góc trên bên trái trang 1.',
+    };
+  }
+  if (/^[\/\-]/.test(trimmed)) {
+    return {
+      suspicious: true,
+      reason: `Số/ký hiệu đọc được ("${trimmed}") đang thiếu chữ số gốc đứng trước dấu "/". Vui lòng đối chiếu bản PDF gốc và bổ sung đủ số văn bản.`,
+    };
+  }
+  if (!/\d/.test(trimmed)) {
+    return {
+      suspicious: true,
+      reason: `Số/ký hiệu đọc được ("${trimmed}") chưa có phần chữ số rõ ràng. Vui lòng kiểm tra lại với bản PDF gốc.`,
+    };
+  }
+  if (!/[\/\-]/.test(trimmed)) {
+    return {
+      suspicious: true,
+      reason: `Số/ký hiệu đọc được ("${trimmed}") có thể bị thiếu phần ký hiệu sau dấu "/". Vui lòng kiểm tra lại.`,
+    };
+  }
+  if (/[\uFFFD?]/.test(trimmed)) {
+    return {
+      suspicious: true,
+      reason: `Số/ký hiệu đọc được ("${trimmed}") có ký tự lỗi phông chữ. Vui lòng kiểm tra lại.`,
+    };
+  }
+  return { suspicious: false, reason: '' };
+}
+
+export function extractFilenameDocNumberHint(fileName: string): string {
+  const base = (fileName || '').replace(/\.[^.]+$/, '').trim();
+  if (!base) return '';
+  // Tìm mẫu số văn bản phổ biến trong tên tệp (vd "2937-QD-SGDDT", "2937.QD-SGDDT", "03-TB.DTN", "2937_QD-SGDDT")
+  const match = base.match(/(?:^|[^\d])(\d{1,5}[.\-\/_][A-Za-zÀ-ỹĐđ]{1,8}(?:[.\-\/_][A-Za-zÀ-ỹĐđ0-9]+)*)/i);
+  if (!match) return '';
+  const raw = match[1].trim();
+  if (/^\d{1,2}[.\-\/]\d{1,2}[.\-\/]\d{2,4}$/.test(raw)) return '';
+  const normalized = raw.replace(/^(\d{1,5})[._\-/]/, '$1/').replace(/[._]+/g, '-');
+  return normalized;
 }
 
 function isMostlyUppercaseLine(str: string): boolean {
@@ -1792,10 +2000,24 @@ const SIGNER_ROLE_REGEX =
   /^(?:KT\.|TM\.|Q\.|TL\.|TUQ\.|GIAM DOC|PHO GIAM DOC|CHU TICH|PHO CHU TICH|HIEU TRUONG|PHO HIEU TRUONG|BI THU|PHO BI THU|TRUONG PHONG|PHO TRUONG PHONG|CHANH VAN PHONG|PHO CHANH VAN PHONG|TRUONG BAN|PHO TRUONG BAN|THU TRUONG|CUC TRUONG|PHO CUC TRUONG|VU TRUONG|CHU NHIEM|PHO CHU NHIEM|BO TRUONG|THU TUONG|PHO THU TUONG|QUYEN HIEU TRUONG|QUYEN GIAM DOC|TONG BIEN TAP|PHO TONG BIEN TAP|UY VIEN)/i;
 
 const NON_NAME_LINE_REGEX =
-  /^(CONG HOA|DOC LAP|NOI NHAN|DA KY|SO GIAO DUC|UY BAN NHAN DAN|THANH PHO|TINH |TRUONG THPT|DOAN TRUONG|PHONG GIAO DUC|BO GIAO DUC|PHU LUC|THE LE|KT\.|TM\.|TL\.|TUQ\.|Q\.|BAN GIAM HIEU|BAN TO CHUC)/i;
+  /^(CONG HOA|DOC LAP|HANH PHUC|CHU NGHIA|VIET NAM|NOI NHAN|DA KY|SO GIAO DUC|UY BAN NHAN DAN|THANH PHO|TINH |TRUONG THPT|DOAN TRUONG|PHONG GIAO DUC|BO GIAO DUC|PHU LUC|THE LE|KT\.|TM\.|TL\.|TUQ\.|Q\.|BAN GIAM HIEU|BAN TO CHUC|KE HOACH|QUYET DINH|THONG BAO|BAO CAO|CHUONG TRINH|CONG VAN|DINH KEM|BAN HANH|VAN BAN|LUU|KINH GUI)/i;
 
 const SKIP_SIG_LINE_REGEX =
   /^(Noi nhan|Luu|-\s*Nhu tren|Kinh gui|Ngay ky|Thoi gian ky|Ky boi|\(?Da ky\)?|\(?Ky,?\s*(?:ghi ro ho ten|dong dau|ten).*?\)?)/i;
+
+const DIGITAL_SIG_NOISE_REGEX =
+  /(?:smartca|vnpt|viettel[\-\s]?ca|bkav|newca|trustca|\bca2\b|fpt[\-\s]?ca|safe[\-\s]?ca|efy[\-\s]?ca|itext|itextsharp|adobe|acrobat|foxit|signature\s+valid|digitally\s+signed|signed\s+by\s+system|certificate|serial(?:\s*number)?|issuer|timestamp|revocation|valid\s+from|chung\s+thu\s+so|to\s+chuc\s+cap|phan\s+mem\s+ky|chu\s+ky\s+so\s+hop\s+le|\bCN\s*=|\bO\s*=|\bOU\s*=|\bC\s*=\s*VN\b)/i;
+
+function isDigitalSignatureNoise(rawLine: string): boolean {
+  const s = (rawLine || '').trim();
+  if (!s) return true;
+  const norm = removeVietnameseDiacritics(s);
+  if (DIGITAL_SIG_NOISE_REGEX.test(norm)) return true;
+  // Chuỗi phiên bản phần mềm (vd 5.5.13, v2.1.0) hoặc OID kỹ thuật
+  if (/\bv?\d+\.\d+\.\d+(?:\.\d+)?\b/i.test(s)) return true;
+  if (/\b1\.\d+\.\d+\.\d+\b/.test(s)) return true;
+  return false;
+}
 
 function cleanOcrStampNoiseFromName(rawLine: string): string {
   return (rawLine || '')
@@ -1803,6 +2025,42 @@ function cleanOcrStampNoiseFromName(rawLine: string): string {
     .replace(/[\s\-–—•*·|~`'":;.,()\[\]{}\/\\0-9]+$/, '')
     .replace(/\s+/g, ' ')
     .trim();
+}
+
+function isLikelyVietnamesePersonName(cand: string): boolean {
+  const s = (cand || '').trim();
+  if (!s || s.length < 4 || s.length > 60) return false;
+  if (/\d/.test(s)) return false;
+  if (isDigitalSignatureNoise(s)) return false;
+
+  const norm = removeVietnameseDiacritics(s);
+  if (
+    DELEGATION_PREFIX_REGEX.test(norm) ||
+    SIGNER_ROLE_REGEX.test(norm) ||
+    NON_NAME_LINE_REGEX.test(norm) ||
+    SKIP_SIG_LINE_REGEX.test(norm)
+  ) {
+    return false;
+  }
+
+  const words = s.split(/\s+/).filter(Boolean);
+  if (words.length < 2 || words.length > 5) return false;
+
+  // Cho phép cả Title Case ("Huỳnh Văn Hóa") lẫn IN HOA toàn bộ ("HUỲNH VĂN HÓA")
+  const allWordsCapitalized = words.every((w) => /^[\p{Lu}][\p{L}]{0,18}$/u.test(w));
+  if (!allWordsCapitalized) return false;
+
+  // Nếu dòng IN HOA toàn bộ, loại trừ các cụm hành chính thường đứng gần khối ký
+  if (isMostlyUppercaseLine(s)) {
+    if (
+      /\b(?:CONG HOA|XA HOI|DOC LAP|HANH PHUC|GIAO DUC|DAO TAO|TRUONG|SO |PHONG |BAN |UBND|BO |CHI BO|DOAN|TINH |HUYEN|THANH PHO|QUYET DINH|THONG BAO|KE HOACH|PHU LUC)\b/i.test(
+        norm
+      )
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
 
 function chooseBestSignerRole(roleLines: string[]): string {
@@ -1826,46 +2084,32 @@ function extractSignersFromZoneText(
   const found: Array<{ name: string; role: string; page: number }> = [];
   if (!zoneText) return found;
 
-  // 1. Mẫu chữ ký số ("Ký bởi: Nguyễn Văn A", "Người ký: ...", "Signed by: ...")
-  const digitalMatches = zoneText.matchAll(
-    /(?:K[ýy]\s+b[ởơ]i|Ng[ườờ]i\s+k[ýy]|Signed\s+by)\s*[:\-]\s*([^\n,;]{3,70})/gi
-  );
-  for (const dm of digitalMatches) {
-    const candName = dm[1].replace(/\([^)]*\)/g, '').trim();
-    const normCand = removeVietnameseDiacritics(candName);
-    if (candName.length >= 4 && !DELEGATION_PREFIX_REGEX.test(normCand) && !SIGNER_ROLE_REGEX.test(normCand)) {
-      found.push({ name: candName, role: '', page: pageNumber });
-    }
-  }
-
-  // 2. Khối chức vụ + tên người ký bên dưới (chịu nhiễu con dấu đỏ / chữ ký chồng lên)
+  // 1. Mẫu chức vụ + tên người ký ở vùng chữ ký hiển thị trên trang PDF (ưu tiên hơn text chữ ký số)
   const lines = zoneText
     .split('\n')
     .map((l) => l.trim())
     .filter(Boolean);
 
   for (let i = 0; i < lines.length; i++) {
+    if (isDigitalSignatureNoise(lines[i])) continue;
     const normLine = removeVietnameseDiacritics(lines[i]);
     if (SIGNER_ROLE_REGEX.test(normLine)) {
       const roleParts = [lines[i]];
       let nameLine = '';
-      for (let j = i + 1; j < Math.min(i + 15, lines.length); j++) {
+      for (let j = i + 1; j < Math.min(i + 16, lines.length); j++) {
         const rawL = lines[j];
+        if (isDigitalSignatureNoise(rawL)) continue;
         const l = cleanOcrStampNoiseFromName(rawL);
+        if (!l || isDigitalSignatureNoise(l)) continue;
         const normL = removeVietnameseDiacritics(l);
-        if (!l || SKIP_SIG_LINE_REGEX.test(normL)) {
+        if (SKIP_SIG_LINE_REGEX.test(normL)) {
           continue;
         }
         if (SIGNER_ROLE_REGEX.test(normL) && j <= i + 3) {
           roleParts.push(l);
           continue;
         }
-        // Bỏ qua các mảnh chữ rời hoặc nhiễu con dấu (vd: 1-2 ký tự, hoặc toàn chữ hoa tên cơ quan)
-        if (DELEGATION_PREFIX_REGEX.test(normL) || NON_NAME_LINE_REGEX.test(normL) || SIGNER_ROLE_REGEX.test(normL)) {
-          continue;
-        }
-        // Tên người Việt: 2-6 từ bắt đầu chữ hoa (Title Case hoặc có dấu), không chứa số
-        if (/^[\p{Lu}][\p{L}]+(?:\s+[\p{Lu}][\p{L}]+){1,5}$/u.test(l) && !isMostlyUppercaseLine(l)) {
+        if (isLikelyVietnamesePersonName(l)) {
           nameLine = l;
           break;
         }
@@ -1877,6 +2121,25 @@ function extractSignersFromZoneText(
           page: pageNumber,
         });
       }
+    }
+  }
+
+  // 2. Mẫu nhãn tường minh ("Ký bởi: Nguyễn Văn A", "Người ký: ...", "Signed by: ...") - lọc bỏ CA/phần mềm
+  const digitalMatches = zoneText.matchAll(
+    /(?:K[ýy]\s+b[ởơ]i|Ng[ườờ]i\s+k[ýy]|Signed\s+by)\s*[:\-]\s*([^\n,;]{3,70})/gi
+  );
+  for (const dm of digitalMatches) {
+    const rawSeg = dm[1]
+      .replace(/\([^)]*\)/g, '')
+      .replace(/(?:Ng[àa]y\s+k[ýy]|Time|Date|Serial).*$/i, '')
+      .trim();
+    const candName = cleanOcrStampNoiseFromName(rawSeg);
+    if (
+      candName.length >= 4 &&
+      isLikelyVietnamesePersonName(candName) &&
+      !found.some((f) => f.name.toLowerCase() === candName.toLowerCase())
+    ) {
+      found.push({ name: candName, role: '', page: pageNumber });
     }
   }
 
@@ -1904,23 +2167,29 @@ function extractSignerInfo(
   const candidates: Array<{ name: string; role: string; page: number }> = [];
 
   for (const p of signaturePages) {
-    // Ưu tiên góc dưới bên phải -> nửa phải -> nửa dưới -> toàn trang (kèm annotation chữ ký số)
+    // Ưu tiên các vùng chữ ký hiển thị trên trang TRƯỚC; KHÔNG trộn annotation chữ ký số vào trước khi đọc chữ ký hiển thị
     const zones = [p.rightBottomText, p.rightHalfText, p.bottomText, p.fullText].filter(
       (z) => z && z.trim().length > 0
     );
 
     let pageCandidates: Array<{ name: string; role: string; page: number }> = [];
     for (const zone of zones) {
-      const mergedZone = [zone, p.annotationText].filter(Boolean).join('\n');
-      const matches = extractSignersFromZoneText(mergedZone, p.pageNumber);
+      const matches = extractSignersFromZoneText(zone, p.pageNumber);
       if (matches.length > 0) {
         pageCandidates = matches;
         break;
       }
     }
 
+    // Chỉ dùng annotationText làm nguồn phụ khi vùng hiển thị trên trang không có tên người ký hợp lệ
     if (pageCandidates.length === 0 && p.annotationText) {
-      pageCandidates = extractSignersFromZoneText(p.annotationText, p.pageNumber);
+      const cleanAnnotLines = p.annotationText
+        .split('\n')
+        .filter((l) => !isDigitalSignatureNoise(l))
+        .join('\n');
+      if (cleanAnnotLines) {
+        pageCandidates = extractSignersFromZoneText(cleanAnnotLines, p.pageNumber);
+      }
     }
 
     if (pageCandidates.length > 0) {
@@ -1931,12 +2200,13 @@ function extractSignerInfo(
   }
 
   for (const rs of rawSigSigners) {
-    const cleanRs = rs.trim();
-    const normRs = removeVietnameseDiacritics(cleanRs);
+    let cleanRs = rs.trim();
+    const cnMatch = cleanRs.match(/CN=([^,\/]+)/i);
+    if (cnMatch) cleanRs = cnMatch[1].trim();
+    cleanRs = cleanOcrStampNoiseFromName(cleanRs);
     if (
       cleanRs &&
-      !DELEGATION_PREFIX_REGEX.test(normRs) &&
-      !SIGNER_ROLE_REGEX.test(normRs) &&
+      isLikelyVietnamesePersonName(cleanRs) &&
       !candidates.some((c) => c.name.toLowerCase() === cleanRs.toLowerCase())
     ) {
       candidates.push({
@@ -1947,15 +2217,16 @@ function extractSignerInfo(
     }
   }
 
-  // Khử trùng giữ thứ tự
+  // Khử trùng giữ thứ tự và loại bỏ hoàn toàn các tên nhiễu CA/phần mềm nếu còn sót
+  const filteredCandidates = candidates.filter((c) => !isDigitalSignatureNoise(c.name));
   const uniqueNames: string[] = [];
-  for (const c of candidates) {
+  for (const c of filteredCandidates) {
     if (!uniqueNames.some((n) => n.toLowerCase() === c.name.toLowerCase())) {
       uniqueNames.push(c.name);
     }
   }
 
-  const primary = candidates[0];
+  const primary = filteredCandidates[0];
   return {
     signer: primary?.name || '',
     signerRole: primary?.role || '',
@@ -2102,6 +2373,110 @@ async function extractMetadataWithGemini(params: {
   }
 }
 
+async function runTopLeftHeader300DpiFallback(buffer: Buffer): Promise<{
+  text: string;
+  boxes: NormalizedBox[];
+  visionDocNumber?: string;
+}> {
+  const cropWFrac = 0.58;
+  const cropHFrac = 0.42;
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'nct-hdr-ocr-'));
+  const pdfPath = path.join(tmpDir, 'input.pdf');
+  const pagePng = path.join(tmpDir, 'page1-300.png');
+  const cropPng = path.join(tmpDir, 'page1-top-left.png');
+  fs.writeFileSync(pdfPath, buffer);
+
+  let worker: any = null;
+  let ocrText = '';
+  let mappedBoxes: NormalizedBox[] = [];
+  let visionDocNumber = '';
+
+  try {
+    await renderPdfPageToPng(pdfPath, 1, pagePng, 300);
+    if (fs.existsSync(pagePng)) {
+      const cropMeta = cropRgbPngRegion(pagePng, cropPng, 0, 0, cropWFrac, cropHFrac);
+      const imagePath = cropMeta && fs.existsSync(cropPng) ? cropPng : pagePng;
+      const effXScale = cropMeta ? cropWFrac : 1;
+      const effYScale = cropMeta ? cropHFrac : 1;
+
+      try {
+        const { createWorker } = await import('tesseract.js');
+        const langPath = path.resolve(process.cwd(), 'node_modules/@tesseract.js-data/vie/4.0.0');
+        const workerOpts: any = fs.existsSync(path.join(langPath, 'vie.traineddata.gz'))
+          ? { langPath, gzip: true }
+          : {};
+        worker = await createWorker('vie', 1, workerOpts);
+        const dims = getPngDimensions(imagePath);
+        const ret = await worker.recognize(imagePath, {}, { blocks: true });
+        const rawBoxes = extractBoxesFromTesseractData(ret?.data, dims.width, dims.height);
+        mappedBoxes = rawBoxes.map((b) => ({
+          ...b,
+          x0: clamp01(b.x0 * effXScale),
+          x1: clamp01(b.x1 * effXScale),
+          y0: clamp01(b.y0 * effYScale),
+          y1: clamp01(b.y1 * effYScale),
+          height: b.height * effYScale,
+        }));
+        ocrText = (mappedBoxes.length > 0 ? boxesToText(mappedBoxes) : (ret?.data?.text || '')).trim();
+      } catch (ocrErr: any) {
+        console.warn('[PDF 300DPI Header OCR] Lỗi OCR vùng tiêu đề góc trên trái:', ocrErr?.message);
+      }
+
+      const apiKey = (process.env.GEMINI_API_KEY || '').trim();
+      if (apiKey && fs.existsSync(imagePath)) {
+        try {
+          const { GoogleGenAI, Type } = await import('@google/genai');
+          const ai = new GoogleGenAI({
+            apiKey,
+            httpOptions: { headers: { 'User-Agent': 'aistudio-build' } },
+          });
+          const imgBuf = fs.readFileSync(imagePath);
+          const resp = await ai.models.generateContent({
+            model: 'gemini-4-hydrogen',
+            contents: [
+              {
+                role: 'user',
+                parts: [
+                  { inlineData: { mimeType: 'image/png', data: imgBuf.toString('base64') } },
+                  {
+                    text: 'Đọc chính xác Số/ký hiệu văn bản ở dòng "Số:" trong ảnh vùng góc trên bên trái trang 1 (giữ nguyên số 0 đứng đầu nếu có, chuẩn hóa dạng 2937/QĐ-SGDĐT). Nếu không chắc chắn từng chữ số, trả về chuỗi rỗng.',
+                  },
+                ],
+              },
+            ],
+            config: {
+              responseMimeType: 'application/json',
+              responseSchema: {
+                type: Type.OBJECT,
+                properties: {
+                  docNumber: { type: Type.STRING },
+                },
+              },
+            },
+          });
+          const parsed = JSON.parse((resp.text || '{}').trim());
+          if (typeof parsed?.docNumber === 'string' && parsed.docNumber.trim()) {
+            visionDocNumber = extractDocNumberFromSoValue(
+              parsed.docNumber.replace(/^S[ốo]\s*[:\.]?\s*/i, '')
+            );
+          }
+        } catch {
+          // ignore optional vision assist errors
+        }
+      }
+    }
+  } catch (err: any) {
+    console.warn('[PDF 300DPI Header] Không thể render trang 1 ở 300 DPI:', err?.message);
+  } finally {
+    if (worker) {
+      await worker.terminate().catch(() => {});
+    }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+
+  return { text: ocrText, boxes: mappedBoxes, visionDocNumber: visionDocNumber || undefined };
+}
+
 export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   sha256: string;
   extraction: PdfExtractionResult;
@@ -2201,11 +2576,52 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   let docNumber = headerAnalysis.docNumber;
   let usedFallbackDocNumber = false;
   let fallbackDocNumbers: string[] = [];
+  let docNumberBBoxOverride: NormalizedBBox | undefined = headerAnalysis.docNumberBBox;
+  let docNumberConflictDetected = false;
+  let docNumberConflictDetail = '';
 
   if (!docNumber) {
     fallbackDocNumbers = extractDocNumberCandidates(page1Text);
     docNumber = fallbackDocNumbers[0] || '';
     usedFallbackDocNumber = Boolean(docNumber);
+  }
+
+  // Kiểm tra bất thường Số văn bản ở góc trên bên trái: thiếu phần số ("/QĐ-...") hoặc trống hoặc có cảnh báo
+  const initialSuspicious = isIncompleteOrSuspiciousDocNumber(docNumber);
+  if (
+    initialSuspicious.suspicious ||
+    !page1HasPdfBoxes ||
+    headerAnalysis.docNumberNeedsReview
+  ) {
+    const croppedFallback = await runTopLeftHeader300DpiFallback(buffer);
+    const cropHeader =
+      croppedFallback.boxes.length > 0
+        ? analyzeTopLeftHeader(croppedFallback.boxes, [])
+        : null;
+    const cropCandidates = [
+      cropHeader?.docNumber || '',
+      ...extractDocNumberCandidates(croppedFallback.text),
+      croppedFallback.visionDocNumber || '',
+    ]
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+    const completeCropCandidate = cropCandidates.find(
+      (c) => !isIncompleteOrSuspiciousDocNumber(c).suspicious
+    );
+
+    if (completeCropCandidate) {
+      usedOcr = true;
+      if (!docNumber || initialSuspicious.suspicious) {
+        docNumber = completeCropCandidate;
+        if (!docNumberBBoxOverride && cropHeader?.docNumberBBox) {
+          docNumberBBoxOverride = cropHeader.docNumberBBox;
+        }
+      } else if (docNumber.toLowerCase() !== completeCropCandidate.toLowerCase()) {
+        docNumberConflictDetected = true;
+        docNumberConflictDetail = `Số văn bản từ lớp chữ ("${docNumber}") khác với kết quả đọc vùng tiêu đề ("${completeCropCandidate}"). Vui lòng đối chiếu bản PDF gốc.`;
+      }
+    }
   }
 
   let parentAgency = headerAnalysis.parentAgency;
@@ -2319,8 +2735,20 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     const cleanGeminiDocNum = geminiResult.docNumber
       ? extractDocNumberFromSoValue(geminiResult.docNumber.replace(/^S[ốo]\s*[:\.]?\s*/i, ''))
       : '';
-    if (!docNumber && cleanGeminiDocNum) {
-      docNumber = cleanGeminiDocNum;
+    if ((!docNumber || isIncompleteOrSuspiciousDocNumber(docNumber).suspicious) && cleanGeminiDocNum) {
+      if (!isIncompleteOrSuspiciousDocNumber(cleanGeminiDocNum).suspicious || !docNumber) {
+        docNumber = cleanGeminiDocNum;
+      }
+    } else if (
+      docNumber &&
+      cleanGeminiDocNum &&
+      !isIncompleteOrSuspiciousDocNumber(cleanGeminiDocNum).suspicious &&
+      docNumber.toLowerCase() !== cleanGeminiDocNum.toLowerCase()
+    ) {
+      docNumberConflictDetected = true;
+      docNumberConflictDetail =
+        docNumberConflictDetail ||
+        `Số văn bản đọc từ bố cục ("${docNumber}") khác với nhận diện bổ sung ("${cleanGeminiDocNum}"). Vui lòng đối chiếu bản PDF gốc.`;
     }
     if (!parentAgency && geminiResult.parentAgency?.trim()) {
       parentAgency = geminiResult.parentAgency.replace(/\s+/g, ' ').trim();
@@ -2336,8 +2764,7 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     }
     if (!signer && geminiResult.signer?.trim()) {
       const candSigner = cleanOcrStampNoiseFromName(geminiResult.signer.trim());
-      const normCandSigner = removeVietnameseDiacritics(candSigner);
-      if (candSigner && !DELEGATION_PREFIX_REGEX.test(normCandSigner) && !SIGNER_ROLE_REGEX.test(normCandSigner)) {
+      if (candSigner && isLikelyVietnamesePersonName(candSigner)) {
         signer = candSigner;
       }
     }
@@ -2406,6 +2833,27 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     signDate = d2;
   }
 
+  const finalDocNumCheck = isIncompleteOrSuspiciousDocNumber(docNumber);
+  let docNumberNeedsConfirmation = false;
+  let docNumberReviewReason = '';
+
+  if (finalDocNumCheck.suspicious) {
+    docNumberNeedsConfirmation = true;
+    docNumberReviewReason = finalDocNumCheck.reason;
+  } else if (docNumberConflictDetected && docNumberConflictDetail) {
+    docNumberNeedsConfirmation = true;
+    docNumberReviewReason = docNumberConflictDetail;
+  } else if (headerAnalysis.docNumberNeedsReview && headerAnalysis.docNumberReviewReason) {
+    docNumberNeedsConfirmation = true;
+    docNumberReviewReason = headerAnalysis.docNumberReviewReason;
+  } else if (usedFallbackDocNumber) {
+    docNumberNeedsConfirmation = true;
+    docNumberReviewReason =
+      fallbackDocNumbers.length > 1
+        ? `Chưa xác định rõ dòng "Số" ở góc trên bên trái; phát hiện nhiều số trong trang đầu (${fallbackDocNumbers.join(', ')}), vui lòng kiểm tra đúng số gốc.`
+        : 'Chưa xác định rõ dòng "Số" ngay dưới khối cơ quan ở góc trên bên trái, vui lòng kiểm tra lại Số/ký hiệu đã trích xuất.';
+  }
+
   const reviewReasons: string[] = [];
   if (usedOcr) {
     if (ocrUnavailableReason && ocrConfidence === undefined) {
@@ -2416,16 +2864,8 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
       reviewReasons.push('Văn bản dạng bản scan đã nhận diện bằng OCR tiếng Việt, vui lòng rà soát trước khi lưu.');
     }
   }
-  if (!docNumber) {
-    reviewReasons.push('Chưa nhận diện được Số/ký hiệu văn bản.');
-  } else if (headerAnalysis.docNumberNeedsReview && headerAnalysis.docNumberReviewReason) {
-    reviewReasons.push(headerAnalysis.docNumberReviewReason);
-  } else if (usedFallbackDocNumber) {
-    reviewReasons.push(
-      fallbackDocNumbers.length > 1
-        ? `Chưa xác định rõ dòng "Số" ở góc trên bên trái; phát hiện nhiều số trong trang đầu (${fallbackDocNumbers.join(', ')}), vui lòng kiểm tra đúng số gốc.`
-        : 'Chưa xác định rõ dòng "Số" ngay dưới khối cơ quan ở góc trên bên trái, vui lòng kiểm tra lại Số/ký hiệu đã trích xuất.'
-    );
+  if (docNumberReviewReason) {
+    reviewReasons.push(docNumberReviewReason);
   }
   if (headerAnalysis.agencyNeedsReview && headerAnalysis.agencyReviewReason) {
     reviewReasons.push(headerAnalysis.agencyReviewReason);
@@ -2453,10 +2893,14 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
   const fieldLocations: Partial<Record<ExtractableFieldKey, FieldLocation>> = {};
 
   if (docNumber) {
-    const bbox = headerAnalysis.docNumberBBox || findLinesBBoxByQuery(page1Boxes, docNumber, 0, 0.48);
-    fieldLocations.docNumber = bbox ? { page: 1, bbox } : { page: 1, estimated: true };
+    const bbox = docNumberBBoxOverride || findLinesBBoxByQuery(page1Boxes, docNumber, 0, 0.48);
+    fieldLocations.docNumber = bbox
+      ? { page: 1, bbox }
+      : { page: 1, estimated: true, bbox: { x0: 0.04, y0: 0.08, x1: 0.48, y1: 0.30 } };
   } else {
-    fieldLocations.docNumber = { page: 1, estimated: true };
+    fieldLocations.docNumber = docNumberBBoxOverride
+      ? { page: 1, estimated: true, bbox: docNumberBBoxOverride }
+      : { page: 1, estimated: true, bbox: { x0: 0.04, y0: 0.08, x1: 0.48, y1: 0.30 } };
   }
 
   if (parentAgency) {
@@ -2533,6 +2977,8 @@ export async function analyzePdfBuffer(buffer: Buffer): Promise<{
     pageTexts,
     extraction: {
       docNumber,
+      docNumberNeedsConfirmation,
+      docNumberReviewReason: docNumberReviewReason || undefined,
       docName,
       title,
       documentDate,
