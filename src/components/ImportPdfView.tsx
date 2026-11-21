@@ -1305,20 +1305,32 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                         )}
                       </div>
                     </div>
-                    <label
-                      className={`inline-flex items-center gap-2 px-2.5 py-1.5 bg-white border border-amber-300 rounded-md font-semibold text-amber-950 ${
-                        docNumberIncomplete ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
-                      }`}
-                    >
-                      <input
-                        type="checkbox"
-                        checked={docNumberConfirmed && !docNumberIncomplete}
-                        disabled={docNumberIncomplete}
-                        onChange={(e) => setDocNumberConfirmed(e.target.checked)}
-                        className="rounded border-amber-400 text-amber-700"
-                      />
-                      <span>Tôi đã đối chiếu số/ký hiệu với bản PDF gốc</span>
-                    </label>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <label
+                        className={`inline-flex items-center gap-2 px-2.5 py-1.5 bg-white border border-amber-300 rounded-md font-semibold text-amber-950 ${
+                          docNumberIncomplete ? 'opacity-60 cursor-not-allowed' : 'cursor-pointer'
+                        }`}
+                      >
+                        <input
+                          type="checkbox"
+                          checked={docNumberConfirmed && !docNumberIncomplete}
+                          disabled={docNumberIncomplete}
+                          onChange={(e) => setDocNumberConfirmed(e.target.checked)}
+                          className="rounded border-amber-400 text-amber-700"
+                        />
+                        <span>Tôi đã đối chiếu số/ký hiệu với bản PDF gốc</span>
+                      </label>
+                      {analysis.extraction.fieldLocations?.docNumber && (
+                        <button
+                          type="button"
+                          onClick={() => handleLocateField('docNumber', 'Số/ký hiệu')}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 bg-white hover:bg-sky-50 border border-sky-300 text-sky-800 font-semibold rounded-md transition-colors"
+                        >
+                          <Crosshair className="w-3.5 h-3.5 shrink-0" />
+                          <span>Xem vị trí số văn bản (Tr.{analysis.extraction.fieldLocations.docNumber.page})</span>
+                        </button>
+                      )}
+                    </div>
                   </div>
                 )}
               </div>
@@ -1371,23 +1383,26 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     setDocName(e.target.value);
                     setIsEditingFileName(false);
                   }}
-                  placeholder="Tên văn bản (dùng để đặt tên tệp lưu trữ)..."
+                  placeholder="Tên văn bản ngắn gọn (tự động cập nhật tên tệp lưu trên Drive)..."
                   className="w-full min-h-[44px] h-11 sm:h-10 px-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm font-medium text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                 />
+                <p className="text-[11px] text-slate-500">
+                  Tên rút gọn tạo từ trích yếu gốc để đặt tên tệp lưu trữ; chỉnh sửa tại đây sẽ cập nhật ngay tên tệp Drive viết hoa.
+                </p>
               </div>
 
               <div className="space-y-1 min-w-0">
                 <div className="flex items-center justify-between gap-1 flex-wrap">
                   <label className="block text-xs font-bold text-slate-700 uppercase tracking-wide">
-                    Trích yếu / Nội dung (V/v)
+                    Trích yếu / Nội dung
                   </label>
                   {renderLocateButton('title', 'Trích yếu')}
                 </div>
                 <textarea
                   value={title}
                   onChange={(e) => setTitle(e.target.value)}
-                  rows={2}
-                  placeholder="Nội dung trích yếu sau V/v..."
+                  rows={3}
+                  placeholder="Nguyên văn tiêu đề và trích yếu đọc được từ trang đầu để đối chiếu..."
                   className="w-full p-3 bg-white border border-slate-300 rounded-lg text-base sm:text-sm text-slate-900 focus:outline-hidden focus:ring-2 focus:ring-sky-600"
                 />
               </div>
@@ -1581,6 +1596,19 @@ export const ImportPdfView: React.FC<ImportPdfViewProps> = ({
                     {dateInvalid && (
                       <p className="text-[11px] text-rose-700 font-semibold">
                         Ngày văn bản không hợp lệ. Vui lòng nhập đúng định dạng dd/mm/yyyy.
+                      </p>
+                    )}
+                    {compStatus === 'missing' && !documentDate.trim() && (
+                      <p
+                        data-testid="missing-printed-date-notice"
+                        className="text-[11px] text-amber-900 bg-amber-50 border border-amber-200 rounded-md px-2.5 py-1.5 flex items-start gap-1.5"
+                      >
+                        <AlertTriangle className="w-3.5 h-3.5 text-amber-600 shrink-0 mt-0.5" />
+                        <span>
+                          {analysis.extraction.ignoredDigitalSignatureDate
+                            ? 'Chỉ phát hiện ngày/giờ trên chữ ký số điện tử (đã bỏ qua). Vui lòng đối chiếu bản PDF gốc và nhập ngày ban hành nếu có.'
+                            : 'Chưa phát hiện ngày ban hành in trên văn bản. Vui lòng đối chiếu bản PDF gốc và nhập thủ công nếu có.'}
+                        </span>
                       </p>
                     )}
                   </div>

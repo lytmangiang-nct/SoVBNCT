@@ -601,6 +601,7 @@ export interface PdfExtractionResult {
   docNumberNeedsConfirmation?: boolean;
   docNumberReviewReason?: string;
   filenameDocNumberHint?: string;
+  ignoredDigitalSignatureDate?: boolean;
 }
 
 export interface PdfAnalyzeResponse {
